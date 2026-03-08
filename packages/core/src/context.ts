@@ -229,14 +229,29 @@ export class Context {
     }
 
     /**
-     * Generate collection name based on codebase path and hybrid mode
+     * Generate collection name based on codebase path and hybrid mode.
+     * If MILVUS_COLLECTION_PRIVATE is set, use it directly (custom naming).
      */
     public getCollectionName(codebasePath: string): string {
+        const customName = envManager.get('MILVUS_COLLECTION_PRIVATE');
+        if (customName) {
+            return customName;
+        }
         const isHybrid = this.getIsHybrid();
         const normalizedPath = path.resolve(codebasePath);
         const hash = crypto.createHash('md5').update(normalizedPath).digest('hex');
         const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
         return `${prefix}_${hash.substring(0, 8)}`;
+    }
+
+    /**
+     * Get the shared collection name from environment, if configured.
+     * Returns undefined if no shared collection is set or strategy is 'private'.
+     */
+    public getSharedCollectionName(): string | undefined {
+        const strategy = envManager.get('MILVUS_STRATEGY');
+        if (strategy === 'private') return undefined;
+        return envManager.get('MILVUS_COLLECTION_SHARED');
     }
 
     /**
@@ -412,9 +427,22 @@ export class Context {
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
 
         const collectionName = this.getCollectionName(codebasePath);
-        console.log(`[Context] 🔍 Using collection: ${collectionName}`);
+        const sharedCollectionName = this.getSharedCollectionName();
+        const collectionsToSearch: string[] = [collectionName];
 
-        // Check if collection exists and has data
+        if (sharedCollectionName && sharedCollectionName !== collectionName) {
+            const hasShared = await this.vectorDatabase.hasCollection(sharedCollectionName);
+            if (hasShared) {
+                collectionsToSearch.push(sharedCollectionName);
+                console.log(`[Context] 🔍 Multi-collection search: private=${collectionName}, shared=${sharedCollectionName}`);
+            } else {
+                console.log(`[Context] ⚠️  Shared collection '${sharedCollectionName}' does not exist, searching private only`);
+            }
+        } else {
+            console.log(`[Context] 🔍 Using collection: ${collectionName}`);
+        }
+
+        // Check if primary collection exists
         const hasCollection = await this.vectorDatabase.hasCollection(collectionName);
         if (!hasCollection) {
             console.log(`[Context] ⚠️  Collection '${collectionName}' does not exist. Please index the codebase first.`);
@@ -423,95 +451,106 @@ export class Context {
 
         if (isHybrid === true) {
             try {
-                // Check collection stats to see if it has data
                 const stats = await this.vectorDatabase.query(collectionName, '', ['id'], 1);
                 console.log(`[Context] 🔍 Collection '${collectionName}' exists and appears to have data`);
             } catch (error) {
                 console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
             }
 
-            // 1. Generate query vector
+            // 1. Generate query vector (once, reused for all collections)
             console.log(`[Context] 🔍 Generating embeddings for query: "${query}"`);
             const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
             console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
-            console.log(`[Context] 🔍 First 5 embedding values: [${queryEmbedding.vector.slice(0, 5).join(', ')}]`);
 
-            // 2. Prepare hybrid search requests
-            const searchRequests: HybridSearchRequest[] = [
-                {
-                    data: queryEmbedding.vector,
-                    anns_field: "vector",
-                    param: { "nprobe": 10 },
-                    limit: topK
-                },
-                {
-                    data: query,
-                    anns_field: "sparse_vector",
-                    param: { "drop_ratio_search": 0.2 },
-                    limit: topK
-                }
-            ];
+            // 2. Search all collections and merge results
+            let allResults: SemanticSearchResult[] = [];
 
-            console.log(`[Context] 🔍 Search request 1 (dense): anns_field="${searchRequests[0].anns_field}", vector_dim=${queryEmbedding.vector.length}, limit=${searchRequests[0].limit}`);
-            console.log(`[Context] 🔍 Search request 2 (sparse): anns_field="${searchRequests[1].anns_field}", query_text="${query}", limit=${searchRequests[1].limit}`);
-
-            // 3. Execute hybrid search
-            console.log(`[Context] 🔍 Executing hybrid search with RRF reranking...`);
-            const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
-                collectionName,
-                searchRequests,
-                {
-                    rerank: {
-                        strategy: 'rrf',
-                        params: { k: 100 }
+            for (const collection of collectionsToSearch) {
+                const searchRequests: HybridSearchRequest[] = [
+                    {
+                        data: queryEmbedding.vector,
+                        anns_field: "vector",
+                        param: { "nprobe": 10 },
+                        limit: topK
                     },
-                    limit: topK,
-                    filterExpr
-                }
-            );
+                    {
+                        data: query,
+                        anns_field: "sparse_vector",
+                        param: { "drop_ratio_search": 0.2 },
+                        limit: topK
+                    }
+                ];
 
-            console.log(`[Context] 🔍 Raw search results count: ${searchResults.length}`);
+                console.log(`[Context] 🔍 Searching collection: ${collection}`);
+                const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
+                    collection,
+                    searchRequests,
+                    {
+                        rerank: {
+                            strategy: 'rrf',
+                            params: { k: 100 }
+                        },
+                        limit: topK,
+                        filterExpr
+                    }
+                );
 
-            // 4. Convert to semantic search result format
-            const results: SemanticSearchResult[] = searchResults.map(result => ({
-                content: result.document.content,
-                relativePath: result.document.relativePath,
-                startLine: result.document.startLine,
-                endLine: result.document.endLine,
-                language: result.document.metadata.language || 'unknown',
-                score: result.score
-            }));
+                const results: SemanticSearchResult[] = searchResults.map(result => ({
+                    content: result.document.content,
+                    relativePath: collection !== collectionName
+                        ? `[shared] ${result.document.relativePath}`
+                        : result.document.relativePath,
+                    startLine: result.document.startLine,
+                    endLine: result.document.endLine,
+                    language: result.document.metadata.language || 'unknown',
+                    score: result.score
+                }));
 
-            console.log(`[Context] ✅ Found ${results.length} relevant hybrid results`);
-            if (results.length > 0) {
-                console.log(`[Context] 🔍 Top result score: ${results[0].score}, path: ${results[0].relativePath}`);
+                console.log(`[Context] 🔍 Found ${results.length} results from ${collection}`);
+                allResults.push(...results);
             }
 
-            return results;
+            // 3. Sort merged results by score and take topK
+            allResults.sort((a, b) => b.score - a.score);
+            allResults = allResults.slice(0, topK);
+
+            console.log(`[Context] ✅ Found ${allResults.length} relevant hybrid results (from ${collectionsToSearch.length} collection(s))`);
+            if (allResults.length > 0) {
+                console.log(`[Context] 🔍 Top result score: ${allResults[0].score}, path: ${allResults[0].relativePath}`);
+            }
+
+            return allResults;
         } else {
-            // Regular semantic search
-            // 1. Generate query vector
+            // Regular semantic search — also supports multi-collection
             const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+            let allResults: SemanticSearchResult[] = [];
 
-            // 2. Search in vector database
-            const searchResults: VectorSearchResult[] = await this.vectorDatabase.search(
-                collectionName,
-                queryEmbedding.vector,
-                { topK, threshold, filterExpr }
-            );
+            for (const collection of collectionsToSearch) {
+                const searchResults: VectorSearchResult[] = await this.vectorDatabase.search(
+                    collection,
+                    queryEmbedding.vector,
+                    { topK, threshold, filterExpr }
+                );
 
-            // 3. Convert to semantic search result format
-            const results: SemanticSearchResult[] = searchResults.map(result => ({
-                content: result.document.content,
-                relativePath: result.document.relativePath,
-                startLine: result.document.startLine,
-                endLine: result.document.endLine,
-                language: result.document.metadata.language || 'unknown',
-                score: result.score
-            }));
+                const results: SemanticSearchResult[] = searchResults.map(result => ({
+                    content: result.document.content,
+                    relativePath: collection !== collectionName
+                        ? `[shared] ${result.document.relativePath}`
+                        : result.document.relativePath,
+                    startLine: result.document.startLine,
+                    endLine: result.document.endLine,
+                    language: result.document.metadata.language || 'unknown',
+                    score: result.score
+                }));
 
-            console.log(`[Context] ✅ Found ${results.length} relevant results`);
-            return results;
+                allResults.push(...results);
+            }
+
+            allResults.sort((a, b) => b.score - a.score);
+            allResults = allResults.slice(0, topK);
+
+            console.log(`[Context] ✅ Found ${allResults.length} relevant results (from ${collectionsToSearch.length} collection(s))`);
+            return allResults;
         }
     }
 
