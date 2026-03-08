@@ -255,6 +255,15 @@ export class Context {
     }
 
     /**
+     * Get the writable shared collection name from environment, if configured.
+     * When set, indexing will dual-write to both private and shared collections
+     * using a single embedding computation (no additional API cost).
+     */
+    public getWritableSharedCollectionName(): string | undefined {
+        return envManager.get('MILVUS_WRITABLE_SHARED');
+    }
+
+    /**
      * Index a codebase for semantic search
      * @param codebasePath Codebase root path
      * @param progressCallback Optional progress callback function
@@ -693,6 +702,23 @@ export class Context {
         }
 
         console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);
+
+        // Also prepare writable shared collection if configured (dual-write support)
+        const writableShared = this.getWritableSharedCollectionName();
+        if (writableShared && writableShared !== collectionName) {
+            const sharedExists = await this.vectorDatabase.hasCollection(writableShared);
+            if (!sharedExists) {
+                console.log(`[Context] 🔧 Also preparing writable shared collection: ${writableShared}`);
+                if (isHybrid === true) {
+                    await this.vectorDatabase.createHybridCollection(writableShared, dimension, `Shared hybrid index (writable from ${dirName})`);
+                } else {
+                    await this.vectorDatabase.createCollection(writableShared, dimension, `Shared index (writable from ${dirName})`);
+                }
+                console.log(`[Context] ✅ Shared collection ${writableShared} created successfully`);
+            } else {
+                console.log(`[Context] 📋 Shared collection ${writableShared} already exists, will dual-write during indexing`);
+            }
+        }
     }
 
     /**
@@ -882,8 +908,14 @@ export class Context {
                 };
             });
 
-            // Store to vector database
+            // Store to vector database (private collection)
             await this.vectorDatabase.insertHybrid(this.getCollectionName(codebasePath), documents);
+
+            // Dual-write to shared collection if configured (same embeddings, no extra API cost)
+            const writableShared = this.getWritableSharedCollectionName();
+            if (writableShared && writableShared !== this.getCollectionName(codebasePath)) {
+                await this.vectorDatabase.insertHybrid(writableShared, documents);
+            }
         } else {
             // Create regular vector documents
             const documents: VectorDocument[] = chunks.map((chunk, index) => {
@@ -912,8 +944,14 @@ export class Context {
                 };
             });
 
-            // Store to vector database
+            // Store to vector database (private collection)
             await this.vectorDatabase.insert(this.getCollectionName(codebasePath), documents);
+
+            // Dual-write to shared collection if configured (same embeddings, no extra API cost)
+            const writableShared = this.getWritableSharedCollectionName();
+            if (writableShared && writableShared !== this.getCollectionName(codebasePath)) {
+                await this.vectorDatabase.insert(writableShared, documents);
+            }
         }
     }
 

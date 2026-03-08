@@ -22,6 +22,7 @@ Adds multi-collection search to claude-context, enabling projects to maintain is
 |----------|---------|-------------|
 | `MILVUS_COLLECTION_PRIVATE` | auto-generated hash | Custom private collection name (e.g., `event_crawler_own`) |
 | `MILVUS_COLLECTION_SHARED` | — | Shared collection to query alongside private |
+| `MILVUS_WRITABLE_SHARED` | — | When set, indexing dual-writes to both private AND this collection (one embedding cost) |
 | `MILVUS_STRATEGY` | — | `hybrid`: query private + shared. `private`: query private only |
 | `CLAUDE_CONTEXT_HOME` | `~/.context` | Snapshot directory override for multi-user sharing |
 
@@ -31,12 +32,19 @@ Adds multi-collection search to claude-context, enabling projects to maintain is
 
 ### Indexing (`index_codebase`)
 
-Writes **only** to the private collection. One embedding cost per codebase.
+Writes to the private collection. With `MILVUS_WRITABLE_SHARED`, also writes to the shared collection using the same embeddings (no additional API cost).
 
 ```
+# Basic: private only
 MILVUS_COLLECTION_PRIVATE=event_crawler_own
 → index_codebase writes to: event_crawler_own
-→ embedding cost: 1x (same as upstream)
+→ embedding cost: 1x
+
+# Dual-write: private + shared (same embedding cost)
+MILVUS_COLLECTION_PRIVATE=event_crawler_own
+MILVUS_WRITABLE_SHARED=event_shared
+→ index_codebase writes to: event_crawler_own + event_shared
+→ embedding cost: 1x (same embeddings inserted into both collections)
 ```
 
 ### Searching (`search_code`)
@@ -73,6 +81,7 @@ Override: shared directory for multi-user environments.
 MILVUS_STRATEGY=hybrid
 MILVUS_COLLECTION_PRIVATE=event_crawler_own
 MILVUS_COLLECTION_SHARED=event_shared
+MILVUS_WRITABLE_SHARED=event_shared    # Optional: dual-write to shared on indexing
 ```
 
 ### `~/.claude.json` (user scope)
@@ -99,7 +108,7 @@ MILVUS_COLLECTION_SHARED=event_shared
 
 | File | Change |
 |------|--------|
-| `packages/core/src/context.ts` | `getCollectionName()`: read `MILVUS_COLLECTION_PRIVATE`. `getSharedCollectionName()`: new method. `semanticSearch()`: multi-collection search with score merge. |
+| `packages/core/src/context.ts` | `getCollectionName()`: read `MILVUS_COLLECTION_PRIVATE`. `getSharedCollectionName()`: new method. `getWritableSharedCollectionName()`: read `MILVUS_WRITABLE_SHARED`. `semanticSearch()`: multi-collection search with score merge. `prepareCollection()`: also creates shared collection. `processChunkBatch()`: dual-write to shared collection. |
 | `packages/mcp/src/snapshot.ts` | Constructor reads `CLAUDE_CONTEXT_HOME` env. |
 
 ---
