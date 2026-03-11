@@ -18,12 +18,14 @@
         "prepublishOnly": "pnpm build"
     },
     "dependencies": {
-        "@zilliz/claude-context-core": "workspace:*",
         "@modelcontextprotocol/sdk": "^1.12.1",
+        "@zilliz/claude-context-core": "workspace:*",
+        "proper-lockfile": "^4.1.2",
         "zod": "^3.25.55"
     },
     "devDependencies": {
         "@types/node": "^20.0.0",
+        "@types/proper-lockfile": "^4.1.4",
         "tsx": "^4.19.4",
         "typescript": "^5.0.0"
     },

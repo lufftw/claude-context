@@ -94,6 +94,7 @@ export interface ContextConfig {
     ignorePatterns?: string[];
     customExtensions?: string[]; // New: custom extensions from MCP
     customIgnorePatterns?: string[]; // New: custom ignore patterns from MCP
+    includeDotDirs?: string[]; // Dot-prefixed directories to include in indexing
 }
 
 export class Context {
@@ -102,6 +103,7 @@ export class Context {
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
     private ignorePatterns: string[];
+    private includeDotDirs: string[];
     private synchronizers = new Map<string, FileSynchronizer>();
 
     constructor(config: ContextConfig = {}) {
@@ -145,6 +147,9 @@ export class Context {
         // Remove duplicates
         this.ignorePatterns = [...new Set(allIgnorePatterns)];
 
+        // Initialize includeDotDirs from config
+        this.includeDotDirs = (config.includeDotDirs || []).map(d => d.replace(/\/+$/, ''));
+
         console.log(`[Context] 🔧 Initialized with ${this.supportedExtensions.length} supported extensions and ${this.ignorePatterns.length} ignore patterns`);
         if (envCustomExtensions.length > 0) {
             console.log(`[Context] 📎 Loaded ${envCustomExtensions.length} custom extensions from environment: ${envCustomExtensions.join(', ')}`);
@@ -187,6 +192,13 @@ export class Context {
      */
     getIgnorePatterns(): string[] {
         return [...this.ignorePatterns];
+    }
+
+    /**
+     * Get include dot directories
+     */
+    getIncludeDotDirs(): string[] {
+        return [...this.includeDotDirs];
     }
 
     /**
@@ -348,7 +360,7 @@ export class Context {
             await this.loadIgnorePatterns(codebasePath);
 
             // To be safe, let's initialize if it's not there.
-            const newSynchronizer = new FileSynchronizer(codebasePath, this.ignorePatterns);
+            const newSynchronizer = new FileSynchronizer(codebasePath, this.ignorePatterns, this.includeDotDirs);
             await newSynchronizer.initialize();
             this.synchronizers.set(collectionName, newSynchronizer);
         }
@@ -1044,9 +1056,38 @@ export class Context {
             } else {
                 console.log('📄 No ignore files found, keeping existing patterns');
             }
+
+            // Load .contextinclude for dot-directory inclusion
+            await this.loadIncludeDotDirs(codebasePath);
         } catch (error) {
             console.warn(`[Context] ⚠️ Failed to load ignore patterns: ${error}`);
             // Continue with existing patterns on error - don't reset them
+        }
+    }
+
+    /**
+     * Load .contextinclude file to find dot-prefixed directories to include in indexing.
+     * Each line in the file specifies a dot-prefixed directory name (e.g., .opencode).
+     */
+    private async loadIncludeDotDirs(codebasePath: string): Promise<void> {
+        const includeFilePath = path.join(codebasePath, '.contextinclude');
+        try {
+            await fs.promises.access(includeFilePath);
+            const content = await fs.promises.readFile(includeFilePath, 'utf-8');
+            const dirs = content
+                .split('\n')
+                .map(line => line.trim())
+                .filter(line => line && !line.startsWith('#'))
+                .map(d => d.replace(/\/+$/, ''));
+
+            if (dirs.length > 0) {
+                // Merge with existing includeDotDirs (dedup)
+                const combined = new Set([...this.includeDotDirs, ...dirs]);
+                this.includeDotDirs = [...combined];
+                console.log(`[Context] 📂 Loaded ${dirs.length} include-dot-dirs from .contextinclude: ${dirs.join(', ')}`);
+            }
+        } catch {
+            // .contextinclude is optional
         }
     }
 
@@ -1056,6 +1097,9 @@ export class Context {
      * @returns Array of ignore file paths
      */
     private async findIgnoreFiles(codebasePath: string): Promise<string[]> {
+        // Skip ignore files that are not relevant to code indexing
+        const SKIP_IGNORE_FILES = new Set(['.dockerignore']);
+
         try {
             const entries = await fs.promises.readdir(codebasePath, { withFileTypes: true });
             const ignoreFiles: string[] = [];
@@ -1063,7 +1107,8 @@ export class Context {
             for (const entry of entries) {
                 if (entry.isFile() &&
                     entry.name.startsWith('.') &&
-                    entry.name.endsWith('ignore')) {
+                    entry.name.endsWith('ignore') &&
+                    !SKIP_IGNORE_FILES.has(entry.name)) {
                     ignoreFiles.push(path.join(codebasePath, entry.name));
                 }
             }

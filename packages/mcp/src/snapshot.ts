@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import lockfile from "proper-lockfile";
 import {
     CodebaseSnapshot,
     CodebaseSnapshotV1,
@@ -17,6 +18,7 @@ export class SnapshotManager {
     private indexingCodebases: Map<string, number> = new Map(); // Map of codebase path to progress percentage
     private codebaseFileCount: Map<string, number> = new Map(); // Map of codebase path to indexed file count
     private codebaseInfoMap: Map<string, CodebaseInfo> = new Map(); // Map of codebase path to complete info
+    private removedCodebases: Set<string> = new Set(); // Tracks codebases explicitly removed by this session
 
     constructor() {
         // Initialize snapshot file path (supports CLAUDE_CONTEXT_HOME env override for multi-user sharing)
@@ -435,6 +437,9 @@ export class SnapshotManager {
         this.codebaseFileCount.delete(codebasePath);
         this.codebaseInfoMap.delete(codebasePath);
 
+        // Track removal so merge-save won't resurrect it from the existing file
+        this.removedCodebases.add(codebasePath);
+
         console.log(`[SNAPSHOT-DEBUG] Completely removed codebase from snapshot: ${codebasePath}`);
     }
 
@@ -467,41 +472,104 @@ export class SnapshotManager {
         }
     }
 
+    /**
+     * Ensure the snapshot file exists (needed for proper-lockfile to lock on it).
+     */
+    private ensureSnapshotFileExists(): void {
+        const snapshotDir = path.dirname(this.snapshotFilePath);
+        if (!fs.existsSync(snapshotDir)) {
+            fs.mkdirSync(snapshotDir, { recursive: true });
+            console.log('[SNAPSHOT-DEBUG] Created snapshot directory:', snapshotDir);
+        }
+        if (!fs.existsSync(this.snapshotFilePath)) {
+            // Create an empty v2 snapshot so the file exists for locking
+            const empty: CodebaseSnapshotV2 = {
+                formatVersion: 'v2',
+                codebases: {},
+                lastUpdated: new Date().toISOString()
+            };
+            fs.writeFileSync(this.snapshotFilePath, JSON.stringify(empty, null, 2));
+            console.log('[SNAPSHOT-DEBUG] Created empty snapshot file for locking');
+        }
+    }
+
+    /**
+     * Perform the locked read-merge-write of the snapshot file.
+     * This is the core logic extracted so it can be called within a lock.
+     */
+    private mergeAndWriteSnapshot(): void {
+        // Read existing snapshot to merge with (prevents multi-session overwrites)
+        let existingCodebases: Record<string, CodebaseInfo> = {};
+        try {
+            const existingData = fs.readFileSync(this.snapshotFilePath, 'utf8');
+            const existingSnapshot = JSON.parse(existingData);
+            if (existingSnapshot && existingSnapshot.formatVersion === 'v2' && existingSnapshot.codebases) {
+                existingCodebases = existingSnapshot.codebases;
+                console.log(`[SNAPSHOT-DEBUG] Loaded ${Object.keys(existingCodebases).length} existing codebases for merge`);
+            }
+        } catch (readError) {
+            console.warn('[SNAPSHOT-DEBUG] Could not read existing snapshot for merge, will overwrite:', readError);
+        }
+
+        // Merge: start with existing codebases, then apply this session's entries on top.
+        const codebases: Record<string, CodebaseInfo> = { ...existingCodebases };
+
+        // Apply all codebases from this session's info map (overwrites same paths, preserves others)
+        for (const [codebasePath, info] of this.codebaseInfoMap) {
+            codebases[codebasePath] = info;
+        }
+
+        // Remove codebases that this session explicitly removed
+        for (const removedPath of this.removedCodebases) {
+            delete codebases[removedPath];
+        }
+
+        const snapshot: CodebaseSnapshotV2 = {
+            formatVersion: 'v2',
+            codebases: codebases,
+            lastUpdated: new Date().toISOString()
+        };
+
+        fs.writeFileSync(this.snapshotFilePath, JSON.stringify(snapshot, null, 2));
+
+        const indexedCount = this.indexedCodebases.length;
+        const indexingCount = this.indexingCodebases.size;
+        const failedCount = this.getFailedCodebases().length;
+        const totalInFile = Object.keys(codebases).length;
+
+        console.log(`[SNAPSHOT-DEBUG] Snapshot saved (merged) in v2 format. This session - Indexed: ${indexedCount}, Indexing: ${indexingCount}, Failed: ${failedCount}. Total in file: ${totalInFile}`);
+    }
+
     public saveCodebaseSnapshot(): void {
         console.log('[SNAPSHOT-DEBUG] Saving codebase snapshot to:', this.snapshotFilePath);
 
         try {
-            // Ensure directory exists
-            const snapshotDir = path.dirname(this.snapshotFilePath);
-            if (!fs.existsSync(snapshotDir)) {
-                fs.mkdirSync(snapshotDir, { recursive: true });
-                console.log('[SNAPSHOT-DEBUG] Created snapshot directory:', snapshotDir);
+            this.ensureSnapshotFileExists();
+
+            // Acquire file lock, then read-merge-write atomically
+            let release: (() => void) | undefined;
+            try {
+                release = lockfile.lockSync(this.snapshotFilePath, {
+                    retries: { retries: 5, minTimeout: 100, maxTimeout: 1000 },
+                    stale: 10000, // Consider lock stale after 10s (handles crashed processes)
+                });
+                console.log('[SNAPSHOT-DEBUG] File lock acquired');
+
+                this.mergeAndWriteSnapshot();
+            } finally {
+                if (release) {
+                    release();
+                    console.log('[SNAPSHOT-DEBUG] File lock released');
+                }
             }
-
-            // Build v2 format snapshot using the complete info map
-            const codebases: Record<string, CodebaseInfo> = {};
-
-            // Add all codebases from the info map
-            for (const [codebasePath, info] of this.codebaseInfoMap) {
-                codebases[codebasePath] = info;
-            }
-
-            const snapshot: CodebaseSnapshotV2 = {
-                formatVersion: 'v2',
-                codebases: codebases,
-                lastUpdated: new Date().toISOString()
-            };
-
-            fs.writeFileSync(this.snapshotFilePath, JSON.stringify(snapshot, null, 2));
-
-            const indexedCount = this.indexedCodebases.length;
-            const indexingCount = this.indexingCodebases.size;
-            const failedCount = this.getFailedCodebases().length;
-
-            console.log(`[SNAPSHOT-DEBUG] Snapshot saved successfully in v2 format. Indexed: ${indexedCount}, Indexing: ${indexingCount}, Failed: ${failedCount}`);
-
         } catch (error: any) {
-            console.error('[SNAPSHOT-DEBUG] Error saving snapshot:', error);
+            // If locking fails (e.g. permissions), fall back to unlocked merge-write
+            console.warn('[SNAPSHOT-DEBUG] File lock failed, falling back to unlocked save:', error.message);
+            try {
+                this.mergeAndWriteSnapshot();
+            } catch (fallbackError: any) {
+                console.error('[SNAPSHOT-DEBUG] Error saving snapshot:', fallbackError);
+            }
         }
     }
 } 

@@ -58,11 +58,22 @@ export class ToolHandlers {
 
             const cloudCodebases = new Set<string>();
 
+            // Build set of known custom collection names (from env config)
+            const knownCustomCollections = new Set<string>();
+            const privateCol = this.context.getCollectionName('');
+            if (privateCol) knownCustomCollections.add(privateCol);
+            const sharedCol = this.context.getWritableSharedCollectionName();
+            if (sharedCol) knownCustomCollections.add(sharedCol);
+            const readSharedCol = this.context.getSharedCollectionName();
+            if (readSharedCol) knownCustomCollections.add(readSharedCol);
+
             // Check each collection for codebase path
             for (const collectionName of collections) {
                 try {
-                    // Skip collections that don't match the code_chunks pattern (support both legacy and new collections)
-                    if (!collectionName.startsWith('code_chunks_') && !collectionName.startsWith('hybrid_code_chunks_')) {
+                    // Skip collections that don't match code_chunks pattern AND are not known custom collections
+                    const isCodeChunks = collectionName.startsWith('code_chunks_') || collectionName.startsWith('hybrid_code_chunks_');
+                    const isKnownCustom = knownCustomCollections.has(collectionName);
+                    if (!isCodeChunks && !isKnownCustom) {
                         console.log(`[SYNC-CLOUD] ⏭️  Skipping non-code collection: ${collectionName}`);
                         continue;
                     }
@@ -109,15 +120,24 @@ export class ToolHandlers {
 
             console.log(`[SYNC-CLOUD] 📊 Found ${cloudCodebases.size} valid codebases in cloud`);
 
+            // Normalize path for cross-platform comparison (backslash vs forward slash)
+            const normalizePath = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+
+            // Build normalized cloud path set for comparison
+            const normalizedCloudPaths = new Set<string>();
+            for (const cp of cloudCodebases) {
+                normalizedCloudPaths.add(normalizePath(cp));
+            }
+
             // Get current local codebases
             const localCodebases = new Set(this.snapshotManager.getIndexedCodebases());
             console.log(`[SYNC-CLOUD] 📊 Found ${localCodebases.size} local codebases in snapshot`);
 
             let hasChanges = false;
 
-            // Remove local codebases that don't exist in cloud
+            // Remove local codebases that don't exist in cloud (using normalized path comparison)
             for (const localCodebase of localCodebases) {
-                if (!cloudCodebases.has(localCodebase)) {
+                if (!normalizedCloudPaths.has(normalizePath(localCodebase))) {
                     this.snapshotManager.removeIndexedCodebase(localCodebase);
                     hasChanges = true;
                     console.log(`[SYNC-CLOUD] ➖ Removed local codebase (not in cloud): ${localCodebase}`);
@@ -345,8 +365,12 @@ export class ToolHandlers {
             // Initialize file synchronizer with proper ignore patterns (including project-specific patterns)
             const { FileSynchronizer } = await import("@zilliz/claude-context-core");
             const ignorePatterns = this.context.getIgnorePatterns() || [];
+            const includeDotDirs = this.context.getIncludeDotDirs() || [];
             console.log(`[BACKGROUND-INDEX] Using ignore patterns: ${ignorePatterns.join(', ')}`);
-            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns);
+            if (includeDotDirs.length > 0) {
+                console.log(`[BACKGROUND-INDEX] Including dot directories: ${includeDotDirs.join(', ')}`);
+            }
+            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, includeDotDirs);
             await synchronizer.initialize();
 
             // Store synchronizer in the context (let context manage collection names)

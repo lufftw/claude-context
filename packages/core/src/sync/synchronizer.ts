@@ -10,13 +10,16 @@ export class FileSynchronizer {
     private rootDir: string;
     private snapshotPath: string;
     private ignorePatterns: string[];
+    private includeDotDirs: string[];
 
-    constructor(rootDir: string, ignorePatterns: string[] = []) {
+    constructor(rootDir: string, ignorePatterns: string[] = [], includeDotDirs: string[] = []) {
         this.rootDir = rootDir;
         this.snapshotPath = this.getSnapshotPath(rootDir);
         this.fileHashes = new Map();
         this.merkleDAG = new MerkleDAG();
         this.ignorePatterns = ignorePatterns;
+        // Normalize: ensure entries start with '.' and have no trailing slashes
+        this.includeDotDirs = includeDotDirs.map(d => d.replace(/\/+$/, ''));
     }
 
     private getSnapshotPath(codebasePath: string): string {
@@ -96,10 +99,16 @@ export class FileSynchronizer {
     }
 
     private shouldIgnore(relativePath: string, isDirectory: boolean = false): boolean {
-        // Always ignore hidden files and directories (starting with .)
+        // Ignore hidden files and directories (starting with .) unless explicitly included
         const pathParts = relativePath.split(path.sep);
         if (pathParts.some(part => part.startsWith('.'))) {
-            return true;
+            // Check if the dot-prefixed part is in the include list
+            const hasIncludedDotDir = this.includeDotDirs.length > 0 && pathParts.every(part =>
+                !part.startsWith('.') || this.includeDotDirs.includes(part)
+            );
+            if (!hasIncludedDotDir) {
+                return true;
+            }
         }
 
         if (this.ignorePatterns.length === 0) {
