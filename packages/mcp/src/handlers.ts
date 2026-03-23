@@ -581,8 +581,11 @@ export class ToolHandlers {
                 const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
                 const context = truncateContent(result.content, 5000);
                 const codebaseInfo = path.basename(absolutePath);
+                const sourceLabel = result.sourceProject
+                    ? `[${codebaseInfo}] (from: ${result.sourceProject})`
+                    : `[${codebaseInfo}]`;
 
-                return `${index + 1}. Code snippet (${result.language}) [${codebaseInfo}]\n` +
+                return `${index + 1}. Code snippet (${result.language}) ${sourceLabel}\n` +
                     `   Location: ${location}\n` +
                     `   Rank: ${index + 1}\n` +
                     `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
@@ -783,7 +786,17 @@ export class ToolHandlers {
             let statusMessage = '';
 
             switch (status) {
-                case 'indexed':
+                case 'indexed': {
+                    // Verify collection still exists in Milvus (may be lost after restart/cleanup)
+                    const collectionName = this.context.getCollectionName(absolutePath);
+                    const hasCollection = await this.context.getVectorDatabase().hasCollection(collectionName);
+
+                    if (!hasCollection) {
+                        statusMessage = `⚠️ Codebase '${absolutePath}' was indexed but the index data has been lost (collection not found in Milvus).`;
+                        statusMessage += `\n🔄 Please re-index using index_codebase with force=true.`;
+                        break;
+                    }
+
                     if (info && 'indexedFiles' in info) {
                         const indexedInfo = info as any;
                         statusMessage = `✅ Codebase '${absolutePath}' is fully indexed and ready for search.`;
@@ -794,6 +807,7 @@ export class ToolHandlers {
                         statusMessage = `✅ Codebase '${absolutePath}' is fully indexed and ready for search.`;
                     }
                     break;
+                }
 
                 case 'indexing':
                     if (info && 'indexingPercentage' in info) {

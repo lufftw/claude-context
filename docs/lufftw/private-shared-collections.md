@@ -1,8 +1,8 @@
 # Private + Shared Collection Support
 
-**Version**: v0.1.3-lufftw.1
+**Version**: v0.1.3-lufftw.1 (updated v0.1.4-lufftw.2)
 **Based on**: upstream v0.1.3 (zilliztech/claude-context)
-**Date**: 2026-03-08
+**Date**: 2026-03-08 (updated 2026-03-14)
 
 ---
 
@@ -135,6 +135,7 @@ git push origin master --tags
 
 ## Related Documentation
 
+- [project-env-loading.md](./project-env-loading.md) — Project `.env` loading support (v0.1.4-lufftw.2)
 - `milvus-services/docs/claude-context/` — Collection strategies, project registry, env reference
 - `mcp-services/docs/claude-context/` — Usage guide, setup guide
 - `claude-control-center/scripts/check-claude-context-upstream.sh` — Version check

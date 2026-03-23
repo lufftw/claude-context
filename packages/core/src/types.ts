@@ -11,4 +11,6 @@ export interface SemanticSearchResult {
     endLine: number;
     language: string;
     score: number;
+    /** Source project name for shared collection results */
+    sourceProject?: string;
 }

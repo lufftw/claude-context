@@ -1,6 +1,6 @@
 {
     "name": "@zilliz/claude-context-mcp",
-    "version": "0.1.4-lufftw.1",
+    "version": "0.1.4-lufftw.2",
     "description": "Model Context Protocol integration for Claude Context (lufftw fork: private+shared collections, CLAUDE_CONTEXT_HOME, dual-write)",
     "type": "module",
     "main": "dist/index.js",

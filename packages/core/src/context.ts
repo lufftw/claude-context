@@ -287,6 +287,8 @@ export class Context {
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
         forceReindex: boolean = false
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
+        // Load project-scoped .env for collection identity (MILVUS_STRATEGY, etc.)
+        envManager.setProjectPath(codebasePath);
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
@@ -443,6 +445,8 @@ export class Context {
      * @param threshold Similarity threshold
      */
     async semanticSearch(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string): Promise<SemanticSearchResult[]> {
+        // Load project-scoped .env for collection identity (MILVUS_STRATEGY, etc.)
+        envManager.setProjectPath(codebasePath);
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
@@ -516,15 +520,19 @@ export class Context {
                     }
                 );
 
+                const isShared = collection !== collectionName;
                 const results: SemanticSearchResult[] = searchResults.map(result => ({
                     content: result.document.content,
-                    relativePath: collection !== collectionName
+                    relativePath: isShared
                         ? `[shared] ${result.document.relativePath}`
                         : result.document.relativePath,
                     startLine: result.document.startLine,
                     endLine: result.document.endLine,
                     language: result.document.metadata.language || 'unknown',
-                    score: result.score
+                    score: result.score,
+                    ...(isShared && result.document.metadata.codebasePath ? {
+                        sourceProject: path.basename(result.document.metadata.codebasePath)
+                    } : {})
                 }));
 
                 console.log(`[Context] 🔍 Found ${results.length} results from ${collection}`);
@@ -553,15 +561,19 @@ export class Context {
                     { topK, threshold, filterExpr }
                 );
 
+                const isShared = collection !== collectionName;
                 const results: SemanticSearchResult[] = searchResults.map(result => ({
                     content: result.document.content,
-                    relativePath: collection !== collectionName
+                    relativePath: isShared
                         ? `[shared] ${result.document.relativePath}`
                         : result.document.relativePath,
                     startLine: result.document.startLine,
                     endLine: result.document.endLine,
                     language: result.document.metadata.language || 'unknown',
-                    score: result.score
+                    score: result.score,
+                    ...(isShared && result.document.metadata.codebasePath ? {
+                        sourceProject: path.basename(result.document.metadata.codebasePath)
+                    } : {})
                 }));
 
                 allResults.push(...results);
@@ -581,6 +593,7 @@ export class Context {
      * @returns Whether index exists
      */
     async hasIndex(codebasePath: string): Promise<boolean> {
+        envManager.setProjectPath(codebasePath);
         const collectionName = this.getCollectionName(codebasePath);
         return await this.vectorDatabase.hasCollection(collectionName);
     }
@@ -594,6 +607,8 @@ export class Context {
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
     ): Promise<void> {
+        // Load project-scoped .env for collection identity (MILVUS_STRATEGY, etc.)
+        envManager.setProjectPath(codebasePath);
         console.log(`[Context] 🧹 Cleaning index data for ${codebasePath}...`);
 
         progressCallback?.({ phase: 'Checking existing index...', current: 0, total: 100, percentage: 0 });
