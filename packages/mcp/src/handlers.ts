@@ -396,7 +396,7 @@ export class ToolHandlers {
             if (includeDotDirs.length > 0) {
                 console.log(`[BACKGROUND-INDEX] Including dot directories: ${includeDotDirs.join(', ')}`);
             }
-            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, includeDotDirs);
+            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, includeDotDirs, this.context.getSupportedExtensions());
             await synchronizer.initialize();
 
             // Store synchronizer in the context (let context manage collection names)
