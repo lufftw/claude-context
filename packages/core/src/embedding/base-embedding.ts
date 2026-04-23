@@ -25,7 +25,17 @@ export abstract class Embedding {
         // Each token is roughly 4 characters on average for English text
         const maxChars = this.maxTokens * 4;
         if (text.length > maxChars) {
-            return text.substring(0, maxChars);
+            let sliced = text.substring(0, maxChars);
+            // Guard against cutting a UTF-16 surrogate pair: if the last
+            // code unit is a high surrogate (U+D800..U+DBFF) with no paired
+            // low surrogate, drop it. Downstream JSON consumers that strictly
+            // validate surrogate pairs (e.g. llama.cpp nlohmann::json) reject
+            // lone surrogates with json.exception.parse_error.101.
+            const lastUnit = sliced.charCodeAt(sliced.length - 1);
+            if (lastUnit >= 0xD800 && lastUnit <= 0xDBFF) {
+                sliced = sliced.substring(0, sliced.length - 1);
+            }
+            return sliced;
         }
 
         return text;
