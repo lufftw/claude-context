@@ -64,10 +64,11 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
 
         case 'Ollama':
             const ollamaHost = config.ollamaHost || 'http://127.0.0.1:11434';
-            console.log(`[EMBEDDING] 🔧 Configuring Ollama with model: ${config.embeddingModel}, host: ${ollamaHost}`);
+            console.log(`[EMBEDDING] 🔧 Configuring Ollama with model: ${config.embeddingModel}, host: ${ollamaHost}${config.ollamaDimension ? `, dimension: ${config.ollamaDimension}` : ''}`);
             const ollamaEmbedding = new OllamaEmbedding({
                 model: config.embeddingModel,
-                host: ollamaHost
+                host: ollamaHost,
+                ...(config.ollamaDimension && { dimension: config.ollamaDimension })
             });
             console.log(`[EMBEDDING] ✅ Ollama embedding instance created successfully`);
             return ollamaEmbedding;
@@ -118,7 +119,7 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
             console.log(`[EMBEDDING] OpenRouter configuration - API Key: ${config.openrouterApiKey ? '✅ Provided' : '❌ Missing'}`);
             break;
         case 'Ollama':
-            console.log(`[EMBEDDING] Ollama configuration - Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}, Model: ${config.embeddingModel}`);
+            console.log(`[EMBEDDING] Ollama configuration - Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}, Model: ${config.embeddingModel}${config.ollamaDimension ? `, Dimension: ${config.ollamaDimension}` : ''}`);
             break;
         case 'RabbitMQ':
             console.log(`[EMBEDDING] RabbitMQ configuration - Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b'}, URL: ${config.rabbitmqUrl ? '✅ Provided' : '❌ Missing'}`);
