@@ -423,6 +423,20 @@ export class MilvusVectorDatabase implements VectorDatabase {
         });
     }
 
+    async deleteByFilter(collectionName: string, filter: string): Promise<void> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        if (!this.client) {
+            throw new Error('MilvusClient is not initialized after ensureInitialized().');
+        }
+
+        await this.client.delete({
+            collection_name: collectionName,
+            filter,
+        });
+    }
+
     async query(collectionName: string, filter: string, outputFields: string[], limit?: number): Promise<Record<string, any>[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);

@@ -1,8 +1,8 @@
-import { OpenAIEmbedding, VoyageAIEmbedding, GeminiEmbedding, OllamaEmbedding } from "@zilliz/claude-context-core";
+import { OpenAIEmbedding, VoyageAIEmbedding, GeminiEmbedding, OllamaEmbedding, RabbitMQEmbedding } from "@zilliz/claude-context-core";
 import { ContextMcpConfig } from "./config.js";
 
 // Helper function to create embedding instance based on provider
-export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbedding | VoyageAIEmbedding | GeminiEmbedding | OllamaEmbedding {
+export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbedding | VoyageAIEmbedding | GeminiEmbedding | OllamaEmbedding | RabbitMQEmbedding {
     console.log(`[EMBEDDING] Creating ${config.embeddingProvider} embedding instance...`);
 
     switch (config.embeddingProvider) {
@@ -57,13 +57,34 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
             console.log(`[EMBEDDING] ✅ Ollama embedding instance created successfully`);
             return ollamaEmbedding;
 
+        case 'RabbitMQ':
+            if (!config.rabbitmqUrl) {
+                console.error(`[EMBEDDING] ❌ RABBITMQ_INFERENCE_URL is required but not provided`);
+                throw new Error('RABBITMQ_INFERENCE_URL is required for RabbitMQ embedding provider');
+            }
+            const rabbitmqQueue = config.rabbitmqQueue || 'embedding.qwen3-8b';
+            const rabbitmqDimension = config.rabbitmqDimension ?? 4096;
+            console.log(`[EMBEDDING] 🔧 Configuring RabbitMQ with queue: ${rabbitmqQueue}, model: ${config.embeddingModel}, dim: ${rabbitmqDimension}`);
+            const rabbitmqEmbedding = new RabbitMQEmbedding({
+                url: config.rabbitmqUrl,
+                queue: rabbitmqQueue,
+                modelName: config.embeddingModel,
+                dimension: rabbitmqDimension,
+                timeoutMs: config.rabbitmqTimeoutMs,
+                priority: config.rabbitmqPriority,
+                concurrency: config.rabbitmqConcurrency,
+                source: config.rabbitmqSource || 'claude-context',
+            });
+            console.log(`[EMBEDDING] ✅ RabbitMQ embedding instance created successfully`);
+            return rabbitmqEmbedding;
+
         default:
             console.error(`[EMBEDDING] ❌ Unsupported embedding provider: ${config.embeddingProvider}`);
             throw new Error(`Unsupported embedding provider: ${config.embeddingProvider}`);
     }
 }
 
-export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: OpenAIEmbedding | VoyageAIEmbedding | GeminiEmbedding | OllamaEmbedding): void {
+export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: OpenAIEmbedding | VoyageAIEmbedding | GeminiEmbedding | OllamaEmbedding | RabbitMQEmbedding): void {
     console.log(`[EMBEDDING] ✅ Successfully initialized ${config.embeddingProvider} embedding provider`);
     console.log(`[EMBEDDING] Provider details - Model: ${config.embeddingModel}, Dimension: ${embedding.getDimension()}`);
 
@@ -81,5 +102,8 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
         case 'Ollama':
             console.log(`[EMBEDDING] Ollama configuration - Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}, Model: ${config.embeddingModel}`);
             break;
+        case 'RabbitMQ':
+            console.log(`[EMBEDDING] RabbitMQ configuration - Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b'}, URL: ${config.rabbitmqUrl ? '✅ Provided' : '❌ Missing'}`);
+            break;
     }
-} 
+}

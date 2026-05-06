@@ -47,6 +47,8 @@ export class SnapshotManager {
                 console.log(`[SNAPSHOT-DEBUG] Validated codebase: ${codebasePath}`);
             } else {
                 console.warn(`[SNAPSHOT-DEBUG] Codebase no longer exists, removing: ${codebasePath}`);
+                // Track removal so the next merge-save deletes the ghost from disk
+                this.removedCodebases.add(codebasePath);
             }
         }
 
@@ -105,6 +107,9 @@ export class SnapshotManager {
         for (const [codebasePath, info] of Object.entries(snapshot.codebases)) {
             if (!fs.existsSync(codebasePath)) {
                 console.warn(`[SNAPSHOT-DEBUG] Codebase no longer exists, removing: ${codebasePath}`);
+                // Track removal so the next merge-save deletes the ghost from disk
+                // instead of silently re-emitting it from the read step.
+                this.removedCodebases.add(codebasePath);
                 continue;
             }
 
@@ -530,7 +535,16 @@ export class SnapshotManager {
             lastUpdated: new Date().toISOString()
         };
 
-        fs.writeFileSync(this.snapshotFilePath, JSON.stringify(snapshot, null, 2));
+        // Atomic write: write to a temp file first, then rename. If we crash
+        // mid-write, the canonical file stays intact; only the temp file is
+        // left over (cleaned up on next save). The lock prevents two writers
+        // from racing, but only an atomic rename prevents readers from seeing
+        // a half-written file if a writer crashes between open() and final
+        // flush. tmp file lives next to the target so the rename is on the
+        // same filesystem (POSIX atomicity guarantee).
+        const tmp = `${this.snapshotFilePath}.tmp.${process.pid}`;
+        fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2));
+        fs.renameSync(tmp, this.snapshotFilePath);
 
         const indexedCount = this.indexedCodebases.length;
         const indexingCount = this.indexingCodebases.size;
@@ -546,15 +560,45 @@ export class SnapshotManager {
         try {
             this.ensureSnapshotFileExists();
 
-            // Acquire file lock, then read-merge-write atomically
+            // Acquire file lock, then read-merge-write atomically.
+            //
+            // proper-lockfile@4 forbids `retries` on the sync API (adapter.js throws
+            // ESYNC: "Cannot use retries with the sync api"). We need synchronous
+            // semantics here because saveCodebaseSnapshot() is invoked by sync code
+            // paths in handlers.ts, so we implement the retry loop ourselves and
+            // sleep with Atomics.wait — Node's only native synchronous sleep that
+            // works on the main thread (verified Node 20+).
             let release: (() => void) | undefined;
-            try {
-                release = lockfile.lockSync(this.snapshotFilePath, {
-                    retries: { retries: 5, minTimeout: 100, maxTimeout: 1000 },
-                    stale: 10000, // Consider lock stale after 10s (handles crashed processes)
-                });
-                console.log('[SNAPSHOT-DEBUG] File lock acquired');
+            const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+            const MAX_ATTEMPTS = 6; // 1 initial + 5 retries (matches former intent)
+            let lastErr: any;
+            for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+                try {
+                    release = lockfile.lockSync(this.snapshotFilePath, {
+                        stale: 10000, // Consider lock stale after 10s (handles crashed processes)
+                    });
+                    if (attempt > 0) {
+                        console.log(`[SNAPSHOT-DEBUG] File lock acquired after ${attempt} retries`);
+                    } else {
+                        console.log('[SNAPSHOT-DEBUG] File lock acquired');
+                    }
+                    break;
+                } catch (err: any) {
+                    lastErr = err;
+                    // Only retry on contention; any other error is a real problem.
+                    if (err?.code !== 'ELOCKED') {
+                        throw err;
+                    }
+                    if (attempt === MAX_ATTEMPTS - 1) {
+                        throw err;
+                    }
+                    // Exponential backoff: 100, 200, 400, 800, then capped at 1000ms
+                    const wait = Math.min(100 * (1 << attempt), 1000);
+                    Atomics.wait(SLEEP_BUF, 0, 0, wait);
+                }
+            }
 
+            try {
                 this.mergeAndWriteSnapshot();
             } finally {
                 if (release) {
@@ -563,7 +607,9 @@ export class SnapshotManager {
                 }
             }
         } catch (error: any) {
-            // If locking fails (e.g. permissions), fall back to unlocked merge-write
+            // If locking fails (e.g. permissions, filesystem doesn't support locks,
+            // or contention exhausted retries), fall back to unlocked merge-write.
+            // Better than refusing to save at all.
             console.warn('[SNAPSHOT-DEBUG] File lock failed, falling back to unlocked save:', error.message);
             try {
                 this.mergeAndWriteSnapshot();

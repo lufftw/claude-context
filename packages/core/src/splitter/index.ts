@@ -6,6 +6,8 @@ export interface CodeChunk {
         endLine: number;
         language?: string;
         filePath?: string;
+        fileHash?: string;
+        [key: string]: unknown;
     };
 }
 

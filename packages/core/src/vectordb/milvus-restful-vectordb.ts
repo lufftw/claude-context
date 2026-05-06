@@ -485,6 +485,23 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
         }
     }
 
+    async deleteByFilter(collectionName: string, filter: string): Promise<void> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        try {
+            const restfulConfig = this.config as MilvusRestfulConfig;
+            await this.makeRequest('/entities/delete', 'POST', {
+                collectionName,
+                filter,
+                dbName: restfulConfig.database,
+            });
+        } catch (error) {
+            console.error(`[MilvusRestfulDB] ❌ Failed to deleteByFilter from collection '${collectionName}':`, error);
+            throw error;
+        }
+    }
+
     async query(collectionName: string, filter: string, outputFields: string[], limit?: number): Promise<Record<string, any>[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);

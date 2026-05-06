@@ -187,3 +187,5 @@ By contributing to Claude Context, you agree that your contributions will be lic
 ---
 
 Thank you for contributing to Claude Context! 🎉
+
+<!-- incremental test marker 2026-05-04T15:35:04+08:00 -->

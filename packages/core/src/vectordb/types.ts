@@ -118,6 +118,13 @@ export interface VectorDatabase {
     delete(collectionName: string, ids: string[]): Promise<void>;
 
     /**
+     * Delete documents matching a filter expression
+     * @param collectionName Collection name
+     * @param filter Milvus filter expression (e.g. 'relativePath == "src/foo.ts"')
+     */
+    deleteByFilter(collectionName: string, filter: string): Promise<void>;
+
+    /**
      * Query documents with filter conditions
      * @param collectionName Collection name
      * @param filter Filter expression

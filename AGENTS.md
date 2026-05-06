@@ -109,3 +109,5 @@ Usage notes:
 <!-- SKILLS_TABLE_END -->
 
 </skills_system>
+
+<!-- incremental indexing test marker 2026-05-04T15:25:16+08:00 -->

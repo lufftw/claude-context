@@ -287,8 +287,18 @@ export class Context {
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
         forceReindex: boolean = false
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
-        // Load project-scoped .env for collection identity (MILVUS_STRATEGY, etc.)
-        envManager.setProjectPath(codebasePath);
+        // Scope project-`.env` reads (MILVUS_COLLECTION_PRIVATE, _SHARED, _STRATEGY, etc.)
+        // to this call only via AsyncLocalStorage. Critical for parallel safety:
+        // sibling indexCodebase() calls must not see each other's project context.
+        // Bug history: see docs/lufftw/bugfix-2026-05-04-envmanager-concurrency.md
+        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, forceReindex));
+    }
+
+    private async _indexCodebaseImpl(
+        codebasePath: string,
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        forceReindex: boolean = false
+    ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
@@ -351,6 +361,13 @@ export class Context {
     }
 
     async reindexByChange(
+        codebasePath: string,
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
+    ): Promise<{ added: number, removed: number, modified: number }> {
+        return envManager.runWithProject(codebasePath, () => this._reindexByChangeImpl(codebasePath, progressCallback));
+    }
+
+    private async _reindexByChangeImpl(
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
     ): Promise<{ added: number, removed: number, modified: number }> {
@@ -445,8 +462,11 @@ export class Context {
      * @param threshold Similarity threshold
      */
     async semanticSearch(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string): Promise<SemanticSearchResult[]> {
-        // Load project-scoped .env for collection identity (MILVUS_STRATEGY, etc.)
-        envManager.setProjectPath(codebasePath);
+        // Scope project-`.env` reads to this call (parallel-safe via AsyncLocalStorage)
+        return envManager.runWithProject(codebasePath, () => this._semanticSearchImpl(codebasePath, query, topK, threshold, filterExpr));
+    }
+
+    private async _semanticSearchImpl(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string): Promise<SemanticSearchResult[]> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
@@ -593,9 +613,10 @@ export class Context {
      * @returns Whether index exists
      */
     async hasIndex(codebasePath: string): Promise<boolean> {
-        envManager.setProjectPath(codebasePath);
-        const collectionName = this.getCollectionName(codebasePath);
-        return await this.vectorDatabase.hasCollection(collectionName);
+        return envManager.runWithProject(codebasePath, async () => {
+            const collectionName = this.getCollectionName(codebasePath);
+            return await this.vectorDatabase.hasCollection(collectionName);
+        });
     }
 
     /**
@@ -607,8 +628,13 @@ export class Context {
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
     ): Promise<void> {
-        // Load project-scoped .env for collection identity (MILVUS_STRATEGY, etc.)
-        envManager.setProjectPath(codebasePath);
+        return envManager.runWithProject(codebasePath, () => this._clearIndexImpl(codebasePath, progressCallback));
+    }
+
+    private async _clearIndexImpl(
+        codebasePath: string,
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
+    ): Promise<void> {
         console.log(`[Context] 🧹 Cleaning index data for ${codebasePath}...`);
 
         progressCallback?.({ phase: 'Checking existing index...', current: 0, total: 100, percentage: 0 });
@@ -787,6 +813,49 @@ export class Context {
  * @param onFileProcessed Callback called when each file is processed
  * @returns Object with processed file count and total chunk count
  */
+    /**
+     * Compute SHA-256 hash of file content for incremental indexing.
+     */
+    private async computeFileHash(filePath: string): Promise<string> {
+        const content = await fs.promises.readFile(filePath);
+        return crypto.createHash('sha256').update(content).digest('hex');
+    }
+
+    /**
+     * Load existing fileHash values from Milvus for a collection.
+     * Returns a Map of relativePath -> fileHash for all indexed files.
+     * Uses pagination to handle collections with >16384 unique files.
+     */
+    private async loadExistingFileHashes(collectionName: string): Promise<Map<string, string>> {
+        const hashMap = new Map<string, string>();
+        try {
+            const hasCollection = await this.vectorDatabase.hasCollection(collectionName);
+            if (!hasCollection) return hashMap;
+
+            // Query all chunks' relativePath + metadata (which contains fileHash)
+            // We only need one chunk per file to get the fileHash.
+            const results = await this.vectorDatabase.query(
+                collectionName,
+                '',  // no filter = all rows
+                ['relativePath', 'metadata'],
+                16384
+            );
+
+            for (const row of results) {
+                const rp = row.relativePath;
+                if (!rp || hashMap.has(rp)) continue;  // one per file is enough
+                const meta = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
+                if (meta?.fileHash) {
+                    hashMap.set(rp, meta.fileHash);
+                }
+            }
+            console.log(`[Context] 📋 Loaded ${hashMap.size} existing file hashes from ${collectionName}`);
+        } catch (error) {
+            console.warn(`[Context] ⚠️  Could not load existing hashes (first index?): ${error}`);
+        }
+        return hashMap;
+    }
+
     private async processFileList(
         filePaths: string[],
         codebasePath: string,
@@ -795,20 +864,79 @@ export class Context {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
         const CHUNK_LIMIT = 450000;
+        // 2026-05-05 deepinfra-rogue-worker incident: silently absorbing every
+        // batch failure let a zombie indexer keep firing embeddings for ~50K
+        // chunks after its target collection was dropped, wasting GPU + risking
+        // dimension-mismatch insert failures that nobody noticed. We now abort
+        // the whole indexing run after MAX_CONSECUTIVE_BATCH_ERRORS in a row.
+        // Successful batches reset the counter so a single transient blip is
+        // still tolerated. Override threshold via INDEX_MAX_CONSECUTIVE_ERRORS.
+        const MAX_CONSECUTIVE_BATCH_ERRORS = Math.max(
+            1,
+            parseInt(envManager.get('INDEX_MAX_CONSECUTIVE_ERRORS') || '3', 10),
+        );
         console.log(`[Context] 🔧 Using EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE}`);
+
+        // ── Incremental indexing: load existing file hashes ──
+        const collectionName = this.getCollectionName(codebasePath);
+        const existingHashes = await this.loadExistingFileHashes(collectionName);
+        let skippedFiles = 0;
+        let changedFiles = 0;
+        let deletedChunkFiles = 0;
 
         let chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }> = [];
         let processedFiles = 0;
         let totalChunks = 0;
         let limitReached = false;
+        let consecutiveBatchErrors = 0;
 
         for (let i = 0; i < filePaths.length; i++) {
             const filePath = filePaths[i];
 
             try {
+                // ── File hash check: skip unchanged files ──
+                const relativePath = path.relative(codebasePath, filePath);
+                const fileHash = await this.computeFileHash(filePath);
+                const existingHash = existingHashes.get(relativePath);
+
+                if (existingHash === fileHash) {
+                    skippedFiles++;
+                    processedFiles++;
+                    onFileProcessed?.(filePath, i + 1, filePaths.length);
+                    continue;  // File unchanged — skip embedding entirely
+                }
+
+                // File is new or changed — delete old chunks if they exist
+                if (existingHash) {
+                    changedFiles++;
+                    try {
+                        const escapedPath = relativePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+                        await this.vectorDatabase.deleteByFilter(
+                            collectionName,
+                            `relativePath == "${escapedPath}"`
+                        );
+                        // Also delete from shared collection if dual-write is enabled
+                        const writableShared = this.getWritableSharedCollectionName();
+                        if (writableShared && writableShared !== collectionName) {
+                            await this.vectorDatabase.deleteByFilter(
+                                writableShared,
+                                `relativePath == "${escapedPath}"`
+                            );
+                        }
+                        deletedChunkFiles++;
+                    } catch (delError) {
+                        console.warn(`[Context] ⚠️  Failed to delete old chunks for ${relativePath}: ${delError}`);
+                    }
+                }
+
                 const content = await fs.promises.readFile(filePath, 'utf-8');
                 const language = this.getLanguageFromExtension(path.extname(filePath));
                 const chunks = await this.codeSplitter.split(content, language, filePath);
+
+                // Inject fileHash into each chunk's metadata so future runs can skip
+                for (const chunk of chunks) {
+                    chunk.metadata = { ...chunk.metadata, fileHash };
+                }
 
                 // Log files with many chunks or large content
                 if (chunks.length > 50) {
@@ -826,11 +954,25 @@ export class Context {
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
                         try {
                             await this.processChunkBuffer(chunkBuffer);
+                            consecutiveBatchErrors = 0;
                         } catch (error) {
+                            consecutiveBatchErrors++;
                             const searchType = isHybrid === true ? 'hybrid' : 'regular';
-                            console.error(`[Context] ❌ Failed to process chunk batch for ${searchType}:`, error);
+                            console.error(
+                                `[Context] ❌ Failed to process chunk batch for ${searchType} ` +
+                                `(${consecutiveBatchErrors}/${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive):`,
+                                error,
+                            );
                             if (error instanceof Error) {
                                 console.error('[Context] Stack trace:', error.stack);
+                            }
+                            if (consecutiveBatchErrors >= MAX_CONSECUTIVE_BATCH_ERRORS) {
+                                chunkBuffer = [];
+                                const cause = error instanceof Error ? error.message : String(error);
+                                throw new Error(
+                                    `Aborting indexing: ${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive ` +
+                                    `chunk-batch failures. Last error: ${cause}`,
+                                );
                             }
                         } finally {
                             chunkBuffer = []; // Always clear buffer, even on failure
@@ -857,7 +999,11 @@ export class Context {
             }
         }
 
-        // Process any remaining chunks in the buffer
+        // Process any remaining chunks in the buffer.
+        // Final batch is critical — if it fails we'd end up with a partial
+        // index that the snapshot reports as 'completed', silently losing the
+        // last EMBEDDING_BATCH_SIZE - 1 chunks. Always re-throw so the caller
+        // (handlers.ts startBackgroundIndexing) marks the run as indexfailed.
         if (chunkBuffer.length > 0) {
             const searchType = isHybrid === true ? 'hybrid' : 'regular';
             console.log(`📝 Processing final batch of ${chunkBuffer.length} chunks for ${searchType}`);
@@ -868,6 +1014,15 @@ export class Context {
                 if (error instanceof Error) {
                     console.error('[Context] Stack trace:', error.stack);
                 }
+                throw error;
+            }
+        }
+
+        // ── Log incremental stats ──
+        if (existingHashes.size > 0) {
+            console.log(`[Context] 📊 Incremental indexing: ${skippedFiles} files unchanged (skipped), ${changedFiles} files changed (re-embedded), ${filePaths.length - skippedFiles - changedFiles} new files`);
+            if (deletedChunkFiles > 0) {
+                console.log(`[Context] 🗑️  Deleted old chunks for ${deletedChunkFiles} changed files`);
             }
         }
 

@@ -4,7 +4,7 @@ export interface ContextMcpConfig {
     name: string;
     version: string;
     // Embedding provider configuration
-    embeddingProvider: 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama';
+    embeddingProvider: 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'RabbitMQ';
     embeddingModel: string;
     // Provider-specific API keys
     openaiApiKey?: string;
@@ -15,6 +15,14 @@ export interface ContextMcpConfig {
     // Ollama configuration
     ollamaModel?: string;
     ollamaHost?: string;
+    // RabbitMQ inference-queue configuration
+    rabbitmqUrl?: string;
+    rabbitmqQueue?: string;
+    rabbitmqDimension?: number;
+    rabbitmqTimeoutMs?: number;
+    rabbitmqPriority?: number;
+    rabbitmqConcurrency?: number;
+    rabbitmqSource?: string;
     // Vector database configuration
     milvusAddress?: string; // Optional, can be auto-resolved from token
     milvusToken?: string;
@@ -78,6 +86,8 @@ export function getDefaultModelForProvider(provider: string): string {
             return 'gemini-embedding-001';
         case 'Ollama':
             return 'nomic-embed-text';
+        case 'RabbitMQ':
+            return 'qwen3-embedding-8b';
         default:
             return 'text-embedding-3-small';
     }
@@ -91,6 +101,13 @@ export function getEmbeddingModelForProvider(provider: string): string {
             const ollamaModel = envManager.get('OLLAMA_MODEL') || envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
             console.log(`[DEBUG] 🎯 Ollama model selection: OLLAMA_MODEL=${envManager.get('OLLAMA_MODEL') || 'NOT SET'}, EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${ollamaModel}`);
             return ollamaModel;
+        case 'RabbitMQ':
+            // RabbitMQ passes the logical model name in the task body. The worker on the
+            // other side ignores this field for routing (routing is by queue name) but we
+            // still include it so worker-side observability / metrics stay meaningful.
+            const rmqModel = envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
+            console.log(`[DEBUG] 🎯 RabbitMQ model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${rmqModel}`);
+            return rmqModel;
         case 'OpenAI':
         case 'VoyageAI':
         case 'Gemini':
@@ -113,11 +130,16 @@ export function createMcpConfig(): ContextMcpConfig {
     console.log(`[DEBUG]   MILVUS_ADDRESS: ${envManager.get('MILVUS_ADDRESS') || 'NOT SET'}`);
     console.log(`[DEBUG]   NODE_ENV: ${envManager.get('NODE_ENV') || 'NOT SET'}`);
 
+    const rabbitmqDim = envManager.get('RABBITMQ_EMBEDDING_DIMENSION');
+    const rabbitmqTimeout = envManager.get('RABBITMQ_EMBEDDING_TIMEOUT_MS');
+    const rabbitmqPriority = envManager.get('RABBITMQ_EMBEDDING_PRIORITY');
+    const rabbitmqConcurrency = envManager.get('RABBITMQ_EMBEDDING_CONCURRENCY');
+
     const config: ContextMcpConfig = {
         name: envManager.get('MCP_SERVER_NAME') || "Context MCP Server",
         version: envManager.get('MCP_SERVER_VERSION') || "1.0.0",
         // Embedding provider configuration
-        embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama') || 'OpenAI',
+        embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'RabbitMQ') || 'OpenAI',
         embeddingModel: getEmbeddingModelForProvider(envManager.get('EMBEDDING_PROVIDER') || 'OpenAI'),
         // Provider-specific API keys
         openaiApiKey: envManager.get('OPENAI_API_KEY'),
@@ -128,6 +150,14 @@ export function createMcpConfig(): ContextMcpConfig {
         // Ollama configuration
         ollamaModel: envManager.get('OLLAMA_MODEL'),
         ollamaHost: envManager.get('OLLAMA_HOST'),
+        // RabbitMQ inference-queue configuration
+        rabbitmqUrl: envManager.get('RABBITMQ_INFERENCE_URL'),
+        rabbitmqQueue: envManager.get('RABBITMQ_EMBEDDING_QUEUE'),
+        rabbitmqDimension: rabbitmqDim ? parseInt(rabbitmqDim, 10) : undefined,
+        rabbitmqTimeoutMs: rabbitmqTimeout ? parseInt(rabbitmqTimeout, 10) : undefined,
+        rabbitmqPriority: rabbitmqPriority ? parseInt(rabbitmqPriority, 10) : undefined,
+        rabbitmqConcurrency: rabbitmqConcurrency ? parseInt(rabbitmqConcurrency, 10) : undefined,
+        rabbitmqSource: envManager.get('RABBITMQ_EMBEDDING_SOURCE'),
         // Vector database configuration - address can be auto-resolved from token
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
         milvusToken: envManager.get('MILVUS_TOKEN')
@@ -165,6 +195,15 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
         case 'Ollama':
             console.log(`[MCP]   Ollama Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}`);
             console.log(`[MCP]   Ollama Model: ${config.embeddingModel}`);
+            break;
+        case 'RabbitMQ':
+            console.log(`[MCP]   RabbitMQ URL: ${config.rabbitmqUrl ? '✅ Configured' : '❌ Missing (RABBITMQ_INFERENCE_URL)'}`);
+            console.log(`[MCP]   RabbitMQ Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b (default)'}`);
+            console.log(`[MCP]   RabbitMQ Model: ${config.embeddingModel}`);
+            console.log(`[MCP]   RabbitMQ Dimension: ${config.rabbitmqDimension ?? 4096}`);
+            console.log(`[MCP]   RabbitMQ Priority: ${config.rabbitmqPriority ?? 5}`);
+            console.log(`[MCP]   RabbitMQ Concurrency: ${config.rabbitmqConcurrency ?? 10}`);
+            console.log(`[MCP]   RabbitMQ Timeout: ${config.rabbitmqTimeoutMs ?? 30000}ms`);
             break;
     }
 
