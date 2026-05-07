@@ -10,6 +10,16 @@
         "index_codebase",
         "search_code"
       ]
+    },
+    {
+      "tools": [
+        "clear_index",
+        "get_indexing_status",
+        "index_codebase",
+        "search_code"
+      ],
+      "sha": "0d67136e4a0ee783120c385b25bfd49873a34c5b",
+      "snapshot_at": "after-66d7616"
     }
   ]
 }
