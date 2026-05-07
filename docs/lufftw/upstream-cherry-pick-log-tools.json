@@ -1,4 +1,15 @@
 {
   "schema": "tool inventory snapshots, indexed by SHA, used to compute tools/list-diff at P15",
-  "snapshots": []
+  "snapshots": [
+    {
+      "snapshot_at": "after-B1",
+      "sha": "23d6da338d2d79e9334cfdc1c6b2a70df3139efd",
+      "tools": [
+        "clear_index",
+        "get_indexing_status",
+        "index_codebase",
+        "search_code"
+      ]
+    }
+  ]
 }
