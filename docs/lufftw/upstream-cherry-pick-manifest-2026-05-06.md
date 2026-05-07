@@ -518,3 +518,129 @@ Pre-cherry-pick baseline at `upgrade/phase-b` HEAD (`1068773`, manifest-only com
 
 (Pending — separate authoring task; will produce one prescription block per CAREFUL commit's conflict hunks.)
 
+
+## Phase 0.7.0 Verification Findings (executed 2026-05-07)
+
+### A14 — Lazy-init verification (dynamic, network-blocked spawn)
+
+- `OPENAI_BASE_URL=http://127.0.0.1:1` `RABBITMQ_INFERENCE_URL=amqp://127.0.0.1:1`: jsonrpc-smoke handshake completed in ~6s; tools/list returned the expected 4-tool inventory.
+- **Conclusion: A14 = LAZY-INIT confirmed.** No NoOpStub provider needed.
+
+### A15 — SnapshotManager export + prototype methods
+
+- Export: `SnapshotManager` is a named export from `packages/mcp/dist/snapshot.js`.
+- Prototype methods (27): `isV2Format`, `loadV1Format`, `loadV2Format`, `getIndexedCodebases`, `getIndexingCodebases`, `getIndexingCodebasesWithProgress`, `getIndexingProgress`, `addIndexingCodebase`, `updateIndexingProgress`, `removeIndexingCodebase`, `addIndexedCodebase`, `removeIndexedCodebase`, `moveFromIndexingToIndexed`, `getIndexedFileCount`, `setIndexedFileCount`, `setCodebaseIndexing`, `setCodebaseIndexed`, `setCodebaseIndexFailed`, `getCodebaseStatus`, `getCodebaseInfo`, `getFailedCodebases`, `removeCodebaseCompletely`, **`loadCodebaseSnapshot`**, `ensureSnapshotFileExists`, `mergeAndWriteSnapshot`, **`saveCodebaseSnapshot`**.
+- Harness consumers use `loadCodebaseSnapshot` and `saveCodebaseSnapshot` — both present.
+
+### A16 — Spawn-lifecycle snapshot mutation
+
+- Pre-smoke SHA256: `1AF1C08D582FFFC8E9F6C951FE321D98F19D007945A0A3CACE41D27E9FD39D91`
+- Post-smoke SHA256: `A079CE5531C8DF2983AC07A3857B201157E05FC99924E3FBCAB2AB18C12DE188`
+- **Conclusion: A16 = MUTATION CONFIRMED.** Background sync writes the snapshot during smoke. Mitigation: volatile-stripping path (`stripVolatile` in baseline-capture.mjs and snapshot-smoke.mjs) and snapshot restore-from-backup at the start of every run-smoke.ps1 invocation.
+
+### A17 — Tool-list ground truth
+
+- Inventory captured at fork HEAD `1068773` (manifest commit, no cherry-picks):
+  `["clear_index","get_indexing_status","index_codebase","search_code"]`
+- Matches plan prediction.
+
+### A19 — MCP_DISABLE_BACKGROUND_SYNC
+
+- Source-grep: NOT PRESENT in fork. Volatile-stripping path is unconditional.
+
+### A20 — RabbitMQEmbedding constructor + methods
+
+- Constructor: `constructor(config: RabbitMQEmbeddingConfig)` — single object param.
+- Required fields: `url`, `queue`, **`modelName`** (NOT `model`), `dimension`.
+- Optional: `timeoutMs`, `priority`, `concurrency`, `heartbeat`, `source`, `connectFn`.
+- Prototype methods: `initialize`, `_doInitialize`, `resetState`, `close`, `embed`, **`embedBatch`**, `detectDimension`, `getDimension`, `getProvider`, `sendOne`.
+- Probe script `probe-rabbitmq-worker.mjs` calls `embedBatch(['test'])` → confirmed present.
+- **Probe-script bug found and fixed in flight: was passing `model` instead of `modelName`** (commit `cde3eb5`).
+
+### A20.queue — Probe queue ground truth
+
+- From `docs/lufftw/rabbitmq-embedding-provider.md`: `embedding.qwen3-8b`
+- Saved to `C:\Users\luff\AppData\Local\Temp\probe-queue.txt` for B3.4.0.1 to source.
+
+### A-stderr regex
+
+- Pattern: `console\.log\s*=\s*\([^)]*\)\s*=>\s*\{[\s\S]*?process\.stderr\.write`
+- Matches `packages/mcp/src/index.ts:8-10`. Verified.
+
+### A-envManager export shape
+
+- Both `EnvManager` (class) AND `envManager` (singleton) exported from `packages/core/dist/utils/env-manager.js`. Locking-coexistence ALS-isolation handles either.
+
+## Phase 0.6 — Snapshot Baseline (Node-computed via baseline-capture.mjs)
+
+- formatVersion: `v2`
+- bytesStripped: `2568`
+- codebaseCount: `19`
+- indexedCount: `19`
+- codebases (sorted):
+  - `E:\Developer\lufftw\repo\claude-context`
+  - `E:\Developer\lufftw\repo\dev-machine-setup`
+  - `E:\Developer\lufftw\repo\event-chat-repo`
+  - `E:\Developer\lufftw\repo\event-chat-service`
+  - `E:\Developer\lufftw\repo\event-crawler`
+  - `E:\Developer\lufftw\repo\event-crawler-worker`
+  - `E:\Developer\lufftw\repo\event-model-worker`
+  - `E:\Developer\lufftw\repo\event-platform-infra`
+  - `E:\Developer\lufftw\repo\event-search-service`
+  - `E:\Developer\lufftw\repo\finetune-datasets`
+  - `E:\Developer\lufftw\repo\gpu-coordinator`
+  - `E:\Developer\lufftw\repo\harness-research`
+  - `E:\Developer\lufftw\repo\mcp-doc-search`
+  - `E:\Developer\lufftw\repo\mcp-services`
+  - `E:\Developer\lufftw\repo\milvus-services`
+  - `E:\Developer\lufftw\repo\organization-data-layer`
+  - `E:\Developer\lufftw\repo\poi-data-layer`
+  - `E:\Developer\lufftw\repo\poi-data-layer-crawler-worker`
+  - `E:\Developer\lufftw\repo\taiwan-address-normalizer`
+
+## Phase 0.7.8 — Placeholder Patch + Post-patch Sanity
+
+- Whole-pattern swap regex applied to all 6 placeholders.
+- All defaults (`0`, `'v1'`, `[]`, `/__placeholder_never_matches__/`) successfully replaced.
+- Post-patch sanity: 6/6 PASS — gates are real, not vacuous.
+- Committed at `61d184b`.
+
+## Phase 0.8 — Baseline Build & Smoke Pass
+
+- `pnpm typecheck`: PASS (all packages)
+- `pnpm build`: PASS (all packages, exit 0)
+- `scripts/run-smoke.ps1`:
+  - jsonrpc-smoke: `[smoke] OK initialize+tools/list`
+  - snapshot-smoke: `[snap-smoke] OK production-baseline + V1 + V2 fixtures pass`
+  - feature-regression: `[fregr] OK static feature regressions pass` (17/17)
+  - Tools inventory written to manifest log JSON.
+
+## In-Flight Findings & Fixes (commit `cde3eb5`)
+
+1. **Cold-start time**: native-module load (@zilliz/milvus2-sdk-node + tree-sitter) takes 20+ seconds on first import. Initial 8-second timeouts in jsonrpc-smoke were too short; raised to 45s. `--help` runs in 5s on warm cache.
+2. **Windows ESM dynamic import**: `await import('E:\path')` fails with `ERR_UNSUPPORTED_ESM_URL_SCHEME`. Fixed by wrapping with `pathToFileURL()` in snapshot-smoke.mjs, locking-coexistence.mjs, probe-rabbitmq-worker.mjs.
+3. **V1 fixture path-existence prune**: SnapshotManager removes codebase paths that no longer exist on disk during V1→V2 migration. Fixtures rewritten to use real worktree paths so migration completes with non-empty result.
+4. **Probe RabbitMQEmbedding `modelName`**: constructor required field is `modelName`, not `model`. Probe script corrected.
+5. **embedding/index.ts re-export**: file re-exports via `export * from './rabbitmq-embedding'` (lowercase file path), not literal `RabbitMQEmbedding` symbol. Regex updated to match either form.
+
+## Phase 0 Status — Ready for User Review (Phase 0.9 Gate)
+
+- ✅ Workspace repo + plan mirror
+- ✅ Environment + 28 SHAs + 5 Phase A SHAs verified
+- ✅ Worktree + manifest + log scaffolding
+- ✅ Hotspot SHA256 baselines
+- ✅ Per-commit dry-run + cumulative dry-run + cumulative-build
+- ✅ Snapshot backup + throwaway home + smoke env scripts
+- ✅ Harness scripts + fixtures committed
+- ✅ All A14-A22 verifications passed
+- ✅ Node baseline capture (19 codebases, 2568 stripped bytes)
+- ✅ Placeholder patch + post-patch sanity
+- ✅ Baseline build + run-smoke.ps1 PASS
+- ⏸ Phase 0.2.X **per-hunk resolution prescriptions** — DEFERRED to a separate focused session per user choice (path A)
+
+Phase 0 commits on `upgrade/phase-b`:
+- `1068773` manifest scaffolding
+- `0f6cdc8` conflict map + cumulative dry-run + roster substitution
+- `db868d9` harness scripts with placeholders + ignore backups/
+- `61d184b` seeded constants
+- `cde3eb5` Windows ESM + RabbitMQ + regex fixes
