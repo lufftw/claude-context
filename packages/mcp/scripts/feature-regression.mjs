@@ -42,7 +42,8 @@ must('rabbitmq-embedding.ts present (>1KB)', rmqTs.length > 1000);
 must('rabbitmq-embedding.ts default dim 4096', /\b4096\b/.test(rmqTs));
 must('rabbitmq-embedding.ts has getDimension', /getDimension\s*\(\s*\)/.test(rmqTs));
 const embIdx = read('packages/core/src/embedding/index.ts');
-must('embedding/index.ts exports RabbitMQEmbedding', /RabbitMQEmbedding/.test(embIdx));
+// Match either the lowercase file re-export OR the class name literal.
+must('embedding/index.ts exports rabbitmq-embedding', /rabbitmq-embedding|RabbitMQEmbedding/.test(embIdx));
 
 // 5. base-embedding.ts — UTF-16 surrogate guard.
 const baseTs = read('packages/core/src/embedding/base-embedding.ts');

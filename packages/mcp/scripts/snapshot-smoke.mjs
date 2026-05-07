@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '../../..');
@@ -70,16 +70,20 @@ if (idx !== BASELINE.indexedCount) {
   process.exit(14);
 }
 
-// V1/V2 fixture round-trip.
-const importPath = process.env.SNAPSHOT_MGR_IMPORT
+// V1/V2 fixture round-trip. On Windows, ESM dynamic import() needs file:// URLs.
+const importPathRaw = process.env.SNAPSHOT_MGR_IMPORT
   ?? path.resolve(here, '..', 'dist', 'snapshot.js');
-const mod = await import(importPath);
+const importUrl = importPathRaw.startsWith('file:') ? importPathRaw : pathToFileURL(importPathRaw).href;
+const mod = await import(importUrl);
 const SnapshotManager = mod.SnapshotManager ?? mod.default?.SnapshotManager;
 if (!SnapshotManager) {
   console.error('[snap-smoke] FAIL: SnapshotManager not found in', importPath);
   process.exit(15);
 }
 
+// Fixture round-trip: confirm load+save does not throw. Fork's SnapshotManager
+// auto-migrates V1->V2 and prunes paths that no longer exist on disk; we use real
+// repo paths in the fixtures so prune doesn't empty them.
 for (const fixture of ['snapshot-v1.json', 'snapshot-v2.json']) {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'snap-fixture-'));
   fs.copyFileSync(path.join(repoRoot, 'packages/mcp/__fixtures__', fixture), path.join(tmpHome, 'mcp-codebase-snapshot.json'));
@@ -87,9 +91,16 @@ for (const fixture of ['snapshot-v1.json', 'snapshot-v2.json']) {
   process.env.CLAUDE_CONTEXT_HOME = tmpHome;
   try {
     const sm = new SnapshotManager();
-    const loaded = sm.loadCodebaseSnapshot ? sm.loadCodebaseSnapshot() : sm.load?.();
-    if (!loaded) { console.error(`[snap-smoke] FAIL ${fixture}: load returned falsy`); process.exit(16); }
-    console.error(`[snap-smoke] ${fixture}: loaded`);
+    let threw = null;
+    try {
+      if (typeof sm.loadCodebaseSnapshot === 'function') sm.loadCodebaseSnapshot();
+      else if (typeof sm.load === 'function') sm.load();
+    } catch (e) { threw = e; }
+    if (threw) { console.error(`[snap-smoke] FAIL ${fixture}: load threw ${threw.message}`); process.exit(16); }
+    // After load (which may auto-migrate + save), the file should exist and parse as V2.
+    const after = JSON.parse(fs.readFileSync(path.join(tmpHome, 'mcp-codebase-snapshot.json'), 'utf8'));
+    if (after.formatVersion !== 'v2') { console.error(`[snap-smoke] FAIL ${fixture}: post-load formatVersion=${after.formatVersion} expected v2`); process.exit(17); }
+    console.error(`[snap-smoke] ${fixture}: loaded + auto-migrated to v2`);
   } finally {
     process.env.CLAUDE_CONTEXT_HOME = prevHome;
     fs.rmSync(tmpHome, { recursive: true, force: true });

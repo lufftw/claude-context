@@ -12,10 +12,11 @@
 // Default method called: emb.embedBatch(['test']). Fallback: emb.embed(['test']) or emb.embed('test').
 
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '../../..');
+const toFileUrl = (p) => p.startsWith('file:') ? p : pathToFileURL(p).href;
 
 const url = process.env.RABBITMQ_INFERENCE_URL;
 const queue = process.env.RABBITMQ_EMBEDDING_QUEUE;
@@ -24,7 +25,7 @@ if (!queue) { console.error('[probe] RABBITMQ_EMBEDDING_QUEUE required'); proces
 if (url.includes('127.0.0.1:1') || url.includes('noop')) { console.error('[probe] REFUSING noop URL'); process.exit(3); }
 
 const rmqPath = path.resolve(repoRoot, 'packages/core/dist/embedding/rabbitmq-embedding.js');
-const mod = await import(rmqPath);
+const mod = await import(toFileUrl(rmqPath));
 const RabbitMQEmbedding = mod.RabbitMQEmbedding ?? mod.default?.RabbitMQEmbedding;
 if (!RabbitMQEmbedding) { console.error('[probe] RabbitMQEmbedding not exported from', rmqPath); process.exit(4); }
 
@@ -33,7 +34,7 @@ try {
   emb = new RabbitMQEmbedding({
     url,
     queue,
-    model: process.env.RABBITMQ_EMBEDDING_MODEL ?? 'qwen3-embedding-8b',
+    modelName: process.env.RABBITMQ_EMBEDDING_MODEL ?? 'qwen3-embedding-8b',
     dimension: 4096
   });
 } catch (e) {

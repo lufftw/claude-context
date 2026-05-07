@@ -17,7 +17,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const toFileUrl = (p) => p.startsWith('file:') ? p : pathToFileURL(p).href;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '../../..');
@@ -34,7 +36,7 @@ const snapImportPath = process.env.SNAPSHOT_MGR_IMPORT
 if (writeOnce) {
   if (!home) { console.error('--write-once requires --home or $CLAUDE_CONTEXT_HOME'); process.exit(2); }
   process.env.CLAUDE_CONTEXT_HOME = home;
-  const mod = await import(snapImportPath);
+  const mod = await import(toFileUrl(snapImportPath));
   const SnapshotManager = mod.SnapshotManager ?? mod.default?.SnapshotManager;
   if (!SnapshotManager) { console.error('SnapshotManager not exported'); process.exit(2); }
   const sm = new SnapshotManager();
@@ -59,7 +61,8 @@ if (role === 'writer-A' || role === 'writer-B') {
   process.env.CLAUDE_CONTEXT_HOME = home;
 
   const lockfile = (await import('proper-lockfile')).default ?? (await import('proper-lockfile'));
-  const mod = await import(snapImportPath);
+  // (bare specifier 'proper-lockfile' resolves via Node module resolution, no URL conversion needed)
+  const mod = await import(toFileUrl(snapImportPath));
   const SnapshotManager = mod.SnapshotManager ?? mod.default?.SnapshotManager;
   if (!SnapshotManager) { console.error('SnapshotManager not exported'); process.exit(2); }
   const sm = new SnapshotManager();
@@ -92,7 +95,7 @@ if (role === 'writer-A' || role === 'writer-B') {
 
 if (role === 'als-isolation') {
   const envModPath = path.resolve(repoRoot, 'packages/core/dist/utils/env-manager.js');
-  const envMod = await import(envModPath);
+  const envMod = await import(toFileUrl(envModPath));
   const envManager = envMod.envManager
     ?? (envMod.EnvManager ? new envMod.EnvManager() : null)
     ?? envMod.default?.envManager
