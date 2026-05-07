@@ -1,0 +1,9 @@
+{
+  "formatVersion": "v2",
+  "codebases": {
+    "/fake/project-a": { "status": "indexed", "indexedFiles": 10, "totalChunks": 100, "lastUpdated": "2024-01-01T00:00:00.000Z" },
+    "/fake/project-b": { "status": "indexing", "progress": 50, "lastUpdated": "2024-01-01T00:00:00.000Z" },
+    "/fake/project-c": { "status": "indexFailed", "error": "test", "lastUpdated": "2024-01-01T00:00:00.000Z" }
+  },
+  "lastUpdated": "2024-01-01T00:00:00.000Z"
+}
