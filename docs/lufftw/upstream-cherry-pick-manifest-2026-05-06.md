@@ -644,3 +644,75 @@ Phase 0 commits on `upgrade/phase-b`:
 - `db868d9` harness scripts with placeholders + ignore backups/
 - `61d184b` seeded constants
 - `cde3eb5` Windows ESM + RabbitMQ + regex fixes
+
+### Batch 2 (15 commits): synthesis-budget evaluated; final Phase B vs Phase A split
+
+#### Phase B (proceed) — 5 cleanly-applying CAREFUL
+
+- `c937690` (skip dotfiles): cumulative dry-run CLEAN. Direct cherry-pick.
+- `bb44da9` (cloud-sync in handler): cumulative dry-run CLEAN. Direct cherry-pick.
+- `6289035` (prevent concurrent background sync): cumulative dry-run CLEAN. Direct cherry-pick. **Note**: B3.4.4 (multi-process locking-coexistence test) gates acceptance; the synthetic `locking-coexistence.mjs` tests are pre-Phase-B independent of this cherry-pick.
+
+#### Phase B (proceed) — 5 medium-conflict CAREFUL with budget ≤ 4
+
+- `66d7616` (FileSynchronizer extension alignment) — budget=2 (context.ts=1 handlers.ts=1)
+  - `core/src/context.ts`: **TAKE THEIRS** for the supportedExtensions threading parameter; preserve fork's `runWithProject` wrappers and dual-write `processChunkBatch` branches.
+  - `core/src/sync/synchronizer.ts`: **TAKE THEIRS** — non-hotspot.
+  - `mcp/src/handlers.ts`: **TAKE THEIRS** for the `ToolHandlers` constructor signature change; preserve fork's `handleGetIndexingStatus`/`handleSearchCode` body.
+  - `packages/vscode-extension/src/commands/indexCommand.ts`: **TAKE THEIRS** as-is. After `--continue`, run `pnpm --filter <vscode-pkg> build` to verify.
+
+- `968cce6` (orphan merkle snapshots) — budget=1 (handlers.ts=1)
+  - `mcp/src/handlers.ts`: **SYNTHESIZE (mechanical)** — insert upstream's orphan-cleanup call into fork's `handleGetIndexingStatus`-or-`startup-recovery` block. Preserve fork's ghost-resurrection guard (`removedCodebases`); upstream's orphan-cleanup targets a different class of stale entry.
+
+- `76497e1` (snapshot merge & indexing stuck) — budget=3 (snapshot.ts=3)
+  - `mcp/src/snapshot.ts`: 3 hunks. For EACH hunk, evaluate: does fork's `proper-lockfile` lock already prevent the bug upstream fixes? If yes → `--ours` (keep fork). If no → port upstream patch on top of fork lock.
+  - Likely majority `--ours` because fork's lockfile-based serialization already prevents the data-race upstream addresses (#276/#282).
+  - Survival-grep gate: `proper-lockfile` and `removedCodebases` MUST remain in snapshot.ts post-resolution.
+
+- `b03ebac` (subdirectory paths) — budget=2 (handlers.ts=2)
+  - `mcp/src/handlers.ts`: 2 hunks. **TAKE THEIRS** for both — upstream adds path-resolution helper. Insert BEFORE fork's `runWithProject` call so project path is normalized before env loading.
+
+- `be107de` (root-anchored ignore patterns) — budget=0
+  - `core/src/context.ignore-patterns.test.ts`: **DEPENDS ON `e368a97`** which is DEFERRED. The test file does not exist in fork without `e368a97`. Resolution: **SKIP-CASCADE**. Drop `be107de` along with `e368a97` family.
+
+  *Update*: `be107de` reclassified to **SKIP-CASCADE (depends on e368a97 DEFER)**.
+
+  - `core/src/sync/synchronizer.ts`: alone, would be take-theirs mechanical. But this commit is bundled with the test file change. Drop entirely.
+
+#### Phase B (proceed) — 3 trivial-conflict CAREFUL (Batch 1 already prescribed above)
+
+`a83f260`, `cdad7ab`, `fa93b64`.
+
+#### Phase B (proceed) — 5 cleanly-applying SAFE/CAREFUL
+
+`e447095` (Dart), `b7755c3` (unreachable throw), `c937690`, `bb44da9`, `6289035` listed above.
+
+#### Phase A (DEFER) — 7 commits over synthesis-budget (>4 markers in context+handlers+snapshot)
+
+| SHA | Budget | Hotspots | Reason |
+|-----|--------|----------|--------|
+| `ae0fd79` | 5 | snapshot.ts=2 handlers.ts=3 | Fork's `proper-lockfile` serialization already prevents most of the race this fixes; remaining diff requires structural synthesis around `mergeAndWriteSnapshot`. Re-evaluate in Phase A on top of upstream's restructured `snapshot.ts`. |
+| `e368a97` | 5 | context.ts=4 handlers.ts=1 | Per-codebase ignore-pattern isolation requires reworking fork's `runWithProject` wrappers around the ignore-pattern field. Fork's instance-level `ignorePatterns` and upstream's per-call parameter are competing designs; merge belongs in Phase A. |
+| `b56ca04` | 8 | context.ts=3 handlers.ts=5 | Same pattern as `e368a97` for `customExtensions`. SKIP-CASCADE if e368a97 deferred (same architectural conflict). |
+| `291863a` | 8 | context.ts=4 handlers.ts=4 | `AbortController` integration touches the `processFileList` batch loop where fork tracks `consecutiveBatchErrors`. Synthesis between two error-budget abstractions; defer to Phase A. |
+| `ead19f4` | 8 | context.ts=3 handlers.ts=4 snapshot.ts=1 | Request-scoped splitter option threads through 6 files including all 4 hotspots. Largest refactor in upstream; defer to Phase A. |
+| `d2ef81c` | 5 | snapshot.ts=2 context.ts=1 handlers.ts=2 | Depends on `ead19f4`; SKIP-CASCADE. |
+| `3ed9375` | 5 | snapshot.ts=4 handlers.ts=1 | search_code VectorDB fallback needs the `getSharedCollectionName` integration to be aware of fork's multi-collection design; cleaner in Phase A. |
+| `be107de` | 0 | — | SKIP-CASCADE (depends on `e368a97`'s test file infrastructure). |
+
+**Phase A Tracked Feature List update**: append these 8 SHAs (7 DEFER + 1 SKIP-CASCADE) to the Phase A roadmap. Combined with the original 5 deferred features (`82a37ad`, `3675469`, `62323f4`, `c93138b`, `d4ad9ec`), Phase A now has 13 candidates.
+
+## Phase B Final Roster (after Phase 0.2.X synthesis-budget evaluation)
+
+**To cherry-pick in Phase B (20 commits):**
+
+SAFE-bucket (9): `c912741`, `0bfff25`, `1ebda84`, `a99939e`, `2474e6f`, `f3f22b0`, `cdbd75b`, `c0cc3cc`, `cdad7ab` (substituted from `0f7a82e`).
+
+CAREFUL-bucket (11):
+- Cleanly-applying: `e447095`, `b7755c3`, `c937690`, `bb44da9`, `6289035`.
+- Trivial-conflict: `a83f260`, `fa93b64`.
+- Medium-conflict: `66d7616`, `968cce6`, `76497e1`, `b03ebac`.
+
+**DEFER TO PHASE A (8 commits):** `ae0fd79`, `e368a97`, `b56ca04`, `291863a`, `ead19f4`, `d2ef81c`, `3ed9375`, `be107de`.
+
+**Re-bucket count: 9 SAFE + 11 CAREFUL + 8 DEFER = 28.** `cdad7ab` substitutes `0f7a82e` (merge commit).
