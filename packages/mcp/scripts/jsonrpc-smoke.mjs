@@ -22,7 +22,7 @@ if (!home || home.includes('claude-control-center')) {
 
 // EXPECTED tool list. Default [] makes the superset check vacuous;
 // Task 0.7.8 patches this to the actual tool inventory captured at Task 0.7.0d.
-const EXPECTED = /* __EXPECTED_TOOLS__ */ [];
+const EXPECTED = ['clear_index','get_indexing_status','index_codebase','search_code'];
 const FORBIDDEN_PREFIX = '_internal';
 
 const binaryPath = path.join(repoRoot, 'packages/mcp/dist/index.js');
@@ -50,8 +50,10 @@ child.stdout.on('data', (chunk) => {
 child.stderr.on('data', (chunk) => { stderrBuf += chunk.toString('utf8'); });
 
 const send = (obj) => child.stdin.write(JSON.stringify(obj) + '\n');
-const expect = async (id) => {
-  const dl = Date.now() + 8000;
+const expect = async (id, timeoutMs = 45000) => {
+  // Cold-start of @zilliz/milvus2-sdk-node + tree-sitter natives can take 20+s on Windows.
+  // initialize gets the longer 45s budget; subsequent calls can pass shorter values.
+  const dl = Date.now() + timeoutMs;
   while (Date.now() < dl) {
     while (stdoutMessages.length) {
       const msg = stdoutMessages.shift();

@@ -50,7 +50,7 @@ must('base-embedding.ts has surrogate guard', /0xD800|0xDBFF|surrogate/i.test(ba
 
 // 6. mcp/src/index.ts — stderr redirect. Default placeholder regex never matches; Task 0.7.8 patches.
 const idxTs = read('packages/mcp/src/index.ts');
-const STDERR_REGEX = /* __STDERR_REDIRECT_REGEX_VERIFIED__ */ /__placeholder_never_matches__/;
+const STDERR_REGEX = /console\.log\s*=\s*\([^)]*\)\s*=>\s*\{[\s\S]*?process\.stderr\.write/;
 must('mcp/src/index.ts redirects to stderr', STDERR_REGEX.test(idxTs));
 
 if (fails.count) { console.error(`[fregr] ${fails.count} FAIL(s)`); process.exit(20); }

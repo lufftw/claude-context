@@ -18,11 +18,11 @@ if (!home || home.includes('claude-control-center')) {
 
 // Baseline values — populated by Task 0.7.8 via whole-pattern swap on the leading-comment markers.
 const BASELINE = {
-  bytesStripped: /* __BASELINE_BYTES_STRIPPED__ */ 0,
-  codebaseCount: /* __BASELINE_CODEBASE_COUNT__ */ 0,
-  indexedCount:  /* __BASELINE_INDEXED_COUNT__ */ 0,
-  formatVersion: /* __BASELINE_FORMAT_VERSION__ */ 'v1',
-  codebasesSorted: /* __BASELINE_CODEBASES_SORTED__ */ []
+  bytesStripped: 2568,
+  codebaseCount: 19,
+  indexedCount:  19,
+  formatVersion: 'v2',
+  codebasesSorted: ["E:\\Developer\\lufftw\\repo\\claude-context","E:\\Developer\\lufftw\\repo\\dev-machine-setup","E:\\Developer\\lufftw\\repo\\event-chat-repo","E:\\Developer\\lufftw\\repo\\event-chat-service","E:\\Developer\\lufftw\\repo\\event-crawler","E:\\Developer\\lufftw\\repo\\event-crawler-worker","E:\\Developer\\lufftw\\repo\\event-model-worker","E:\\Developer\\lufftw\\repo\\event-platform-infra","E:\\Developer\\lufftw\\repo\\event-search-service","E:\\Developer\\lufftw\\repo\\finetune-datasets","E:\\Developer\\lufftw\\repo\\gpu-coordinator","E:\\Developer\\lufftw\\repo\\harness-research","E:\\Developer\\lufftw\\repo\\mcp-doc-search","E:\\Developer\\lufftw\\repo\\mcp-services","E:\\Developer\\lufftw\\repo\\milvus-services","E:\\Developer\\lufftw\\repo\\organization-data-layer","E:\\Developer\\lufftw\\repo\\poi-data-layer","E:\\Developer\\lufftw\\repo\\poi-data-layer-crawler-worker","E:\\Developer\\lufftw\\repo\\taiwan-address-normalizer"]
 };
 
 const stripVolatile = (obj) => {
