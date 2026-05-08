@@ -20,6 +20,16 @@
       ],
       "sha": "0d67136e4a0ee783120c385b25bfd49873a34c5b",
       "snapshot_at": "after-66d7616"
+    },
+    {
+      "sha": "e944f6a01683305456b7b59111c3d4e8995efe60",
+      "tools": [
+        "clear_index",
+        "get_indexing_status",
+        "index_codebase",
+        "search_code"
+      ],
+      "snapshot_at": "after-B1-complete"
     }
   ]
 }

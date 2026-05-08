@@ -50,9 +50,10 @@ child.stdout.on('data', (chunk) => {
 child.stderr.on('data', (chunk) => { stderrBuf += chunk.toString('utf8'); });
 
 const send = (obj) => child.stdin.write(JSON.stringify(obj) + '\n');
-const expect = async (id, timeoutMs = 45000) => {
+const expect = async (id, timeoutMs = 120000) => {
   // Cold-start of @zilliz/milvus2-sdk-node + tree-sitter natives can take 20+s on Windows.
-  // initialize gets the longer 45s budget; subsequent calls can pass shorter values.
+  // After Phase B1 cherry-picks, eager background-sync at boot delays initialize response
+  // to ~60s on cold cache (19 codebases × ~20s each merkle scan). 120s budget covers warmup.
   const dl = Date.now() + timeoutMs;
   while (Date.now() < dl) {
     while (stdoutMessages.length) {
