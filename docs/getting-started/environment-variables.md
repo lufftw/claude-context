@@ -47,6 +47,7 @@ Claude Context supports a global configuration file at `~/.context/.env` to simp
 |----------|-------------|---------|
 | `MILVUS_TOKEN` | Milvus authentication token. Get [Zilliz Personal API Key](https://github.com/zilliztech/claude-context/blob/master/assets/signup_and_get_apikey.png) | Recommended |
 | `MILVUS_ADDRESS` | Milvus server address. Optional when using Zilliz Personal API Key | Auto-resolved from token |
+| `MILVUS_COLLECTION_LIMIT_CHECK_TIMEOUT_MS` | Timeout for gRPC pre-check in `checkCollectionLimit()` before indexing begins | `15000` |
 
 ### Ollama (Optional)
 | Variable | Description | Default |
@@ -73,6 +74,7 @@ cat > ~/.context/.env << 'EOF'
 EMBEDDING_PROVIDER=OpenAI
 OPENAI_API_KEY=sk-your-openai-api-key
 EMBEDDING_MODEL=text-embedding-3-small
+MILVUS_ADDRESS=your-zilliz-cloud-public-endpoint
 MILVUS_TOKEN=your-zilliz-cloud-api-key
 EOF
 ```
@@ -83,7 +85,11 @@ See the [Example File](../../.env.example) for more details.
 
 **Claude Code:**
 ```bash
-claude mcp add claude-context -- npx @zilliz/claude-context-mcp@latest
+claude mcp add claude-context \
+  -e OPENAI_API_KEY=sk-your-openai-api-key \
+  -e MILVUS_ADDRESS=your-zilliz-cloud-public-endpoint \
+  -e MILVUS_TOKEN=your-zilliz-cloud-api-key \
+  -- npx @zilliz/claude-context-mcp@latest
 ```
 
 **Cursor/Windsurf/Others:**

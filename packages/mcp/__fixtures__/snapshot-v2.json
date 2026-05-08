@@ -1,0 +1,8 @@
+{
+  "formatVersion": "v2",
+  "codebases": {
+    "E:\\Developer\\lufftw\\repo\\claude-context-upgrade": { "status": "indexed", "indexedFiles": 10, "totalChunks": 100, "lastUpdated": "2024-01-01T00:00:00.000Z" },
+    "E:\\Developer\\lufftw\\repo\\claude-context": { "status": "indexing", "progress": 50, "lastUpdated": "2024-01-01T00:00:00.000Z" }
+  },
+  "lastUpdated": "2024-01-01T00:00:00.000Z"
+}

@@ -4,7 +4,7 @@ export interface ContextMcpConfig {
     name: string;
     version: string;
     // Embedding provider configuration
-    embeddingProvider: 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'RabbitMQ';
+    embeddingProvider: 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'OpenRouter' | 'RabbitMQ';
     embeddingModel: string;
     // Provider-specific API keys
     openaiApiKey?: string;
@@ -12,9 +12,12 @@ export interface ContextMcpConfig {
     voyageaiApiKey?: string;
     geminiApiKey?: string;
     geminiBaseUrl?: string;
+    // OpenRouter configuration
+    openrouterApiKey?: string;
     // Ollama configuration
     ollamaModel?: string;
     ollamaHost?: string;
+    ollamaDimension?: number;
     // RabbitMQ inference-queue configuration
     rabbitmqUrl?: string;
     rabbitmqQueue?: string;
@@ -84,6 +87,8 @@ export function getDefaultModelForProvider(provider: string): string {
             return 'voyage-code-3';
         case 'Gemini':
             return 'gemini-embedding-001';
+        case 'OpenRouter':
+            return 'openai/text-embedding-3-small';
         case 'Ollama':
             return 'nomic-embed-text';
         case 'RabbitMQ':
@@ -111,6 +116,7 @@ export function getEmbeddingModelForProvider(provider: string): string {
         case 'OpenAI':
         case 'VoyageAI':
         case 'Gemini':
+        case 'OpenRouter':
         default:
             // For all other providers, use EMBEDDING_MODEL or default
             const selectedModel = envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
@@ -119,11 +125,27 @@ export function getEmbeddingModelForProvider(provider: string): string {
     }
 }
 
+function getPositiveIntegerFromEnv(name: string): number | undefined {
+    const rawValue = envManager.get(name);
+    if (!rawValue) {
+        return undefined;
+    }
+
+    const parsedValue = Number(rawValue);
+    if (Number.isInteger(parsedValue) && parsedValue > 0) {
+        return parsedValue;
+    }
+
+    console.warn(`[DEBUG] ⚠️  Ignoring invalid ${name}: ${rawValue}. Expected a positive integer.`);
+    return undefined;
+}
+
 export function createMcpConfig(): ContextMcpConfig {
     // Debug: Print all environment variables related to Context
     console.log(`[DEBUG] 🔍 Environment Variables Debug:`);
     console.log(`[DEBUG]   EMBEDDING_PROVIDER: ${envManager.get('EMBEDDING_PROVIDER') || 'NOT SET'}`);
     console.log(`[DEBUG]   EMBEDDING_MODEL: ${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}`);
+    console.log(`[DEBUG]   EMBEDDING_DIMENSION: ${envManager.get('EMBEDDING_DIMENSION') || 'NOT SET'}`);
     console.log(`[DEBUG]   OLLAMA_MODEL: ${envManager.get('OLLAMA_MODEL') || 'NOT SET'}`);
     console.log(`[DEBUG]   GEMINI_API_KEY: ${envManager.get('GEMINI_API_KEY') ? 'SET (length: ' + envManager.get('GEMINI_API_KEY')!.length + ')' : 'NOT SET'}`);
     console.log(`[DEBUG]   OPENAI_API_KEY: ${envManager.get('OPENAI_API_KEY') ? 'SET (length: ' + envManager.get('OPENAI_API_KEY')!.length + ')' : 'NOT SET'}`);
@@ -139,7 +161,7 @@ export function createMcpConfig(): ContextMcpConfig {
         name: envManager.get('MCP_SERVER_NAME') || "Context MCP Server",
         version: envManager.get('MCP_SERVER_VERSION') || "1.0.0",
         // Embedding provider configuration
-        embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'RabbitMQ') || 'OpenAI',
+        embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'OpenRouter' | 'RabbitMQ') || 'OpenAI',
         embeddingModel: getEmbeddingModelForProvider(envManager.get('EMBEDDING_PROVIDER') || 'OpenAI'),
         // Provider-specific API keys
         openaiApiKey: envManager.get('OPENAI_API_KEY'),
@@ -147,9 +169,12 @@ export function createMcpConfig(): ContextMcpConfig {
         voyageaiApiKey: envManager.get('VOYAGEAI_API_KEY'),
         geminiApiKey: envManager.get('GEMINI_API_KEY'),
         geminiBaseUrl: envManager.get('GEMINI_BASE_URL'),
+        // OpenRouter configuration
+        openrouterApiKey: envManager.get('OPENROUTER_API_KEY'),
         // Ollama configuration
         ollamaModel: envManager.get('OLLAMA_MODEL'),
         ollamaHost: envManager.get('OLLAMA_HOST'),
+        ollamaDimension: getPositiveIntegerFromEnv('EMBEDDING_DIMENSION'),
         // RabbitMQ inference-queue configuration
         rabbitmqUrl: envManager.get('RABBITMQ_INFERENCE_URL'),
         rabbitmqQueue: envManager.get('RABBITMQ_EMBEDDING_QUEUE'),
@@ -192,9 +217,15 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
                 console.log(`[MCP]   Gemini Base URL: ${config.geminiBaseUrl}`);
             }
             break;
+        case 'OpenRouter':
+            console.log(`[MCP]   OpenRouter API Key: ${config.openrouterApiKey ? '✅ Configured' : '❌ Missing'}`);
+            break;
         case 'Ollama':
             console.log(`[MCP]   Ollama Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}`);
             console.log(`[MCP]   Ollama Model: ${config.embeddingModel}`);
+            if (config.ollamaDimension) {
+                console.log(`[MCP]   Ollama Embedding Dimension: ${config.ollamaDimension}`);
+            }
             break;
         case 'RabbitMQ':
             console.log(`[MCP]   RabbitMQ URL: ${config.rabbitmqUrl ? '✅ Configured' : '❌ Missing (RABBITMQ_INFERENCE_URL)'}`);
@@ -224,8 +255,9 @@ Environment Variables:
   MCP_SERVER_VERSION      Server version
   
   Embedding Provider Configuration:
-  EMBEDDING_PROVIDER      Embedding provider: OpenAI, VoyageAI, Gemini, Ollama (default: OpenAI)
+  EMBEDDING_PROVIDER      Embedding provider: OpenAI, VoyageAI, Gemini, Ollama, OpenRouter (default: OpenAI)
   EMBEDDING_MODEL         Embedding model name (works for all providers)
+  EMBEDDING_DIMENSION     Optional embedding dimension override for Ollama
   
   Provider-specific API Keys:
   OPENAI_API_KEY          OpenAI API key (required for OpenAI provider)
@@ -233,7 +265,8 @@ Environment Variables:
   VOYAGEAI_API_KEY        VoyageAI API key (required for VoyageAI provider)
   GEMINI_API_KEY          Google AI API key (required for Gemini provider)
   GEMINI_BASE_URL         Gemini API base URL (optional, for custom endpoints)
-  
+  OPENROUTER_API_KEY      OpenRouter API key (required for OpenRouter provider)
+
   Ollama Configuration:
   OLLAMA_HOST             Ollama server host (default: http://127.0.0.1:11434)
   OLLAMA_MODEL            Ollama model name (alternative to EMBEDDING_MODEL for Ollama)

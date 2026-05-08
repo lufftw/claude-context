@@ -130,6 +130,9 @@ EMBEDDING_MODEL=nomic-embed-text
 
 # Optional: Specify Ollama host (default: http://127.0.0.1:11434)
 OLLAMA_HOST=http://127.0.0.1:11434
+
+# Optional: Override embedding dimension to skip runtime dimension detection
+EMBEDDING_DIMENSION=768
 ```
 
 **Setup Instructions:**
@@ -159,6 +162,9 @@ Copy your Personal Key to replace `your-zilliz-cloud-api-key` in the configurati
 
 ```bash
 MILVUS_TOKEN=your-zilliz-cloud-api-key
+
+# Optional: increase timeout for Milvus collection-limit pre-check on slow clusters (default: 15000)
+MILVUS_COLLECTION_LIMIT_CHECK_TIMEOUT_MS=30000
 ```
 
 #### Embedding Batch Size
@@ -192,7 +198,7 @@ Use the command line interface to add the Claude Context MCP server:
 
 ```bash
 # Add the Claude Context MCP server
-claude mcp add claude-context -e OPENAI_API_KEY=your-openai-api-key -e MILVUS_TOKEN=your-zilliz-cloud-api-key -- npx @zilliz/claude-context-mcp@latest
+claude mcp add claude-context -e OPENAI_API_KEY=your-openai-api-key -e MILVUS_ADDRESS=your-zilliz-cloud-public-endpoint -e MILVUS_TOKEN=your-zilliz-cloud-api-key -- npx @zilliz/claude-context-mcp@latest
 
 ```
 
@@ -347,6 +353,7 @@ Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file i
         "EMBEDDING_PROVIDER": "Ollama",
         "EMBEDDING_MODEL": "nomic-embed-text",
         "OLLAMA_HOST": "http://127.0.0.1:11434",
+        "EMBEDDING_DIMENSION": "768",
         "MILVUS_TOKEN": "your-zilliz-cloud-api-key"
       }
     }

@@ -29,9 +29,10 @@ export class VoyageAIEmbedding extends Embedding {
         const modelInfo = supportedModels[model];
 
         if (modelInfo) {
-            // If dimension is a string (indicating variable dimension), use default value 1024
             if (typeof modelInfo.dimension === 'string') {
-                this.dimension = 1024; // Default dimension
+                // Parse default dimension from string like "1024 (default), 256, 512, 2048"
+                const match = modelInfo.dimension.match(/^(\d+)/);
+                this.dimension = match ? parseInt(match[1], 10) : 1024;
             } else {
                 this.dimension = modelInfo.dimension;
             }
@@ -41,23 +42,6 @@ export class VoyageAIEmbedding extends Embedding {
             // Use default dimension and context length for unknown models
             this.dimension = 1024;
             this.maxTokens = 32000;
-        }
-    }
-
-    private updateDimensionForModel(model: string): void {
-        const supportedModels = VoyageAIEmbedding.getSupportedModels();
-        const modelInfo = supportedModels[model];
-
-        if (modelInfo) {
-            // If dimension is a string (indicating variable dimension), use default value 1024
-            if (typeof modelInfo.dimension === 'string') {
-                this.dimension = 1024; // Default dimension
-            } else {
-                this.dimension = modelInfo.dimension;
-            }
-        } else {
-            // Use default dimension for unknown models
-            this.dimension = 1024;
         }
     }
 
@@ -148,7 +132,28 @@ export class VoyageAIEmbedding extends Embedding {
      */
     static getSupportedModels(): Record<string, { dimension: number | string; contextLength: number; description: string }> {
         return {
-            // Latest recommended models
+            // Voyage 4 series (January 2026)
+            'voyage-4-large': {
+                dimension: '1024 (default), 256, 512, 2048',
+                contextLength: 32000,
+                description: 'Best general-purpose and multilingual retrieval quality (latest)'
+            },
+            'voyage-4': {
+                dimension: '1024 (default), 256, 512, 2048',
+                contextLength: 32000,
+                description: 'Optimized for general-purpose and multilingual retrieval quality'
+            },
+            'voyage-4-lite': {
+                dimension: '1024 (default), 256, 512, 2048',
+                contextLength: 32000,
+                description: 'Optimized for latency and cost'
+            },
+            'voyage-4-nano': {
+                dimension: '1024 (default), 256, 512, 2048',
+                contextLength: 32000,
+                description: 'Open-weight model, smallest and fastest'
+            },
+            // Voyage 3 series
             'voyage-3-large': {
                 dimension: '1024 (default), 256, 512, 2048',
                 contextLength: 32000,

@@ -27,6 +27,7 @@ const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
     '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
     '.cs', '.go', '.rs', '.php', '.rb', '.swift', '.kt', '.scala', '.m', '.mm',
+    '.dart', '.sol',
     // Text and markup files
     '.md', '.markdown', '.ipynb',
     // '.txt',  '.json', '.yaml', '.yml', '.xml', '.html', '.htm',
@@ -379,7 +380,7 @@ export class Context {
             await this.loadIgnorePatterns(codebasePath);
 
             // To be safe, let's initialize if it's not there.
-            const newSynchronizer = new FileSynchronizer(codebasePath, this.ignorePatterns, this.includeDotDirs);
+            const newSynchronizer = new FileSynchronizer(codebasePath, this.ignorePatterns, this.includeDotDirs, this.supportedExtensions);
             await newSynchronizer.initialize();
             this.synchronizers.set(collectionName, newSynchronizer);
         }
@@ -1162,6 +1163,8 @@ export class Context {
             '.scala': 'scala',
             '.m': 'objective-c',
             '.mm': 'objective-c',
+            '.dart': 'dart',
+            '.sol': 'solidity',
             '.ipynb': 'jupyter'
         };
         return languageMap[ext] || 'text';
@@ -1344,11 +1347,20 @@ export class Context {
      * @returns True if path should be ignored
      */
     private matchesIgnorePattern(filePath: string, basePath: string): boolean {
+        const relativePath = path.relative(basePath, filePath);
+
+        // Always ignore dotfiles/dotdirs to stay aligned with
+        // FileSynchronizer.shouldIgnore. If these traversals diverge, files
+        // indexed here are never hashed by the synchronizer and their stale
+        // chunks linger in Milvus forever.
+        if (relativePath.split(path.sep).some(part => part.startsWith('.'))) {
+            return true;
+        }
+
         if (this.ignorePatterns.length === 0) {
             return false;
         }
 
-        const relativePath = path.relative(basePath, filePath);
         const normalizedPath = relativePath.replace(/\\/g, '/'); // Normalize path separators
 
         for (const pattern of this.ignorePatterns) {

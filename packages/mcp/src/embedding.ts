@@ -47,12 +47,28 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
             console.log(`[EMBEDDING] ✅ Gemini embedding instance created successfully`);
             return geminiEmbedding;
 
+        case 'OpenRouter':
+            if (!config.openrouterApiKey) {
+                console.error(`[EMBEDDING] ❌ OpenRouter API key is required but not provided`);
+                throw new Error('OPENROUTER_API_KEY is required for OpenRouter embedding provider');
+            }
+            console.log(`[EMBEDDING] 🔧 Configuring OpenRouter with model: ${config.embeddingModel}`);
+            // Reuse OpenAIEmbedding with OpenRouter's OpenAI-compatible endpoint
+            const openrouterEmbedding = new OpenAIEmbedding({
+                apiKey: config.openrouterApiKey,
+                model: config.embeddingModel,
+                baseURL: 'https://openrouter.ai/api/v1',
+            });
+            console.log(`[EMBEDDING] ✅ OpenRouter embedding instance created successfully`);
+            return openrouterEmbedding;
+
         case 'Ollama':
             const ollamaHost = config.ollamaHost || 'http://127.0.0.1:11434';
-            console.log(`[EMBEDDING] 🔧 Configuring Ollama with model: ${config.embeddingModel}, host: ${ollamaHost}`);
+            console.log(`[EMBEDDING] 🔧 Configuring Ollama with model: ${config.embeddingModel}, host: ${ollamaHost}${config.ollamaDimension ? `, dimension: ${config.ollamaDimension}` : ''}`);
             const ollamaEmbedding = new OllamaEmbedding({
                 model: config.embeddingModel,
-                host: config.ollamaHost
+                host: ollamaHost,
+                ...(config.ollamaDimension && { dimension: config.ollamaDimension })
             });
             console.log(`[EMBEDDING] ✅ Ollama embedding instance created successfully`);
             return ollamaEmbedding;
@@ -99,8 +115,11 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
         case 'Gemini':
             console.log(`[EMBEDDING] Gemini configuration - API Key: ${config.geminiApiKey ? '✅ Provided' : '❌ Missing'}, Base URL: ${config.geminiBaseUrl || 'Default'}`);
             break;
+        case 'OpenRouter':
+            console.log(`[EMBEDDING] OpenRouter configuration - API Key: ${config.openrouterApiKey ? '✅ Provided' : '❌ Missing'}`);
+            break;
         case 'Ollama':
-            console.log(`[EMBEDDING] Ollama configuration - Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}, Model: ${config.embeddingModel}`);
+            console.log(`[EMBEDDING] Ollama configuration - Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}, Model: ${config.embeddingModel}${config.ollamaDimension ? `, Dimension: ${config.ollamaDimension}` : ''}`);
             break;
         case 'RabbitMQ':
             console.log(`[EMBEDDING] RabbitMQ configuration - Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b'}, URL: ${config.rabbitmqUrl ? '✅ Provided' : '❌ Missing'}`);

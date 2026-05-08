@@ -71,3 +71,6 @@ repos
 
 evaluation/retrieval_results*
 .venv/
+
+# Phase B upgrade work — fork-only
+/backups/

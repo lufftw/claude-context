@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { Context, COLLECTION_LIMIT_MESSAGE } from "@zilliz/claude-context-core";
+import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
 
@@ -162,6 +162,13 @@ export class ToolHandlers {
                 if (!normalizedCloudPaths.has(normalizePath(localCodebase))) {
                     this.snapshotManager.removeIndexedCodebase(localCodebase);
                     hasChanges = true;
+
+                    try {
+                        await FileSynchronizer.deleteSnapshot(localCodebase);
+                    } catch (error: any) {
+                        console.warn(`[SYNC-CLOUD] ⚠️  Failed to delete local merkle snapshot for removed codebase '${localCodebase}':`, error?.message || error);
+                    }
+
                     console.log(`[SYNC-CLOUD] ➖ Removed local codebase (not in cloud): ${localCodebase}`);
                 }
             }
@@ -232,13 +239,19 @@ export class ToolHandlers {
 
             // Check if already indexing
             if (this.snapshotManager.getIndexingCodebases().includes(absolutePath)) {
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Codebase '${absolutePath}' is already being indexed in the background. Please wait for completion.`
-                    }],
-                    isError: true
-                };
+                if (forceReindex) {
+                    console.log(`[FORCE-REINDEX] Clearing stale indexing state for '${absolutePath}'`);
+                    this.snapshotManager.removeCodebaseCompletely(absolutePath);
+                    this.snapshotManager.saveCodebaseSnapshot();
+                } else {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Codebase '${absolutePath}' is already being indexed in the background. Please wait for completion.`
+                        }],
+                        isError: true
+                    };
+                }
             }
 
             //Check if the snapshot and cloud index are in sync
@@ -259,10 +272,8 @@ export class ToolHandlers {
 
             // If force reindex and codebase is already indexed, remove it
             if (forceReindex) {
-                if (this.snapshotManager.getIndexedCodebases().includes(absolutePath)) {
-                    console.log(`[FORCE-REINDEX] 🔄 Removing '${absolutePath}' from indexed list for re-indexing`);
-                    this.snapshotManager.removeIndexedCodebase(absolutePath);
-                }
+                this.snapshotManager.removeCodebaseCompletely(absolutePath);
+                this.snapshotManager.saveCodebaseSnapshot();
                 if (await this.context.hasIndex(absolutePath)) {
                     console.log(`[FORCE-REINDEX] 🔄 Clearing index for '${absolutePath}'`);
                     await this.context.clearIndex(absolutePath);
@@ -385,14 +396,14 @@ export class ToolHandlers {
             await this.context.getLoadedIgnorePatterns(absolutePath);
 
             // Initialize file synchronizer with proper ignore patterns (including project-specific patterns)
-            const { FileSynchronizer } = await import("@zilliz/claude-context-core");
+            // FileSynchronizer is imported at top of file (968cce6 made it a static import)
             const ignorePatterns = this.context.getIgnorePatterns() || [];
             const includeDotDirs = this.context.getIncludeDotDirs() || [];
             console.log(`[BACKGROUND-INDEX] Using ignore patterns: ${ignorePatterns.join(', ')}`);
             if (includeDotDirs.length > 0) {
                 console.log(`[BACKGROUND-INDEX] Including dot directories: ${includeDotDirs.join(', ')}`);
             }
-            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, includeDotDirs);
+            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, includeDotDirs, this.context.getSupportedExtensions());
             await synchronizer.initialize();
 
             // Store synchronizer in the context (let context manage collection names)
@@ -778,6 +789,8 @@ export class ToolHandlers {
                     isError: true
                 };
             }
+
+            await this.syncIndexedCodebasesFromCloud();
 
             // Check indexing status using new status system
             const status = this.snapshotManager.getCodebaseStatus(absolutePath);
