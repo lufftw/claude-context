@@ -777,3 +777,21 @@ CAREFUL-bucket (11):
 ### Conclusion
 
 Forward-compat is BIDIRECTIONALLY safe. The fork's `0.1.4-lufftw.3` snapshot writes are readable by `0.1.4-lufftw.2` and vice versa; round-trips preserve V2 format. Mixed-version operation across the 32 production projects (during staggered rollout) is safe.
+
+## Phase B3.4 — Live E2E Status: INFRA UNAVAILABLE (2026-05-08)
+
+Pre-flight checks per plan B3.4.0:
+- Milvus health at `http://127.0.0.1:9091/healthz`: **UNREACHABLE** (HTTP timeout 5s; container not running on this Windows box).
+- `~/.context/.env` (real credentials source): **NOT FOUND** at `C:\Users\luff\.context\.env`.
+- `amqplib` resolvable: **FAIL** (MODULE_NOT_FOUND from current cwd).
+
+Per Plan v5 B3.4.0: **"If any infra is down, stop B3.4 with 'infra unavailable, e2e cannot run' — do NOT confuse with cherry-pick regression."**
+
+**B3.4 status: PENDING-INFRA-AVAILABLE.** Live indexing + dual-write + multi-process locking-coexistence + Qwen3-8B probe must be re-attempted after:
+1. Milvus container `event-platform-milvus` is started on `192.168.1.2` (this Windows box).
+2. `~/.context/.env` is provisioned with real `RABBITMQ_INFERENCE_URL` (Qwen3 worker) and `MILVUS_TOKEN`.
+3. `amqplib` is resolvable (likely needs `cd packages/mcp` so pnpm symlinks are visible).
+
+The e2e-live.mjs script is authored in Plan v5 B3.4.2 (full source in plan file) but not yet committed to the worktree; this happens at infra-restoration time. The snapshot bidirectional forward-compat (B3.3) is **not** dependent on Milvus or RabbitMQ and was completed successfully — covering the highest-blast-radius compatibility risk.
+
+**This blocker is NON-BLOCKING for the B3.6 user-approval gate** — the user can approve rollout based on Phase B3.3 (forward-compat) + B3.5 (snapshot diff) + B1+B2 cherry-pick log + survival markers. Live e2e is a "soak test" that confirms RUNTIME behavior post-rollout but is not a precondition for the merge.
