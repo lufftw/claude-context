@@ -746,3 +746,34 @@ CAREFUL-bucket (11):
 - 8 synthesis-budget DEFERs (Phase 0.2.X): `ae0fd79`, `e368a97`, `b56ca04`, `291863a`, `ead19f4`, `d2ef81c`, `3ed9375`, `be107de`
 - 1 SKIP-CASCADE caught at execution: `b03ebac` (depends on `ae0fd79`)
 
+
+## Phase B3.3 — Bidirectional Forward-Compatibility (executed 2026-05-08)
+
+### B3.3.0 OLD binary audit datum
+
+- main checkout HEAD: `2586462` (fork master baseline)
+- main `packages/mcp/package.json` version: `0.1.4-lufftw.2`
+- main `packages/mcp/dist/index.js` SHA256: `FAF99E814ECA0FB5329DDAE4EC2EC687030A46A3B1CACAD053A4C1F486D38CE8`
+- main checkout state restoration: not required (already at baseline; no rebuild needed).
+
+### B3.3.2 Leg 1: NEW writes → OLD reads
+
+- Throwaway home: `E:\tmp\fwd-compat-leg1`
+- pre-write snapshot SHA256: `1AF1C08D582FFFC8E9F6C951FE321D98F19D007945A0A3CACE41D27E9FD39D91`
+- NEW build (worktree, `0.1.4-lufftw.3`) ran `locking-coexistence.mjs --write-once`: OK
+- post-write SHA256: `6B5B214DB4EB626F41F548F3F14B52A6688AB2F1BB830A02BF7D22E2D5C18F0F` (mtime advanced; content changed)
+- OLD binary (main, `0.1.4-lufftw.2`) read via temporarily-copied `jsonrpc-smoke.mjs`: PASS (exit 0).
+- **Leg 1 verdict: PASS — OLD binary can read NEW-written snapshot.**
+
+### B3.3.3 Leg 2: OLD writes → NEW reads → OLD writes-back → NEW reads
+
+- Throwaway home: `E:\tmp\fwd-compat-leg2`
+- Step A (OLD writes via `locking-coexistence.mjs --write-once`): OK; SHA changed.
+- Step B (NEW reads): exit 0.
+- Step C (OLD writes-back): OK.
+- Step D (NEW reads, with V2 baseline schema check): exit 0; `formatVersion === 'v2'` confirmed.
+- **Leg 2 verdict: PASS — bidirectional round-trip preserves V2 schema.**
+
+### Conclusion
+
+Forward-compat is BIDIRECTIONALLY safe. The fork's `0.1.4-lufftw.3` snapshot writes are readable by `0.1.4-lufftw.2` and vice versa; round-trips preserve V2 format. Mixed-version operation across the 32 production projects (during staggered rollout) is safe.
