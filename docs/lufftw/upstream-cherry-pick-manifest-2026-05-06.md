@@ -829,3 +829,21 @@ The plan's stop-the-world checkpoint. Surface to user:
 3. Reject (worktree + tags preserved; nothing pushed).
 
 Until option 1 is selected, `git merge`, `git push origin master`, and `git tag --push` MUST NOT run.
+
+## Phase B3.7 — Published Merge (executed 2026-05-08)
+
+- **Merge SHA**: `c4080eb7d84ae56608ad1ae0a09dd82e7b020e8d`
+- **Tag**: `v0.1.4-lufftw.3` → `c4080eb`
+- **Pushed at**: 2026-05-08T12:31:54+08:00
+- **Pre-push origin/master**: `2586462` → **post-push**: `c4080eb`
+- **Pre-push tag**: absent → **post-push**: `c4080eb`
+- **Atomic push**: `git push origin --atomic master v0.1.4-lufftw.3`: exit 0
+- **Audit tag**: `upgrade/phase-b1-checkpoint` → `16a52a8` retained as LOCAL-ONLY (not pushed; per Plan v5 B3.7.3)
+
+## Phase B Status: SHIPPED
+
+The fork is published at `v0.1.4-lufftw.3`. Phase B is complete. Remaining steps are out-of-execution scope and happen in separate sessions:
+
+- **B3.8 production rollout** — update `~/.claude.json` `mcpServers` entries to point at the main checkout's freshly-built `packages/mcp/dist/index.js` (which is now `0.1.4-lufftw.3`). Restart Claude Code sessions; observe MCP boot logs across all 32 projects.
+- **B3.9 worktree cleanup** — after ≥7 days of stable production, `git worktree remove ..\claude-context-upgrade` and `git branch -d upgrade/phase-b`. Audit tag retained.
+- **B3.4 live e2e** — re-attempt after Milvus is restored on this Windows box and `~/.context/.env` is provisioned with real RabbitMQ/Milvus credentials. Pre-rollout, this is informational; post-rollout, the 32 production projects ARE the e2e.
