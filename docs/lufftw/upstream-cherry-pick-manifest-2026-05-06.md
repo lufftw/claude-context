@@ -716,3 +716,33 @@ CAREFUL-bucket (11):
 **DEFER TO PHASE A (8 commits):** `ae0fd79`, `e368a97`, `b56ca04`, `291863a`, `ead19f4`, `d2ef81c`, `3ed9375`, `be107de`.
 
 **Re-bucket count: 9 SAFE + 11 CAREFUL + 8 DEFER = 28.** `cdad7ab` substitutes `0f7a82e` (merge commit).
+
+## Phase B Finalization (B3.1 — version bump completed 2026-05-08)
+
+- Bumped `packages/core/package.json` and `packages/mcp/package.json` from `0.1.4-lufftw.2` to `0.1.4-lufftw.3` at commit `d19f783`.
+- `pnpm install` lockfile drift: none.
+- `pnpm build`: exit 0.
+- `run-smoke.ps1`: exit 0 (jsonrpc/snap/fregr all OK).
+- `CLAUDE.md` is gitignored in this worktree; version-string update will be applied to the main-checkout copy at production rollout (B3.8).
+
+## Phase B Final Tally
+
+**Cherry-pick attempt outcomes (28 SHAs in roster):**
+
+| Outcome | Count | SHAs |
+|---|---|---|
+| Cherry-picked successfully | 18 | `1ebda84` `0bfff25` `c912741` `a99939e` `2474e6f` `f3f22b0` `cdbd75b` `cdad7ab` `c0cc3cc` `b7755c3` `c937690` `bb44da9` `6289035` `76497e1` `66d7616` `fa93b64` `a83f260` `968cce6` |
+| Fork-only fix | 1 | `23d6da3` deleteByFilter restoration (post-`cdbd75b --theirs` regression caught and fixed) |
+| ALREADY-PRESENT-VIA-BACKPORT | 1 | `e447095` (Dart already added by `cdad7ab` resolution) |
+| SKIP-CASCADE / reverted | 1 | `b03ebac` (reverted at `97abd74`; depends on deferred `ae0fd79`) |
+| DEFER TO PHASE A | 8 | `ae0fd79`, `e368a97`, `b56ca04`, `291863a`, `ead19f4`, `d2ef81c`, `3ed9375`, `be107de` |
+
+**Final fork version:** `0.1.4-lufftw.3`
+**Final commit on `upgrade/phase-b`:** `d19f783`
+**B1 checkpoint tag:** `upgrade/phase-b1-checkpoint` → `16a52a8`
+
+**Phase A list updated to 14 candidates:**
+- 5 originally-tracked features: `82a37ad`, `3675469`, `62323f4`, `c93138b`, `d4ad9ec`
+- 8 synthesis-budget DEFERs (Phase 0.2.X): `ae0fd79`, `e368a97`, `b56ca04`, `291863a`, `ead19f4`, `d2ef81c`, `3ed9375`, `be107de`
+- 1 SKIP-CASCADE caught at execution: `b03ebac` (depends on `ae0fd79`)
+
