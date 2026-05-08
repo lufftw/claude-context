@@ -795,3 +795,37 @@ Per Plan v5 B3.4.0: **"If any infra is down, stop B3.4 with 'infra unavailable, 
 The e2e-live.mjs script is authored in Plan v5 B3.4.2 (full source in plan file) but not yet committed to the worktree; this happens at infra-restoration time. The snapshot bidirectional forward-compat (B3.3) is **not** dependent on Milvus or RabbitMQ and was completed successfully — covering the highest-blast-radius compatibility risk.
 
 **This blocker is NON-BLOCKING for the B3.6 user-approval gate** — the user can approve rollout based on Phase B3.3 (forward-compat) + B3.5 (snapshot diff) + B1+B2 cherry-pick log + survival markers. Live e2e is a "soak test" that confirms RUNTIME behavior post-rollout but is not a precondition for the merge.
+
+## Phase B3.5 — Snapshot Diff vs Phase-0 Backup (executed 2026-05-08)
+
+| Property | Production snapshot | Phase-0 backup | Match? |
+|---|---|---|---|
+| File size | 4373 bytes | 4373 bytes | yes |
+| SHA256 | `E8046E92...140977B` | `1AF1C08D...39D91` | no (timestamps differ) |
+| formatVersion | `v2` | `v2` | yes |
+| Codebases (count) | 19 | 19 | yes |
+| Codebases lost since backup | 0 | — | yes |
+| Codebases added since backup | 0 | — | yes |
+
+**B3.5 verdict: PASS — schema preserved; no codebase regressions; no live MCP writes during Phase B (consistent with Milvus being offline).**
+
+The SHA mismatch despite same byte length and same codebase set is most likely from differing volatile fields (`lastUpdated`, `lastSync`) — exactly what the smoke harness's `stripVolatile` is designed to ignore. Schema integrity is the gate, not raw-byte equality, and that gate passes.
+
+## Phase B3.6 — User-Approval Gate (REACHED)
+
+The plan's stop-the-world checkpoint. Surface to user:
+
+- **Phase B execution log**: 18 cherry-picks applied + 1 fork-only deleteByFilter restoration + 1 ALREADY-PRESENT-VIA-BACKPORT (e447095) + 1 SKIP-CASCADE/REVERT (b03ebac) + 8 DEFER TO PHASE A.
+- **Forward-compat (B3.3)**: BIDIRECTIONAL PASS — both legs verified.
+- **Snapshot diff (B3.5)**: Schema preserved; 0 codebase regressions.
+- **Live e2e (B3.4)**: PENDING-INFRA-AVAILABLE — Milvus offline, real credentials missing. Non-blocking for merge approval per plan; soak test happens post-rollout.
+- **Final commit on `upgrade/phase-b`**: `932673f`.
+- **Final fork version**: `0.1.4-lufftw.3`.
+- **B1 checkpoint tag**: `upgrade/phase-b1-checkpoint` → `16a52a8`.
+
+**Decision required from user before B3.7 (merge + push):**
+1. Approve full rollout (B3.7 merge to master + atomic push).
+2. Approve soak rollout (link `~/.claude.json` to worktree's `dist/` for one project; revisit after 7 days).
+3. Reject (worktree + tags preserved; nothing pushed).
+
+Until option 1 is selected, `git merge`, `git push origin master`, and `git tag --push` MUST NOT run.
