@@ -74,3 +74,9 @@ evaluation/retrieval_results*
 
 # Phase B upgrade work — fork-only
 /backups/
+
+# One-shot scratch scripts at repo root (e.g. ad-hoc batch re-index runners).
+# Often contain hardcoded credentials; promote to scripts/ + sanitize before committing.
+/tmp-*.mjs
+/tmp-*.js
+/tmp-*.ts

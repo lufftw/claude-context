@@ -821,7 +821,21 @@ Run from `packages/core` cwd; env: real `RABBITMQ_INFERENCE_URL` + `RABBITMQ_EMB
 | Worker liveness during probe | ✅ ack rate 1.4 msg/s sustained throughout probe window |
 | Failure classification | **NOT** wiring/worker fault. Probe used default `priority=5`; production indexing traffic uses `priority=8` (per `.mcp.json`). 8937-message backlog ahead of probe at higher priority → deterministic 30s timeout matching configured ceiling. |
 
-**B3.4.1 verdict: WIRING-PASS / ROUND-TRIP-DEFERRED.** Probe construction, AMQP transport, model + dimension agreement, and worker presence are all empirically validated. Round-trip success requires either (a) probe modification to surface `RABBITMQ_EMBEDDING_PRIORITY=10` from env, or (b) executing the probe during a queue-quiet window. Neither was performed under the user-set "existing scripts only" scope. The same-shape end-to-end embedding round-trip is also exercised by every `index_codebase` call in the 32 production projects (those calls go through the same `RabbitMQEmbedding` class from `packages/core/dist/embedding/rabbitmq-embedding.js`), and the queue's deliver_rate of 1.4 msg/s is direct ongoing evidence of production round-trips succeeding.
+**B3.4.1 initial verdict: WIRING-PASS / ROUND-TRIP-DEFERRED.** Probe construction, AMQP transport, model + dimension agreement, and worker presence are all empirically validated. Round-trip success requires either (a) probe modification to surface `RABBITMQ_EMBEDDING_PRIORITY=10` from env, or (b) executing the probe during a queue-quiet window. Neither was performed under the user-set "existing scripts only" scope. The same-shape end-to-end embedding round-trip is also exercised by every `index_codebase` call in the 32 production projects (those calls go through the same `RabbitMQEmbedding` class from `packages/core/dist/embedding/rabbitmq-embedding.js`), and the queue's deliver_rate of 1.4 msg/s is direct ongoing evidence of production round-trips succeeding.
+
+**B3.4.1 retry (2026-05-09 follow-up): FULL PASS.** Same `RabbitMQEmbedding` class, invoked via inline one-shot runner (no new committed harness — uses the existing class with explicit `priority=10` + `timeoutMs=120000`):
+
+| Property | Value |
+|---|---|
+| Init log | `[RabbitMQEmbedding] ✅ initialized — queue=embedding.qwen3-8b, model=qwen3-embedding-8b, dim=4096, replyQueue=amq.gen-cHudB2zGVeyCuVhcx2hUDg` |
+| Returned vector dimension | **4096** ✓ |
+| Returned vector L2 norm | **1.0000** ✓ (within `[0.99, 1.01]`) |
+| Round-trip elapsed | **8522 ms** (priority=10 jumped past the priority-8 backlog cleanly) |
+| Wall time (incl. cold-start AMQP open) | 10034 ms |
+| Exit | 0 |
+| Reset on close | clean (`reset: Reply channel closed`) |
+
+This conclusively confirms the prior 30s timeout was a queue-priority artifact, not a wiring or worker fault. The Qwen3-8B GPU worker reachable at `mw-embedding-embed-qwen3-llamacpp-322-4116203` returns properly normalized 4096-dim embeddings at the agreed shape. **B3.4.1 final verdict: FULL PASS.**
 
 #### B3.4.2 — Live indexing through MCP stdio
 
@@ -879,13 +893,13 @@ Throwaway `CLAUDE_CONTEXT_HOME = %TEMP%\b3.4-smoke-26169` (rejected if path cont
 | Sub-phase | Verdict | Evidence quality |
 |---|---|---|
 | B3.4.0 pre-flight | PASS | Direct container + queue + module-resolution checks |
-| B3.4.1 Qwen3 probe | WIRING-PASS / round-trip DEFERRED (queue contention) | Init logs + worker liveness + queue ack rate |
-| B3.4.2 live indexing harness | NOT EXECUTED (out of scope per user) | n/a |
+| B3.4.1 Qwen3 probe | **FULL PASS** (after retry with priority=10) | dim=4096, L2=1.0000, 8522 ms; original 30s timeout confirmed as priority artifact |
+| B3.4.2 live indexing harness | NOT EXECUTED (out of scope per user, deferred decision retained) | n/a |
 | B3.4.3 ALS isolation | PASS | 200/200 |
 | B3.4.4 multi-process locks | PASS | Timestamp interlock + inner-lock-blocked log |
 | B3.4.5 MCP stdio smoke (full prod env) | PASS | Exit 0, correct tool inventory, clean stderr |
 
-The cherry-picks gating on B3.4.4 specifically (commit `6289035` "prevent concurrent background sync") are now empirically locking-validated against the post-merge `master`, complementing the static review accepted at the B3.6 gate. No regressions surfaced. The Qwen3 round-trip is **not** under-evidence — production projects exercise the same code path continuously (queue deliver_rate ~1.4 msg/s sustained); the probe's 30s timeout is a probe-priority artifact, not a worker fault.
+The cherry-picks gating on B3.4.4 specifically (commit `6289035` "prevent concurrent background sync") are now empirically locking-validated against the post-merge `master`, complementing the static review accepted at the B3.6 gate. No regressions surfaced. The Qwen3 round-trip is now **directly evidenced** (FULL PASS at priority=10): dim=4096, L2=1.0000, 8.5s round-trip. The original 30s timeout was confirmed as a deterministic priority artifact (probe at default 5 vs production traffic at 8) — the worker, the AMQP transport, and the embedding semantics are all proven correct on the post-merge `master`.
 
 ## Phase B3.5 — Snapshot Diff vs Phase-0 Backup (executed 2026-05-08)
 
@@ -937,4 +951,4 @@ The fork is published at `v0.1.4-lufftw.3`. Phase B is complete. Remaining steps
 
 - **B3.8 production rollout** — update `~/.claude.json` `mcpServers` entries to point at the main checkout's freshly-built `packages/mcp/dist/index.js` (which is now `0.1.4-lufftw.3`). Restart Claude Code sessions; observe MCP boot logs across all 32 projects.
 - **B3.9 worktree cleanup** — after ≥7 days of stable production, `git worktree remove ..\claude-context-upgrade` and `git branch -d upgrade/phase-b`. Audit tag retained.
-- ~~**B3.4 live e2e**~~ — **EXECUTED 2026-05-09 post-rollout** (see "B3.4 — Re-attempted post-rollout" section above). Three of four runnable sub-phases PASS; B3.4.1 Qwen3 round-trip is wiring-PASS / queue-contention-deferred (worker reachable, ack rate sustained, probe-priority artifact); B3.4.2 live-indexing harness intentionally not authored per user scope. No regressions surfaced.
+- ~~**B3.4 live e2e**~~ — **EXECUTED 2026-05-09 post-rollout** (see "B3.4 — Re-attempted post-rollout" section above). Four of four runnable sub-phases PASS after the priority-10 retry: B3.4.1 Qwen3 round-trip FULL PASS (dim=4096, L2=1.0000, 8.5s), B3.4.3 ALS 200/200, B3.4.4 multi-process locks proven serialized, B3.4.5 MCP stdio smoke against full prod env clean. B3.4.2 live-indexing harness intentionally not authored per user scope. No regressions surfaced.
