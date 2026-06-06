@@ -484,21 +484,29 @@ export class MilvusVectorDatabase implements VectorDatabase {
         if (!this.client) {
             throw new Error('MilvusClient is not initialized after ensureInitialized().');
         }
-        // PK must be present for the SDK's keyset pagination to advance.
-        const fields = outputFields.includes('id') ? outputFields : [...outputFields, 'id'];
-        const iterator = await this.client.queryIterator({
-            collection_name: collectionName,
-            output_fields: fields,
-            batchSize,
-            expr: (filter && filter.trim() !== '') ? filter : '',
-        });
-        const out: Record<string, any>[] = [];
-        // for-await drains all batches and stops on done:true WITHOUT re-yielding
-        // the final batch (the SDK re-emits it in `value` on done — for-await ignores it).
-        for await (const batch of iterator as AsyncIterable<Record<string, any>[]>) {
-            out.push(...batch);
+        try {
+            // PK must be present for the SDK's keyset pagination to advance.
+            const fields = outputFields.includes('id') ? outputFields : [...outputFields, 'id'];
+            const iterator = await this.client.queryIterator({
+                collection_name: collectionName,
+                output_fields: fields,
+                batchSize,
+                expr: (filter && filter.trim() !== '') ? filter : '',
+            });
+            const out: Record<string, any>[] = [];
+            // for-await drains all batches and stops on done:true WITHOUT re-yielding
+            // the final batch (the SDK re-emits it in `value` on done — for-await ignores it).
+            for await (const batch of iterator as AsyncIterable<Record<string, any>[]>) {
+                out.push(...batch);
+            }
+            return out;
+        } catch (error) {
+            // Parity with query(): surface the real cause so an iterator failure on an
+            // EXISTING collection is not silently swallowed as a benign "first index?" miss
+            // by the loadExistingFileHashes catch.
+            console.error(`[MilvusDB] ❌ Failed to queryAll collection '${collectionName}':`, error);
+            throw error;
         }
-        return out;
     }
 
     async createHybridCollection(collectionName: string, dimension: number, description?: string): Promise<void> {

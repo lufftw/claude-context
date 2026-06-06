@@ -542,27 +542,32 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
     async queryAll(collectionName: string, outputFields: string[], filter?: string, batchSize: number = 10000): Promise<Record<string, any>[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);
-        const restfulConfig = this.config as MilvusRestfulConfig;
-        const out: Record<string, any>[] = [];
-        let offset = 0;
-        // NOTE: Milvus REST caps offset+limit at the 16384 query window, so this is
-        // best-effort for the RESTful driver (the MCP uses the gRPC driver). Kept for
-        // interface completeness; do NOT rely on it for >16384-row full scans.
-        const pageSize = Math.min(batchSize, 16384);
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-            const req: Record<string, any> = { collectionName, dbName: restfulConfig.database, outputFields, offset, limit: pageSize };
-            if (filter && filter.trim() !== '') req.filter = filter;
-            const response = await this.makeRequest('/entities/query', 'POST', req);
-            if (response.code !== 0) {
-                throw new Error(`Failed to queryAll Milvus: ${response.message || 'Unknown error'}`);
+        try {
+            const restfulConfig = this.config as MilvusRestfulConfig;
+            const out: Record<string, any>[] = [];
+            let offset = 0;
+            // NOTE: Milvus REST caps offset+limit at the 16384 query window, so this is
+            // best-effort for the RESTful driver (the MCP uses the gRPC driver). Kept for
+            // interface completeness; do NOT rely on it for >16384-row full scans.
+            const pageSize = Math.min(batchSize, 16384);
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                const req: Record<string, any> = { collectionName, dbName: restfulConfig.database, outputFields, offset, limit: pageSize };
+                if (filter && filter.trim() !== '') req.filter = filter;
+                const response = await this.makeRequest('/entities/query', 'POST', req);
+                if (response.code !== 0) {
+                    throw new Error(`Failed to queryAll Milvus: ${response.message || 'Unknown error'}`);
+                }
+                const page = (response.data || []) as Record<string, any>[];
+                out.push(...page);
+                if (page.length < pageSize) break;
+                offset += pageSize;
             }
-            const page = (response.data || []) as Record<string, any>[];
-            out.push(...page);
-            if (page.length < pageSize) break;
-            offset += pageSize;
+            return out;
+        } catch (error) {
+            console.error(`[MilvusRestfulDB] ❌ Failed to queryAll collection '${collectionName}':`, error);
+            throw error;
         }
-        return out;
     }
 
     async createHybridCollection(collectionName: string, dimension: number, description?: string): Promise<void> {
