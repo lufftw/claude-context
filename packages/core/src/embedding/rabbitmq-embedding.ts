@@ -1,6 +1,6 @@
 import amqplib, { type ChannelModel, type Channel, type ConfirmChannel } from 'amqplib';
 import { randomUUID } from 'node:crypto';
-import { Embedding, EmbeddingVector } from './base-embedding';
+import { Embedding, EmbeddingVector, EmbedItemResult, EmbedReason, WAIT_REASONS } from './base-embedding';
 
 /**
  * RabbitMQEmbedding
@@ -40,8 +40,14 @@ export interface RabbitMQEmbeddingConfig {
     modelName: string;
     /** Vector dimension produced by the worker (Qwen3-8b = 4096) */
     dimension: number;
-    /** Per-request timeout in ms (default 30000) */
+    /** Per-request liveness timeout in ms (default 1_700_000 ≈ 28 min — patient backstop) */
     timeoutMs?: number;
+    /**
+     * Max retry-via-republish attempts for WAIT-class faults (default 3).
+     * Invariant: timeoutMs * (maxRetries + 1) must stay under the broker
+     * consumer_timeout (2h = 7_200_000ms) so a slow worker never exceeds it.
+     */
+    maxRetries?: number;
     /** RabbitMQ priority (0-10). Indexing = higher if you want to jump enrichment. */
     priority?: number;
     /** Parallel in-flight requests for embedBatch (default 10) */
@@ -84,7 +90,8 @@ export class RabbitMQEmbedding extends Embedding {
             queue: config.queue,
             modelName: config.modelName,
             dimension: config.dimension,
-            timeoutMs: config.timeoutMs ?? 30000,
+            timeoutMs: config.timeoutMs ?? 1_700_000,
+            maxRetries: config.maxRetries ?? 3,
             priority: config.priority ?? 5,
             concurrency: config.concurrency ?? 10,
             heartbeat: config.heartbeat ?? 60,
@@ -173,7 +180,9 @@ export class RabbitMQEmbedding extends Embedding {
                     this.pending.delete(taskId);
 
                     if (raw.success === false) {
-                        pending.reject(new Error(raw.error || 'Embedding worker returned failure'));
+                        pending.reject(Object.assign(
+                            new Error(raw.error || 'Embedding worker returned failure'),
+                            { embedReason: 'worker-error' as EmbedReason }));
                         return;
                     }
 
@@ -182,7 +191,9 @@ export class RabbitMQEmbedding extends Embedding {
                         try {
                             vectors = JSON.parse(raw.content) as number[][];
                         } catch (err) {
-                            pending.reject(new Error(`Failed to parse reply content JSON: ${(err as Error).message}`));
+                            pending.reject(Object.assign(
+                                new Error(`Failed to parse reply content JSON: ${(err as Error).message}`),
+                                { embedReason: 'malformed' as EmbedReason }));
                             return;
                         }
                     } else if (Array.isArray(raw.embeddings)) {
@@ -190,11 +201,26 @@ export class RabbitMQEmbedding extends Embedding {
                     }
 
                     if (!vectors || vectors.length === 0 || !Array.isArray(vectors[0])) {
-                        pending.reject(new Error('Empty or malformed embedding response'));
+                        pending.reject(Object.assign(
+                            new Error('Empty or malformed embedding response'),
+                            { embedReason: 'malformed' as EmbedReason }));
                         return;
                     }
 
-                    pending.resolve(vectors[0]);
+                    // ── Layer-0 dimension/norm guard ──────────────────────────
+                    // Never emit a zero/wrong-dimension vector. Loop-sum the norm;
+                    // NEVER Math.hypot(...v) — a 4096-arg spread throws RangeError.
+                    const v = vectors[0];
+                    let sumSq = 0;
+                    for (let k = 0; k < v.length; k++) sumSq += v[k] * v[k];
+                    const norm = Math.sqrt(sumSq);
+                    if (v.length !== this.config.dimension || !(norm > 0.5 && norm < 2.0)) {
+                        pending.reject(Object.assign(
+                            new Error(`bad embedding: len=${v.length} expected=${this.config.dimension} norm=${norm.toFixed(3)}`),
+                            { embedReason: 'bad-dimension' as EmbedReason }));
+                        return;
+                    }
+                    pending.resolve(v);
                 } catch (err) {
                     console.error(`[RabbitMQEmbedding] reply parse error: ${(err as Error).message}`);
                 }
@@ -212,7 +238,7 @@ export class RabbitMQEmbedding extends Embedding {
      * Idempotent state reset. Rejects all pending requests so callers see
      * a prompt failure instead of waiting for the per-request timeout.
      */
-    private resetState(reason: string): void {
+    private resetState(reason: string, embedClass: EmbedReason = 'connection-lost'): void {
         if (!this.isInitialized && !this.replyQueue && this.pending.size === 0) return;
         console.warn(`[RabbitMQEmbedding] reset: ${reason}`);
         this.isInitialized = false;
@@ -220,7 +246,9 @@ export class RabbitMQEmbedding extends Embedding {
 
         for (const [, p] of this.pending) {
             clearTimeout(p.timer);
-            p.reject(new Error(`RabbitMQEmbedding reset: ${reason}`));
+            p.reject(Object.assign(
+                new Error(`RabbitMQEmbedding reset: ${reason}`),
+                { embedReason: embedClass }));
         }
         this.pending.clear();
 
@@ -235,7 +263,7 @@ export class RabbitMQEmbedding extends Embedding {
         try { if (this.replyCh) await this.replyCh.close(); } catch { /* ignore */ }
         try { if (this.publishCh) await this.publishCh.close(); } catch { /* ignore */ }
         try { if (this.conn) await this.conn.close(); } catch { /* ignore */ }
-        this.resetState('Explicit close');
+        this.resetState('Explicit close', 'shutdown');
     }
 
     // ── Embedding API ────────────────────────────────────────
@@ -243,7 +271,7 @@ export class RabbitMQEmbedding extends Embedding {
     async embed(text: string): Promise<EmbeddingVector> {
         await this.initialize();
         const processed = this.preprocessText(text);
-        const vector = await this.sendOne(processed);
+        const vector = await this.sendOneWithRetry(processed);
         return { vector, dimension: this.config.dimension };
     }
 
@@ -271,6 +299,45 @@ export class RabbitMQEmbedding extends Embedding {
         return out;
     }
 
+    /**
+     * Partial-tolerant batch embed. Same bounded worker-pool as embedBatch but
+     * over sendOneWithRetry, returning index-aligned results. A failed slot
+     * carries a tagged reason — it NEVER pushes an empty or zero vector, so the
+     * indexer can skip just that chunk without corrupting the collection.
+     */
+    async embedBatchPartial(texts: string[]): Promise<EmbedItemResult[]> {
+        await this.initialize();
+        const processed = this.preprocessTexts(texts);
+        const out: EmbedItemResult[] = new Array(processed.length);
+
+        const workers = Math.min(this.config.concurrency, processed.length);
+        let cursor = 0;
+
+        const runWorker = async (): Promise<void> => {
+            while (true) {
+                const idx = cursor++;
+                if (idx >= processed.length) return;
+                try {
+                    const vector = await this.sendOneWithRetry(processed[idx]);
+                    // Defense-in-depth: re-check dimension at the boundary.
+                    if (vector.length !== this.config.dimension) {
+                        out[idx] = { ok: false, index: idx, reason: 'bad-dimension' };
+                    } else {
+                        out[idx] = { ok: true, index: idx, vector, dimension: vector.length };
+                    }
+                } catch (err) {
+                    const reason = ((err as any).embedReason as EmbedReason | undefined) ?? 'worker-error';
+                    out[idx] = { ok: false, index: idx, reason, detail: (err as Error).message };
+                }
+            }
+        };
+
+        const tasks: Promise<void>[] = [];
+        for (let i = 0; i < workers; i++) tasks.push(runWorker());
+        await Promise.all(tasks);
+        return out;
+    }
+
     async detectDimension(_testText: string = 'test'): Promise<number> {
         // Dimension is declared by config — no network probe.
         return this.config.dimension;
@@ -286,7 +353,30 @@ export class RabbitMQEmbedding extends Embedding {
 
     // ── Internals ────────────────────────────────────────────
 
-    private async sendOne(text: string): Promise<number[]> {
+    /**
+     * Bounded retry-via-republish wrapper around sendOne. Only WAIT-class faults
+     * are retried; REAL faults and 'shutdown' fail fast. Retries re-publish a
+     * fresh taskId (the prior attempt already settled — timeout deleted its
+     * pending entry, or the channel closed) and reuse the configured priority
+     * (never escalate).
+     */
+    private async sendOneWithRetry(text: string): Promise<number[]> {
+        let lastErr: any;
+        for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
+            try {
+                return await this.sendOne(text, attempt);
+            } catch (err) {
+                lastErr = err;
+                const reason = (err as any).embedReason as EmbedReason | undefined;
+                if (!reason || !WAIT_REASONS.has(reason)) throw err; // REAL or 'shutdown' → no retry
+                // WAIT-class: re-publish a fresh taskId on the next loop iteration.
+                console.error(`[RabbitMQEmbedding] retry ${attempt + 1}/${this.config.maxRetries} after ${reason}`);
+            }
+        }
+        throw lastErr;
+    }
+
+    private async sendOne(text: string, attempt: number = 0): Promise<number[]> {
         if (!this.publishCh || !this.replyQueue) {
             throw new Error('RabbitMQEmbedding: not initialized');
         }
@@ -304,9 +394,9 @@ export class RabbitMQEmbedding extends Embedding {
             replyTo: this.replyQueue,
             correlationId: taskId,
             prompt: text,
-            retryCount: 0,
+            retryCount: attempt,
             headers: {
-                'x-retry-count': 0,
+                'x-retry-count': attempt,
                 'x-first-attempt-at': now,
             },
             payload: {
@@ -323,7 +413,9 @@ export class RabbitMQEmbedding extends Embedding {
         return new Promise<number[]>((resolve, reject) => {
             const timer = setTimeout(() => {
                 if (this.pending.delete(taskId)) {
-                    reject(new Error(`Embedding timeout after ${this.config.timeoutMs}ms (queue=${this.config.queue})`));
+                    reject(Object.assign(
+                        new Error(`Embedding timeout after ${this.config.timeoutMs}ms (queue=${this.config.queue})`),
+                        { embedReason: 'timeout' as EmbedReason }));
                 }
             }, this.config.timeoutMs);
 

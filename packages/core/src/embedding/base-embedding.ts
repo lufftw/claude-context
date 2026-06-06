@@ -5,6 +5,37 @@ export interface EmbeddingVector {
 }
 
 /**
+ * Machine-readable fault classification for embedding failures.
+ *
+ * REAL class  — a genuine, content/logic-level fault that retrying cannot fix
+ *               (the worker rejected the input, returned a bad shape, or the
+ *               DB insert was rejected). Do NOT retry.
+ * WAIT class  — a transient liveness/transport fault where the work itself was
+ *               never definitively rejected; a fresh republish may succeed.
+ *               ('shutdown' is intentionally NOT in WAIT_REASONS — a deliberate
+ *               close must never be retried.)
+ */
+export type EmbedReason =
+    | 'worker-error' | 'bad-dimension' | 'malformed' | 'insert-error'   // REAL class
+    | 'timeout' | 'no-consumer' | 'connection-lost' | 'shutdown';        // WAIT class (+ shutdown=non-retryable)
+
+export const REAL_REASONS: ReadonlySet<EmbedReason> =
+    new Set<EmbedReason>(['worker-error', 'bad-dimension', 'malformed', 'insert-error']);
+
+export const WAIT_REASONS: ReadonlySet<EmbedReason> =
+    new Set<EmbedReason>(['timeout', 'no-consumer', 'connection-lost']); // 'shutdown' is NOT retried
+
+/**
+ * Index-aligned per-item result for a partial-tolerant batch embed.
+ * A failed slot carries a tagged `reason` (and optional human `detail`) but
+ * NEVER a zero/wrong-dimension vector — callers can skip it without corrupting
+ * the collection.
+ */
+export type EmbedItemResult =
+    | { ok: true; index: number; vector: number[]; dimension: number }
+    | { ok: false; index: number; reason: EmbedReason; detail?: string };
+
+/**
  * Abstract base class for embedding implementations
  */
 export abstract class Embedding {
@@ -71,6 +102,19 @@ export abstract class Embedding {
      * @returns Embedding vector array
      */
     abstract embedBatch(texts: string[]): Promise<EmbeddingVector[]>;
+
+    /**
+     * Partial-tolerant batch embed. The default implementation simply wraps
+     * embedBatch's all-or-nothing result into index-aligned ok=true entries;
+     * providers with real partial semantics (e.g. RabbitMQEmbedding) override
+     * this to return per-item failures without aborting the whole batch.
+     * @param texts Text array
+     * @returns Index-aligned per-item results
+     */
+    async embedBatchPartial(texts: string[]): Promise<EmbedItemResult[]> {
+        const vics = await this.embedBatch(texts);
+        return vics.map((v, index) => ({ ok: true as const, index, vector: v.vector, dimension: v.dimension }));
+    }
 
     /**
      * Get embedding vector dimension

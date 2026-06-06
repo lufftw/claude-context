@@ -23,6 +23,7 @@ export interface ContextMcpConfig {
     rabbitmqQueue?: string;
     rabbitmqDimension?: number;
     rabbitmqTimeoutMs?: number;
+    rabbitmqMaxRetries?: number;
     rabbitmqPriority?: number;
     rabbitmqConcurrency?: number;
     rabbitmqSource?: string;
@@ -154,6 +155,7 @@ export function createMcpConfig(): ContextMcpConfig {
 
     const rabbitmqDim = envManager.get('RABBITMQ_EMBEDDING_DIMENSION');
     const rabbitmqTimeout = envManager.get('RABBITMQ_EMBEDDING_TIMEOUT_MS');
+    const rabbitmqMaxRetries = envManager.get('RABBITMQ_EMBEDDING_MAX_RETRIES');
     const rabbitmqPriority = envManager.get('RABBITMQ_EMBEDDING_PRIORITY');
     const rabbitmqConcurrency = envManager.get('RABBITMQ_EMBEDDING_CONCURRENCY');
 
@@ -180,6 +182,7 @@ export function createMcpConfig(): ContextMcpConfig {
         rabbitmqQueue: envManager.get('RABBITMQ_EMBEDDING_QUEUE'),
         rabbitmqDimension: rabbitmqDim ? parseInt(rabbitmqDim, 10) : undefined,
         rabbitmqTimeoutMs: rabbitmqTimeout ? parseInt(rabbitmqTimeout, 10) : undefined,
+        rabbitmqMaxRetries: rabbitmqMaxRetries ? parseInt(rabbitmqMaxRetries, 10) : undefined,
         rabbitmqPriority: rabbitmqPriority ? parseInt(rabbitmqPriority, 10) : undefined,
         rabbitmqConcurrency: rabbitmqConcurrency ? parseInt(rabbitmqConcurrency, 10) : undefined,
         rabbitmqSource: envManager.get('RABBITMQ_EMBEDDING_SOURCE'),

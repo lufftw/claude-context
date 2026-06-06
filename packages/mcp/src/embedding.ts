@@ -87,6 +87,7 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
                 modelName: config.embeddingModel,
                 dimension: rabbitmqDimension,
                 timeoutMs: config.rabbitmqTimeoutMs,
+                maxRetries: config.rabbitmqMaxRetries,
                 priority: config.rabbitmqPriority,
                 concurrency: config.rabbitmqConcurrency,
                 source: config.rabbitmqSource || 'claude-context',

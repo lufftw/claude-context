@@ -362,10 +362,13 @@ export class MilvusVectorDatabase implements VectorDatabase {
             metadata: JSON.stringify(doc.metadata),
         }));
 
-        await this.client.insert({
+        const res: any = await this.client.insert({
             collection_name: collectionName,
             data: data,
         });
+        if (res?.status?.error_code && res.status.error_code !== 'Success') {
+            throw new Error(`[MilvusDB] insert failed for '${collectionName}': ${res.status.reason || res.status.error_code}`);
+        }
     }
 
     async search(collectionName: string, queryVector: number[], options?: SearchOptions): Promise<VectorSearchResult[]> {
@@ -654,10 +657,13 @@ export class MilvusVectorDatabase implements VectorDatabase {
             metadata: JSON.stringify(doc.metadata),
         }));
 
-        await this.client.insert({
+        const res: any = await this.client.insert({
             collection_name: collectionName,
             data: data,
         });
+        if (res?.status?.error_code && res.status.error_code !== 'Success') {
+            throw new Error(`[MilvusDB] insert failed for '${collectionName}': ${res.status.reason || res.status.error_code}`);
+        }
     }
 
     async hybridSearch(collectionName: string, searchRequests: HybridSearchRequest[], options?: HybridSearchOptions): Promise<HybridSearchResult[]> {
