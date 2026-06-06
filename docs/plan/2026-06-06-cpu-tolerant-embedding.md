@@ -10,7 +10,7 @@
 
 **Design spec:** `docs/lufftw/design-2026-06-06-cpu-tolerant-embedding.md` (authoritative).
 
-**Plan revision:** rev1.2 (ARB³ closed-loop review → `docs/plan/2026-06-06-arb3-review-rev1.1.md`; Round-4 execution-digital-twin → `docs/plan/2026-06-06-round4-digital-twin-rev1.2.md`).
+**Plan revision:** rev1.3 (ARB³ → `2026-06-06-arb3-review-rev1.1.md`; Round-4 digital-twin → `2026-06-06-round4-digital-twin-rev1.2.md`; Round-5 confirmation → `2026-06-06-round5-confirmation-rev1.3.md`). **Phase 1/2 build target = rev1.3.**
 
 ---
 
@@ -46,6 +46,21 @@ Three twins + an adversary traced P30+P31+P33 against the **real code** + the li
 - **P7+P34+P6 (promoted to Tier-1):** `files?` on `CodebaseInfoIndexing` (`config.ts:49-52`); `setCodebaseIndexing` carries `files` forward (else the 2s tick clobbers it — killed run leaves no readable ledger → resume degrades to full re-index); field-merge `files` in `mergeAndWriteSnapshot`; retain on interrupted `indexing` reload.
 - **P32:** result-check the Milvus `insert` (`milvus-vectordb.ts:365-368` discards `MutationResult`) — non-`Success`/`insert_cnt!==len` ⇒ REAL `insert-error`; never seal `complete` on a partial insert.
 - **P5:** cross-layer `onFileComplete` callback (core→handlers→`setFileComplete`); core never imports mcp.
+
+### Round 5 (confirmation) — verdict: GO to implement (rev1.3). 3 mechanical additions + 4-commit order
+All four Round-4 findings confirmed CLOSED against real code (every line verbatim). HIGH confidence. Fold these **producer-completion** additions into the atomic unit before coding (full detail in `docs/plan/2026-06-06-round5-confirmation-rev1.3.md`):
+- **Add-1 (item 6b):** `processChunkBuffer` (`context.ts:1040`, the real 3-level intermediary `processFileList`→`processChunkBuffer`@957/1012→`processChunkBatch`@1053) must become the explicit `BatchOutcome`-returning, **tuple-forwarding** method — drop the `.map(item=>item.chunk)` at 1044 so `relativePath` (edit 4) survives to `BatchOutcome.perFile`. The three-way counter (edit 8) awaits `processChunkBuffer`, not `processChunkBatch`.
+- **Add-2 (amend item 15):** pre-Phase-3, `absent-ledger + milvusSaysSame` must `deleteByFilter(relativePath)` **before** re-embed (NOT plain insert) — else the non-upsert path re-inserts identical deterministic PKs → duplicate rows → non-deterministic `fileHash` in `loadExistingFileHashes`. Three-way: `complete:false`→delete+re-embed; `absent`+Phase-3→upsert no-predelete; `absent`+pre-Phase-3→delete+re-embed.
+- **Add-3 (amend item 10):** fire `onFileComplete` at **flush time** keyed off `BatchOutcome.perFile` (deduped via a `firedComplete: Set<string>`), NOT at the file-loop boundary (991) — with `EMBEDDING_BATCH_SIZE=100` + cross-file buffering, a finished file's chunks usually sit unflushed at 991 → would read `inserted:0`.
+- **Add-3b (clarify item 8):** when replacing lines 955-980, **preserve** the unconditional `chunkBuffer = []` reset (was the 978-980 `finally`) outside any catch — a literal block-delete would drop it and the buffer would grow unbounded.
+
+**4-commit landing order** (each compiles green under `pnpm typecheck && pnpm build`; producer-before-consumer):
+1. **Provider seam + types** — edits 1,2,3 + MutationResult surfacing (7): `EmbedReason`/`REAL_REASONS`/`EmbedItemResult`/`embedBatchPartial` (+ base default), Layer-0 dim/norm reject before `rabbitmq-embedding.ts:197`, stop discarding `MutationResult`. Nothing calls it yet.
+2. **Batch reducer + 3-level return shape (atomic cluster)** — edits 4,5,6,**6b**,8,9 + Add-3b: `BatchOutcome`, `relativePath` thread, `fileChunkTotals`, partial+result-checked `processChunkBatch`, tuple-forwarding `processChunkBuffer`, three-way counter (+ final-flush 1008-1020). `onFileComplete` not wired yet.
+3. **Completeness gate + ledger callback + persistence** — edits 10(+**Add-3**+`incompleteByLimit`),11,12,13,14: flush-time `onFileComplete`, core `onFileComplete?` param + handlers wiring (core↛mcp), `files?` on `CodebaseInfoIndexing`, `setFileComplete`+files-carrying `setCodebaseIndexing`, field-merge + `loadV2Format` retain.
+4. **Next-run read + tests** — edit 15(+**Add-2**)+16: ledger-gated skip + absent/false/upsert branch + the 5 binary dynamic-verification tests (rogue via real consumer; SIGKILL resume; Add-2 no-dup-PK; Add-3 flush-timing; `fileChunkTotals`=splitter length).
+
+> **Round 6 is NOT a 6th review** — it is the post-implementation **dynamic verification** (the 5 binary tests above), per `feedback_dynamic_over_static_verification` + `feedback_binary_acceptance`. It collapses into "run the item-16 suite, confirm exit codes + collection state."
 
 ### Phase 3 — duplicate-PK call (definite, from Round 4)
 - **Upsert is sufficient for new writes** (deterministic PK collapses to 1 row) — stops manufacturing dups.
