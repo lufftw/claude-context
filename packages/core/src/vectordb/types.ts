@@ -134,6 +134,12 @@ export interface VectorDatabase {
     query(collectionName: string, filter: string, outputFields: string[], limit?: number): Promise<Record<string, any>[]>;
 
     /**
+     * Full-scan query that drains ALL matching rows (no 16384 window cap),
+     * using server-side iteration. Use for resume/readback over large collections.
+     */
+    queryAll(collectionName: string, outputFields: string[], filter?: string, batchSize?: number): Promise<Record<string, any>[]>;
+
+    /**
      * Get collection description
      * @param collectionName Collection name
      * @returns Collection description string

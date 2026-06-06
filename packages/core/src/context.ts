@@ -835,11 +835,11 @@ export class Context {
 
             // Query all chunks' relativePath + metadata (which contains fileHash)
             // We only need one chunk per file to get the fileHash.
-            const results = await this.vectorDatabase.query(
+            // Full-scan (no 16384 truncation) so resume sees every indexed file.
+            const results = await this.vectorDatabase.queryAll(
                 collectionName,
-                '',  // no filter = all rows
                 ['relativePath', 'metadata'],
-                16384
+                ''  // all rows
             );
 
             for (const row of results) {
