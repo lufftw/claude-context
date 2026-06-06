@@ -24,12 +24,24 @@ interface PublishedTask {
 
 function makeHarness() {
     const publishedTasks: PublishedTask[] = [];
+    // Always points at the consumer registered by the MOST RECENT initialize().
     let consumeCallback: ((msg: any) => void) | null = null;
     let replyQueueName = 'amq.gen-fake-reply';
+    // Captured connection-level event handlers (so tests can fire 'close'/'error').
+    const connHandlers: Record<string, Array<(arg?: any) => void>> = {};
+    // How many times assertQueue('') has been called — a proxy for "new reply
+    // queue created" across (re)initializations.
+    let assertQueueCount = 0;
 
     const noopEmitter = () => { /* on() handler — ignored in tests */ };
 
+    const captureOn = (store: Record<string, Array<(arg?: any) => void>>) =>
+        (event: string, cb: (arg?: any) => void) => {
+            (store[event] ??= []).push(cb);
+        };
+
     const publishCh: any = {
+        // Channel-level handlers are not exercised by current tests; keep no-op.
         on: noopEmitter,
         publish: (_exchange: string, _queue: string, buffer: Buffer, _opts: any, cb?: (err: any) => void) => {
             const task = JSON.parse(buffer.toString('utf8')) as PublishedTask;
@@ -43,8 +55,13 @@ function makeHarness() {
 
     const replyCh: any = {
         on: noopEmitter,
-        assertQueue: async () => ({ queue: replyQueueName }),
+        assertQueue: async () => {
+            assertQueueCount++;
+            return { queue: replyQueueName };
+        },
         consume: async (_queue: string, cb: (msg: any) => void) => {
+            // Re-bind to the latest consumer so deliveries after a reconnect target
+            // the fresh reply queue's consumer.
             consumeCallback = cb;
             return { consumerTag: 'fake-tag' };
         },
@@ -52,7 +69,8 @@ function makeHarness() {
     };
 
     const conn: any = {
-        on: noopEmitter,
+        // Capture connection 'close'/'error' handlers so tests can fire them.
+        on: captureOn(connHandlers),
         createConfirmChannel: async () => publishCh,
         createChannel: async () => replyCh,
         close: async () => { /* noop */ },
@@ -66,6 +84,16 @@ function makeHarness() {
         lastTaskId: () => publishedTasks[publishedTasks.length - 1]?.id,
         taskIdAt: (i: number) => publishedTasks[i]?.id,
         setReplyQueueName: (name: string) => { replyQueueName = name; },
+        // Number of times an exclusive reply queue has been asserted (assertQueue('')).
+        // 1 after first init; increments to 2 after a successful reconnect.
+        assertQueueCount: () => assertQueueCount,
+        // Simulate the broker/transport dropping the connection: fire the captured
+        // connection 'close' handler, which the provider wires to resetState(...).
+        dropConnection: () => {
+            const handlers = connHandlers['close'] ?? [];
+            if (handlers.length === 0) throw new Error('no connection close handler captured yet');
+            for (const cb of handlers) cb();
+        },
         deliver: (taskId: string, reply: any) => {
             if (!consumeCallback) throw new Error('consumer not registered yet');
             const content = Buffer.from(JSON.stringify({ taskId, ...reply }));
@@ -272,6 +300,70 @@ describe('Edit E — sendOneWithRetry (bounded retry-via-republish)', () => {
         } finally {
             jest.useRealTimers();
         }
+    });
+});
+
+describe('Edit G — connection-lost (WAIT-class) retries re-establish the connection', () => {
+    it('a mid-flight connection drop re-initializes and the retry resolves on the NEW reply queue', async () => {
+        const h = makeHarness();
+        const e = new RabbitMQEmbedding({
+            url: 'amqp://x', queue: 'q', modelName: 'm', dimension: DIM,
+            maxRetries: 3, connectFn: h.connectFn,
+        });
+
+        const p = e.embed('x');
+        // Let initialize() (#1) + first publish complete.
+        await new Promise((r) => setImmediate(r));
+        expect(h.publishedTasks.length).toBe(1);
+        expect(h.assertQueueCount()).toBe(1); // first exclusive reply queue asserted
+
+        // Simulate a transient connection drop INSTEAD of replying. resetState rejects
+        // the pending with embedReason='connection-lost' (WAIT class → retryable) and
+        // nulls publishCh/replyQueue + isInitialized=false.
+        h.setReplyQueueName('amq.gen-fake-reply-2');
+        h.dropConnection();
+
+        // The retry must re-initialize: a SECOND assertQueue('') (new reply queue) and a
+        // SECOND publish. Let the retry loop run initialize() (#2) + republish.
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+        expect(h.assertQueueCount()).toBe(2); // reconnect created a fresh reply queue
+        expect(h.publishedTasks.length).toBe(2);
+        // The republished task targets the NEW reply queue.
+        expect(h.publishedTasks[1].replyTo).toBe('amq.gen-fake-reply-2');
+
+        // Deliver a good reply to the NEW reply queue's consumer for the SECOND task.
+        h.deliver(h.taskIdAt(1), { success: true, content: JSON.stringify([makeVector(DIM)]) });
+
+        // It RESOLVES with a valid vector — and never throws the opaque "not initialized".
+        const out = await p;
+        expect(out.vector.length).toBe(DIM);
+        expect(out.dimension).toBe(DIM);
+        expect((e as any).pending.size).toBe(0);
+    });
+
+    it('embedBatchPartial recovers a single slot after a connection drop (resolves, not "not initialized")', async () => {
+        const h = makeHarness();
+        const e = new RabbitMQEmbedding({
+            url: 'amqp://x', queue: 'q', modelName: 'm', dimension: DIM,
+            maxRetries: 3, concurrency: 1, connectFn: h.connectFn,
+        });
+
+        const pr = e.embedBatchPartial(['only']);
+        await new Promise((r) => setImmediate(r));
+        expect(h.publishedTasks.length).toBe(1);
+
+        // Drop instead of replying → connection-lost → retry re-initializes.
+        h.dropConnection();
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+        expect(h.publishedTasks.length).toBe(2);
+
+        h.deliver(h.taskIdAt(1), { success: true, content: JSON.stringify([makeVector(DIM)]) });
+        const results = await pr;
+        expect(results.length).toBe(1);
+        expect(results[0].ok).toBe(true);
+        if (results[0].ok) expect(results[0].vector.length).toBe(DIM);
     });
 });
 

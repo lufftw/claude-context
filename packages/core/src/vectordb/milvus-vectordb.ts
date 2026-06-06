@@ -366,6 +366,9 @@ export class MilvusVectorDatabase implements VectorDatabase {
             collection_name: collectionName,
             data: data,
         });
+        // error_code may be the string 'Success' or numeric (0 / absent = success). The
+        // `&& ... !== 'Success'` shape treats numeric 0 (and undefined) as success too;
+        // do not regress to a bare truthiness check on the numeric path.
         if (res?.status?.error_code && res.status.error_code !== 'Success') {
             throw new Error(`[MilvusDB] insert failed for '${collectionName}': ${res.status.reason || res.status.error_code}`);
         }
@@ -661,6 +664,9 @@ export class MilvusVectorDatabase implements VectorDatabase {
             collection_name: collectionName,
             data: data,
         });
+        // error_code may be the string 'Success' or numeric (0 / absent = success). The
+        // `&& ... !== 'Success'` shape treats numeric 0 (and undefined) as success too;
+        // do not regress to a bare truthiness check on the numeric path.
         if (res?.status?.error_code && res.status.error_code !== 'Success') {
             throw new Error(`[MilvusDB] insert failed for '${collectionName}': ${res.status.reason || res.status.error_code}`);
         }

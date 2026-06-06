@@ -229,7 +229,10 @@ export class RabbitMQEmbedding extends Embedding {
         );
 
         this.isInitialized = true;
-        console.log(
+        // Library-boundary stdout safety: @zilliz/claude-context-core is a standalone
+        // library and must not rely on the MCP entry-point's console shim to keep
+        // stdout (JSON-RPC) clean — diagnostics go to stderr.
+        console.error(
             `[RabbitMQEmbedding] ✅ initialized — queue=${this.config.queue}, model=${this.config.modelName}, dim=${this.config.dimension}, replyQueue=${this.replyQueue}`
         );
     }
@@ -326,7 +329,7 @@ export class RabbitMQEmbedding extends Embedding {
                         out[idx] = { ok: true, index: idx, vector, dimension: vector.length };
                     }
                 } catch (err) {
-                    const reason = ((err as any).embedReason as EmbedReason | undefined) ?? 'worker-error';
+                    const reason = (err as { embedReason?: EmbedReason }).embedReason ?? 'worker-error';
                     out[idx] = { ok: false, index: idx, reason, detail: (err as Error).message };
                 }
             }
@@ -367,7 +370,7 @@ export class RabbitMQEmbedding extends Embedding {
                 return await this.sendOne(text, attempt);
             } catch (err) {
                 lastErr = err;
-                const reason = (err as any).embedReason as EmbedReason | undefined;
+                const reason = (err as { embedReason?: EmbedReason }).embedReason;
                 if (!reason || !WAIT_REASONS.has(reason)) throw err; // REAL or 'shutdown' → no retry
                 // WAIT-class: re-publish a fresh taskId on the next loop iteration.
                 console.error(`[RabbitMQEmbedding] retry ${attempt + 1}/${this.config.maxRetries} after ${reason}`);
@@ -377,6 +380,12 @@ export class RabbitMQEmbedding extends Embedding {
     }
 
     private async sendOne(text: string, attempt: number = 0): Promise<number[]> {
+        // Re-establish after a resetState (idempotent + mutex-guarded) so WAIT-class
+        // retries can recover from a transient connection/channel drop. Because each
+        // retry calls sendOne afresh, it reads the NEW this.replyQueue at publish time.
+        await this.initialize();
+        // Defensive post-init assertion: initialize() above guarantees these are set
+        // on the happy path; this guards against a drop racing in between.
         if (!this.publishCh || !this.replyQueue) {
             throw new Error('RabbitMQEmbedding: not initialized');
         }
