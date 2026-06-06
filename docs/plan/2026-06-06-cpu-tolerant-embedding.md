@@ -10,6 +10,37 @@
 
 **Design spec:** `docs/lufftw/design-2026-06-06-cpu-tolerant-embedding.md` (authoritative).
 
+**Plan revision:** rev1.1 (hardened by the ARB³ closed-loop review — full verdict + 44-item patch-list in `docs/plan/2026-06-06-arb3-review-rev1.1.md`).
+
+---
+
+## ARB³ Review Status (rev1.1)
+
+A 13-agent, 3-round closed-loop review (domain → meta+simulation+adversarial → chair go/no-go) hardened this plan. Verdict: **NEEDS ROUND 4** (narrow) — Phase-1/2 *code* is gated on a composition trace of the Task 1.4↔1.5↔1.6↔2.3 seam (patches P30/P31/P33). **The Hotfix is independently shippable** after the Tier-0 patches below.
+
+### Gate map
+- **Hotfix:** ✅ unblocked. Tier-0 patches **applied inline** (P1, P2, P3, P4, P22, P24, P25, P44, P51).
+- **Phase 1/2 code start:** ⛔ blocked until **Round 4** traces P30+P31+P33 composing. Tier-1 patches **pending** (annotated in the relevant tasks).
+- **Phase 3:** patches deferred to phase reach (P16, P26, hybrid probe).
+
+### Tier-0 (Hotfix) — APPLIED in rev1.1
+| Patch | What | Where applied |
+|---|---|---|
+| P1/P25 | `queryIterator` is async-iterable-only; probe uses `for await`, pins `127.0.0.1`, hard-fails on no token | Hotfix Step 1 |
+| P2 | mock exposes `[Symbol.asyncIterator]`, re-emits last batch on `done`, asserts no dup | Hotfix Step 2 |
+| P3 | impl uses `for await` + injects PK `id` into `output_fields` (F1+F2+F3) | Hotfix Step 5 |
+| P4/P51/P44 | acceptance gate: no-duplicate-PK primary + require ≥16384 rows (was vacuous) | Hotfix Step 10 |
+| P22 | split `test` / `test:int` so unit gate runs offline | Task 0 Step 2 |
+| P24 | RESTful `queryAll` documented as best-effort ≤16384 (gRPC is the active driver) | Hotfix Step 6 |
+
+### Tier-1 — the Round-4 trace target (PENDING; gates Phase 1/2 code)
+- **P30 (FATAL G1):** rewrite the resume read at `context.ts:903` to consult the ledger (`led.complete===true && led.fileHash===fileHash`), not chunk-metadata hash alone — else Phase 2 is a silent no-op. → Task 2.3.
+- **P31 (FATAL G2):** redefine the abort trigger from "did the batch throw" to "batch has ≥1 REAL-class failed slot"; `processChunkBatch` throws a tagged aggregate. → Task 1.6. Includes the rogue-worker regression test (a 1536-dim `success:true` reply MUST increment the counter).
+- **P33 (HIGH G4):** thread `relativePath` onto the chunk buffer (`context.ts:951`); per-file `{produced,inserted}` map; fire `onFileComplete` only after a file's last chunk flushes (incl. final-batch flush at 1012). → Task 2.3.
+
+### Tier-2/3/4 — PENDING, applied as each phase is reached
+Full list (P5–P52) in the review artifact. Headlines: **P5/F4** cross-layer `onFileComplete` callback (core cannot call mcp `SnapshotManager` — wire in `handlers.ts`); **P6/F5** field-level `files` deep-merge in `mergeAndWriteSnapshot`; **P7/F6** `files?` on `CodebaseInfoIndexing` + carry on progress ticks; **P14** `processChunkBuffer`/`processChunkBatch` return `{failedIndices,insertedIds,perFile}`; **P32/G3** result-check the Milvus `insert` (currently discarded); **P8/P38** tagged `resetState(reason, embedClass)`; **P36** clamp indexing priority ≤7; **P43/P20** reconcile `timeoutMs × (maxRetries+1) < 7_200_000` as a tested invariant (provisional `timeoutMs=1_800_000`, `maxRetries=3`).
+
 ---
 
 ## Plan & Version Control Policy
@@ -133,10 +164,11 @@ module.exports = {
 
 - [ ] **Step 2: Add the test script**
 
-In `packages/core/package.json` `"scripts"`, add:
+In `packages/core/package.json` `"scripts"`, add (P22 — keep live-Milvus `*.int.test.ts` out of the hermetic unit gate so `pnpm test` works offline):
 ```json
-"test": "jest",
-"test:watch": "jest --watch"
+"test": "jest --testPathIgnorePatterns='\\.int\\.test\\.ts$'",
+"test:int": "jest --testMatch='**/__tests__/**/*.int.test.ts'",
+"test:watch": "jest --watch --testPathIgnorePatterns='\\.int\\.test\\.ts$'"
 ```
 
 - [ ] **Step 3: Write a smoke test**
@@ -179,52 +211,67 @@ git commit -m "test: stand up jest harness for core package"
 
 Before coding, confirm the SDK's iterator contract empirically (the project rule is "introspect runtime APIs, do not assume"). Write a one-off probe `tmp-iter-probe.mjs` (gitignored `tmp-*.mjs`) that connects to the live Milvus (`localhost:19530`, token from `.mcp.json`) and calls `client.queryIterator` on an existing collection (`claude_context_own`), logging the shape of the returned object and one `.next()` result to **stderr**.
 
+> **ARB³ P1/P25 (FATAL-class correction):** the SDK `queryIterator` returns an **async-iterable only** — `{ currentTotal, [Symbol.asyncIterator]() {...} }` with **no top-level `.next()`** (verified `@zilliz/milvus2-sdk-node@2.5.10` `dist/milvus/grpc/Data.js:650-686`). A `.next()` call throws. Drive it with `for await`. Pin `127.0.0.1:19530` and hard-fail on missing token.
+
 ```js
-// tmp-iter-probe.mjs — verify queryIterator() return contract
+// tmp-iter-probe.mjs — verify queryIterator() return contract (gitignored tmp-*.mjs)
 import { MilvusClient } from '@zilliz/milvus2-sdk-node';
 import { readFileSync } from 'node:fs';
 const env = Object.values(JSON.parse(readFileSync('./.mcp.json')).mcpServers)[0].env;
-const client = new MilvusClient({ address: env.MILVUS_ADDRESS.replace(/^localhost/, '127.0.0.1'), token: env.MILVUS_TOKEN });
-const it = await client.queryIterator({ collection_name: 'claude_context_own', output_fields: ['relativePath'], batchSize: 5, expr: '' });
-console.error('iterator keys:', Object.keys(it));
-const first = await it.next();
-console.error('first .next():', JSON.stringify({ done: first.done, isArray: Array.isArray(first.value), len: first.value?.length }));
+const address = (env.MILVUS_ADDRESS || '127.0.0.1:19530').replace(/^localhost/, '127.0.0.1');
+const token = env.MILVUS_TOKEN;
+if (!token) { console.error('[probe] MILVUS_TOKEN missing'); process.exit(2); }
+const client = new MilvusClient({ address, token });
+const it = await client.queryIterator({ collection_name: 'claude_context_own', output_fields: ['relativePath','id'], batchSize: 5, expr: '' });
+console.error('has .next():', typeof it.next);                       // expect 'undefined'
+console.error('has asyncIterator:', typeof it[Symbol.asyncIterator]); // expect 'function'
+let pages = 0, rows = 0;
+for await (const batch of it) { pages++; rows += batch.length; if (pages >= 3) break; }
+console.error('drained', pages, 'pages,', rows, 'rows via for-await');
 process.exit(0);
 ```
 Run: `node tmp-iter-probe.mjs`
-Record the observed contract (e.g. `{ done, value: Row[] }`) — the implementation in Step 3 must match what is observed, not what is assumed. Delete the probe after.
+**Acceptance:** stderr shows `has .next(): undefined` and `has asyncIterator: function`. Paste this output before writing Step 5. Delete the probe after.
 
 - [ ] **Step 2: Write the failing test (mock the iterator)**
 
 `packages/core/src/vectordb/__tests__/query-all.test.ts`:
+> **ARB³ P2:** the mock MUST expose `[Symbol.asyncIterator]` and re-emit the **previous** batch on `{done:true}` (SDK `Data.js:658-659` returns the last non-empty batch in `value`, not `[]`). `for await` ignores the value when `done:true`, so the assertion proves no duplicate `'c'`.
+
 ```ts
 import { MilvusVectorDatabase } from '../milvus-vectordb';
 
 describe('MilvusVectorDatabase.queryAll', () => {
-  it('drains all batches beyond the 16384 window', async () => {
+  it('drains all batches via async-iterator without double-counting the final batch', async () => {
     const db = new MilvusVectorDatabase({ address: 'unused' });
-    // Fake an initialized client + iterator that yields 3 batches then done.
     const batches = [
-      [{ relativePath: 'a' }, { relativePath: 'b' }],
-      [{ relativePath: 'c' }],
-      [],
+      [{ relativePath: 'a', id: '1' }, { relativePath: 'b', id: '2' }],
+      [{ relativePath: 'c', id: '3' }],
     ];
-    let i = 0;
+    let capturedFields: string[] = [];
     (db as any).client = {
-      queryIterator: async () => ({
-        next: async () => {
-          const value = batches[i] ?? [];
-          const done = i >= batches.length - 1; // last call returns done with []
-          i++;
-          return { done, value };
-        },
-      }),
+      queryIterator: async (req: any) => {
+        capturedFields = req.output_fields;
+        return {
+          [Symbol.asyncIterator]() {
+            let i = 0;
+            return {
+              async next() {
+                if (i < batches.length) return { done: false, value: batches[i++] };
+                // SDK contract: done:true re-emits the LAST batch in value.
+                return { done: true, value: batches[batches.length - 1] };
+              },
+            };
+          },
+        };
+      },
     };
     (db as any).ensureInitialized = async () => {};
     (db as any).ensureLoaded = async () => {};
 
     const rows = await db.queryAll('c1', ['relativePath']);
-    expect(rows.map(r => r.relativePath)).toEqual(['a', 'b', 'c']);
+    expect(rows.map(r => r.relativePath)).toEqual(['a', 'b', 'c']); // no duplicate 'c'
+    expect(capturedFields).toContain('id'); // PK injected (P3) so keyset pagination advances
   });
 });
 ```
@@ -251,7 +298,7 @@ In `packages/core/src/vectordb/types.ts`, inside `interface VectorDatabase`, aft
 
 - [ ] **Step 5: Implement in the gRPC driver (matching the observed iterator contract)**
 
-In `packages/core/src/vectordb/milvus-vectordb.ts`, add after `query(...)` (after line 479). **Adjust the `.next()` handling to the contract observed in Step 1** — the version below assumes `{ done, value: Row[] }`:
+In `packages/core/src/vectordb/milvus-vectordb.ts`, add after `query(...)` (after line 479). **P3 (closes F1+F2+F3):** drive the async-iterator with `for await` (correct done-semantics, no double-append), and **always inject the primary key `id`** into `output_fields` — the SDK's keyset pagination (`utils/Function.js:147-168`) re-seeds from the min-PK whenever the last row's PK is absent, so omitting `id` makes every page re-seed page 1 forever:
 ```ts
     async queryAll(collectionName: string, outputFields: string[], filter?: string, batchSize: number = 10000): Promise<Record<string, any>[]> {
         await this.ensureInitialized();
@@ -259,21 +306,19 @@ In `packages/core/src/vectordb/milvus-vectordb.ts`, add after `query(...)` (afte
         if (!this.client) {
             throw new Error('MilvusClient is not initialized after ensureInitialized().');
         }
+        // PK must be present for the SDK's keyset pagination to advance (P3/F3).
+        const fields = outputFields.includes('id') ? outputFields : [...outputFields, 'id'];
         const iterator = await this.client.queryIterator({
             collection_name: collectionName,
-            output_fields: outputFields,
+            output_fields: fields,
             batchSize,
             expr: (filter && filter.trim() !== '') ? filter : '',
         });
         const out: Record<string, any>[] = [];
-        // Drain: each .next() yields a batch in .value until .done.
-        // (Contract verified in Hotfix Step 1 against the live SDK.)
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-            const res = await iterator.next();
-            const batch = (res?.value ?? []) as Record<string, any>[];
-            if (batch.length > 0) out.push(...batch);
-            if (res?.done) break;
+        // for-await drains all batches and stops on done:true WITHOUT re-yielding
+        // the final batch (SDK re-emits it in `value` on done — for-await ignores it).
+        for await (const batch of iterator as AsyncIterable<Record<string, any>[]>) {
+            out.push(...batch);
         }
         return out;
     }
@@ -289,7 +334,10 @@ In `packages/core/src/vectordb/milvus-restful-vectordb.ts`, add after `query(...
         const restfulConfig = this.config as MilvusRestfulConfig;
         const out: Record<string, any>[] = [];
         let offset = 0;
-        // NOTE: Milvus REST caps offset+limit per window; batchSize<=16384 keeps each page legal.
+        // ARB³ P24: Milvus REST caps offset+limit at the 16384 query window, so this loop
+        // does NOT "drain ALL rows" past 16384 — it is best-effort for the RESTful driver,
+        // which the MCP does NOT use (gRPC MilvusVectorDatabase is the active driver). Kept
+        // only for interface completeness. Do not rely on it for >16384-row full scans.
         const pageSize = Math.min(batchSize, 16384);
         // eslint-disable-next-line no-constant-condition
         while (true) {
@@ -334,7 +382,14 @@ Expected: exit code 0.
 
 - [ ] **Step 10: Live scaling gate (binary acceptance) against real Milvus**
 
-Milvus is up at `127.0.0.1:19530`. Write `tmp-pagination-gate.mjs` (gitignored) that builds the gRPC driver from `dist`, calls `queryAll('claude_context_own', ['relativePath'])`, and prints the distinct-`relativePath` count to stderr. Compare against `query(..., 16384)` from the old path on the same collection. Acceptance: if the collection has >16384 rows, `queryAll` returns strictly more distinct files than the capped query; if ≤16384, the counts match exactly. Assert via captured counts (numbers), not substrings.
+> **ARB³ P4/P51/P44 (must-fix — the original gate was vacuous):** a counts-match on a sub-16384 collection is *also* passed by the OLD truncating path, so "counts match" proves nothing. Make **no-duplicate-PK the PRIMARY gate**, and require a collection **at/over the 16384 window** (build a synthetic >20k-chunk corpus per spec §14 if no real collection qualifies). Run against a **quiescent** collection (`queryIterator` issues a separate `count()` RPC that disagrees under concurrent writes).
+
+Milvus is up at `127.0.0.1:19530`. Write `tmp-pagination-gate.mjs` (gitignored) that builds the gRPC driver from `dist` and, against a quiescent collection with **≥16384 rows**:
+1. Asserts `query(collection, '', ['id'], 16384).length === 16384` first (proves the collection actually exceeds the window — else the test is meaningless; abort if not).
+2. Calls `rows = queryAll(collection, ['relativePath'])` and asserts **`rows.length === new Set(rows.map(r => r.id)).size`** (no duplicate PKs — guards F2's terminal-batch double-push) — PRIMARY gate.
+3. Asserts `new Set(rows.map(r => r.relativePath)).size > 16384`-window distinct count from the capped query (proves the full scan beat truncation) — SECONDARY gate.
+
+Assert via captured counts (numbers) + the dedup set sizes, never substrings.
 
 - [ ] **Step 11: Commit**
 
@@ -657,7 +712,7 @@ The `RABBITMQ_EMBEDDING_TIMEOUT_MS` default is **measured, not guessed** (owner 
 
 - [ ] **M1** Once a CPU worker is actively processing (the queue was stalled at last check — gate on a live worker), publish ~20 representative code chunks at **priority 9** via the normal publish path (no purge), timing each round-trip. Record p50/p99 per-chunk latency to stderr; confirm the shared queue message count is unchanged afterward.
 - [ ] **M2** Set the shipped default to a comfortable multiple of observed p99 (headroom for queue wait), bounded under the 2h broker `consumer_timeout`. Record the number + evidence in the spec (§7) and `rabbitmq-embedding-provider.md`.
-- [ ] **M3** Until M1 is possible, ship Phase 1 with the provisional 600000ms (10min) default and a doc note that it is provisional pending measurement.
+- [ ] **M3** Until M1 is possible, ship Phase 1 with a provisional default that satisfies the **broker-ceiling invariant** (ARB³ P43/P20): `timeoutMs × (maxRetries + 1) < 7_200_000` (the 2h `consumer_timeout`). With `maxRetries = 3` (P9, lowered from 5), use `timeoutMs = 1_800_000` (30 min) → `1.8M × 4 = 7.2M`, exactly at the ceiling; pick a hair under (e.g. `1_700_000`) for strict `<`. A naive 10-min default with high retries is fine; a naive 100-min default × 4 retries (24M ms) **violates** the ceiling. Add a unit test asserting the invariant holds for the shipped (`timeoutMs`, `maxRetries`) pair so a future edit can't silently regress it. Record the pair + M1 evidence in spec §7.
 
 ---
 
