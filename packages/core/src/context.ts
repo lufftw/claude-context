@@ -6,7 +6,10 @@ import {
 import {
     Embedding,
     EmbeddingVector,
-    OpenAIEmbedding
+    OpenAIEmbedding,
+    EmbedItemResult,
+    EmbedReason,
+    REAL_REASONS
 } from './embedding';
 import {
     VectorDatabase,
@@ -96,6 +99,34 @@ export interface ContextConfig {
     customExtensions?: string[]; // New: custom extensions from MCP
     customIgnorePatterns?: string[]; // New: custom ignore patterns from MCP
     includeDotDirs?: string[]; // Dot-prefixed directories to include in indexing
+}
+
+/**
+ * Result of processing a single chunk batch through the partial-tolerant
+ * reducer (Commit 2/4).
+ *
+ * The reducer NEVER throws for per-slot embedding faults — it classifies them
+ * into the three-way counter via these fields and lets the caller decide
+ * whether to abort. (`processChunkBatch` only throws for genuinely unexpected
+ * conditions.)
+ *
+ *  - `perFile`       — per-relativePath tally: chunks produced (every slot we
+ *                      attempted) vs inserted (slots embedded AND confirmed
+ *                      written to the vector DB). Accumulated into
+ *                      processFileList's fileProgress; not yet read for
+ *                      completeness (that is Commit 3).
+ *  - `realFailures`  — slots whose reason ∈ REAL_REASONS
+ *                      (worker-error | bad-dimension | malformed | insert-error).
+ *                      A non-zero value advances the consecutive-error counter.
+ *  - `waitFailures`  — slots whose reason ∈ WAIT class (after provider retry
+ *                      exhaustion). Neutral for the abort counter.
+ *  - `successes`     — slots embedded AND confirmed inserted.
+ */
+interface BatchOutcome {
+    perFile: Map<string, { produced: number; inserted: number }>;
+    realFailures: number;
+    waitFailures: number;
+    successes: number;
 }
 
 export class Context {
@@ -885,11 +916,19 @@ export class Context {
         let changedFiles = 0;
         let deletedChunkFiles = 0;
 
-        let chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }> = [];
+        let chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string; relativePath: string }> = [];
         let processedFiles = 0;
         let totalChunks = 0;
         let limitReached = false;
         let consecutiveBatchErrors = 0;
+
+        // Per-file accounting threaded through the batch reducer (Commit 2/4).
+        //  - fileChunkTotals: how many chunks the splitter produced per file.
+        //  - fileProgress:    cumulative produced/inserted as batches drain.
+        // Both accumulate here but are NOT yet read for completeness; the
+        // snapshot completeness ledger / onFileComplete wiring is Commit 3.
+        const fileChunkTotals = new Map<string, number>();
+        const fileProgress = new Map<string, { produced: number; inserted: number }>();
 
         for (let i = 0; i < filePaths.length; i++) {
             const filePath = filePaths[i];
@@ -934,6 +973,11 @@ export class Context {
                 const language = this.getLanguageFromExtension(path.extname(filePath));
                 const chunks = await this.codeSplitter.split(content, language, filePath);
 
+                // Record how many chunks the splitter produced for this file so
+                // a later completeness check (Commit 3) can compare against the
+                // number actually inserted. Accumulated now; not yet read.
+                fileChunkTotals.set(relativePath, chunks.length);
+
                 // Inject fileHash into each chunk's metadata so future runs can skip
                 for (const chunk of chunks) {
                     chunk.metadata = { ...chunk.metadata, fileHash };
@@ -948,36 +992,36 @@ export class Context {
 
                 // Add chunks to buffer
                 for (const chunk of chunks) {
-                    chunkBuffer.push({ chunk, codebasePath });
+                    chunkBuffer.push({ chunk, codebasePath, relativePath });
                     totalChunks++;
 
-                    // Process batch when buffer reaches EMBEDDING_BATCH_SIZE
+                    // Process batch when buffer reaches EMBEDDING_BATCH_SIZE.
+                    // The reducer no longer throws for per-slot embedding faults
+                    // — it returns a BatchOutcome and we apply the three-way
+                    // abort counter (REAL → ++/maybe-abort; clean+productive →
+                    // reset; pure-WAIT → neutral). Only a thrown abort (or a
+                    // genuinely unexpected infra error) escapes here.
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
-                        try {
-                            await this.processChunkBuffer(chunkBuffer);
-                            consecutiveBatchErrors = 0;
-                        } catch (error) {
+                        const r = await this.processChunkBuffer(chunkBuffer);
+                        chunkBuffer = []; // ALWAYS reset, regardless of outcome
+                        this.mergeFileProgress(fileProgress, r.perFile);
+                        if (r.realFailures > 0) {
                             consecutiveBatchErrors++;
                             const searchType = isHybrid === true ? 'hybrid' : 'regular';
                             console.error(
-                                `[Context] ❌ Failed to process chunk batch for ${searchType} ` +
-                                `(${consecutiveBatchErrors}/${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive):`,
-                                error,
+                                `[Context] ❌ Chunk batch for ${searchType} had ${r.realFailures} ` +
+                                `REAL-class slot failure(s) ` +
+                                `(${consecutiveBatchErrors}/${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive)`,
                             );
-                            if (error instanceof Error) {
-                                console.error('[Context] Stack trace:', error.stack);
-                            }
                             if (consecutiveBatchErrors >= MAX_CONSECUTIVE_BATCH_ERRORS) {
-                                chunkBuffer = [];
-                                const cause = error instanceof Error ? error.message : String(error);
-                                throw new Error(
-                                    `Aborting indexing: ${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive ` +
-                                    `chunk-batch failures. Last error: ${cause}`,
-                                );
+                                throw this.makeAbortError(MAX_CONSECUTIVE_BATCH_ERRORS);
                             }
-                        } finally {
-                            chunkBuffer = []; // Always clear buffer, even on failure
+                        } else if (r.successes > 0) {
+                            // Clean, productive batch — a transient blip is forgiven.
+                            consecutiveBatchErrors = 0;
                         }
+                        // pure WAIT-class (realFailures===0 && successes===0):
+                        // leave consecutiveBatchErrors UNCHANGED (neutral).
                     }
 
                     // Check if chunk limit is reached
@@ -996,6 +1040,14 @@ export class Context {
                 }
 
             } catch (error) {
+                // The MAX-consecutive abort must NOT be swallowed by this
+                // per-file skip handler — it has to propagate to the caller
+                // (handlers.ts startBackgroundIndexing → indexfailed). Only
+                // genuine per-file faults (unreadable file, splitter crash, an
+                // unexpected infra error from a batch flush) are skipped.
+                if (this.isAbortError(error)) {
+                    throw error;
+                }
                 console.warn(`[Context] ⚠️  Skipping file ${filePath}: ${error}`);
             }
         }
@@ -1003,20 +1055,29 @@ export class Context {
         // Process any remaining chunks in the buffer.
         // Final batch is critical — if it fails we'd end up with a partial
         // index that the snapshot reports as 'completed', silently losing the
-        // last EMBEDDING_BATCH_SIZE - 1 chunks. Always re-throw so the caller
-        // (handlers.ts startBackgroundIndexing) marks the run as indexfailed.
+        // last EMBEDDING_BATCH_SIZE - 1 chunks. The same three-way classification
+        // applies here (REAL → ++/maybe-abort; clean+productive → reset; pure-WAIT
+        // → neutral). The final batch must NOT silently swallow a REAL failure.
         if (chunkBuffer.length > 0) {
             const searchType = isHybrid === true ? 'hybrid' : 'regular';
             console.log(`📝 Processing final batch of ${chunkBuffer.length} chunks for ${searchType}`);
-            try {
-                await this.processChunkBuffer(chunkBuffer);
-            } catch (error) {
-                console.error(`[Context] ❌ Failed to process final chunk batch for ${searchType}:`, error);
-                if (error instanceof Error) {
-                    console.error('[Context] Stack trace:', error.stack);
+            const r = await this.processChunkBuffer(chunkBuffer);
+            chunkBuffer = [];
+            this.mergeFileProgress(fileProgress, r.perFile);
+            if (r.realFailures > 0) {
+                consecutiveBatchErrors++;
+                console.error(
+                    `[Context] ❌ Final chunk batch for ${searchType} had ${r.realFailures} ` +
+                    `REAL-class slot failure(s) ` +
+                    `(${consecutiveBatchErrors}/${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive)`,
+                );
+                if (consecutiveBatchErrors >= MAX_CONSECUTIVE_BATCH_ERRORS) {
+                    throw this.makeAbortError(MAX_CONSECUTIVE_BATCH_ERRORS);
                 }
-                throw error;
+            } else if (r.successes > 0) {
+                consecutiveBatchErrors = 0;
             }
+            // pure WAIT-class: neutral.
         }
 
         // ── Log incremental stats ──
@@ -1035,49 +1096,141 @@ export class Context {
     }
 
     /**
- * Process accumulated chunk buffer
- */
-    private async processChunkBuffer(chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>): Promise<void> {
-        if (chunkBuffer.length === 0) return;
-
-        // Extract chunks and ensure they all have the same codebasePath
-        const chunks = chunkBuffer.map(item => item.chunk);
-        const codebasePath = chunkBuffer[0].codebasePath;
-
-        // Estimate tokens (rough estimation: 1 token ≈ 4 characters)
-        const estimatedTokens = chunks.reduce((sum, chunk) => sum + Math.ceil(chunk.content.length / 4), 0);
-
-        const isHybrid = this.getIsHybrid();
-        const searchType = isHybrid === true ? 'hybrid' : 'regular';
-        console.log(`[Context] 🔄 Processing batch of ${chunks.length} chunks (~${estimatedTokens} tokens) for ${searchType}`);
-        await this.processChunkBatch(chunks, codebasePath);
+     * Merge a BatchOutcome.perFile tally into a running accumulator, keyed by
+     * relativePath. Used by processFileList to thread per-file accounting
+     * across batches (the fileProgress map). Accumulated now; not yet read for
+     * completeness (Commit 3).
+     */
+    private mergeFileProgress(
+        acc: Map<string, { produced: number; inserted: number }>,
+        perFile: Map<string, { produced: number; inserted: number }>,
+    ): void {
+        for (const [rp, { produced, inserted }] of perFile) {
+            const cur = acc.get(rp) || { produced: 0, inserted: 0 };
+            cur.produced += produced;
+            cur.inserted += inserted;
+            acc.set(rp, cur);
+        }
     }
 
     /**
-     * Process a batch of chunks
+     * Build the sentinel abort error thrown when MAX_CONSECUTIVE_BATCH_ERRORS
+     * REAL-class chunk-batch failures occur in a row. Tagged so the per-file
+     * skip handler in processFileList re-throws it instead of swallowing it.
      */
-    private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
+    private makeAbortError(maxConsecutive: number): Error {
+        const err = new Error(
+            `Aborting indexing: ${maxConsecutive} consecutive REAL-class chunk-batch failures.`,
+        );
+        (err as any).__isIndexAbort = true;
+        return err;
+    }
+
+    /**
+     * Whether an error is the MAX-consecutive abort sentinel (must propagate
+     * past the per-file skip handler to handlers.ts → indexfailed).
+     */
+    private isAbortError(error: unknown): boolean {
+        return !!error && typeof error === 'object' && (error as any).__isIndexAbort === true;
+    }
+
+    /**
+     * Process accumulated chunk buffer. Forwards the FULL tuple (including
+     * relativePath) to processChunkBatch and returns its BatchOutcome so
+     * per-file accounting survives. Does NOT throw for per-slot embedding faults
+     * — those are classified inside the returned outcome.
+     */
+    private async processChunkBuffer(
+        chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string; relativePath: string }>,
+    ): Promise<BatchOutcome> {
+        if (chunkBuffer.length === 0) {
+            return { perFile: new Map(), realFailures: 0, waitFailures: 0, successes: 0 };
+        }
+
+        // Estimate tokens (rough estimation: 1 token ≈ 4 characters)
+        const estimatedTokens = chunkBuffer.reduce(
+            (sum, item) => sum + Math.ceil(item.chunk.content.length / 4),
+            0,
+        );
+
         const isHybrid = this.getIsHybrid();
+        const searchType = isHybrid === true ? 'hybrid' : 'regular';
+        console.log(`[Context] 🔄 Processing batch of ${chunkBuffer.length} chunks (~${estimatedTokens} tokens) for ${searchType}`);
+        return this.processChunkBatch(chunkBuffer);
+    }
 
-        // Generate embedding vectors
-        const chunkContents = chunks.map(chunk => chunk.content);
-        const embeddings = await this.embedding.embedBatch(chunkContents);
+    /**
+     * Process a batch of chunks with partial-tolerant embedding.
+     *
+     * Consumes embedBatchPartial's index-aligned per-item results, builds
+     * documents from ONLY the succeeded slots (paired indices — never positional
+     * re-index after dropping a slot), inserts them, and returns a BatchOutcome
+     * that classifies each slot for the three-way abort counter. Per-slot
+     * embedding faults and Milvus insert failures are recorded in the outcome
+     * (never thrown); only genuinely unexpected conditions propagate.
+     */
+    private async processChunkBatch(
+        items: Array<{ chunk: CodeChunk; codebasePath: string; relativePath: string }>,
+    ): Promise<BatchOutcome> {
+        const isHybrid = this.getIsHybrid();
+        const codebasePath = items[0].codebasePath;
+        const expectedDim = this.embedding.getDimension();
 
-        if (isHybrid === true) {
-            // Create hybrid vector documents
-            const documents: VectorDocument[] = chunks.map((chunk, index) => {
+        const perFile = new Map<string, { produced: number; inserted: number }>();
+        const bump = (rp: string, key: 'produced' | 'inserted', n = 1) => {
+            const cur = perFile.get(rp) || { produced: 0, inserted: 0 };
+            cur[key] += n;
+            perFile.set(rp, cur);
+        };
+
+        // Every item is "produced" — we attempted to embed it.
+        for (const item of items) {
+            bump(item.relativePath, 'produced');
+        }
+
+        let realFailures = 0;
+        let waitFailures = 0;
+
+        const results: EmbedItemResult[] = await this.embedding.embedBatchPartial(
+            items.map(it => it.chunk.content),
+        );
+
+        // Partition into succeeded slots (paired with their source item) and
+        // classify failed slots. Build docs ONLY from succeeded slots using
+        // paired indices — the document shape is identical to the pre-Commit-2
+        // hybrid / non-hybrid mapping.
+        const docs: VectorDocument[] = [];
+        const docItems: Array<{ relativePath: string }> = [];
+
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const res = results[i];
+
+            if (res && res.ok === true) {
+                // Defense-in-depth: a rogue worker can return ok=true with a
+                // wrong-dimension vector (2026-05-05 incident). Treat that as a
+                // REAL bad-dimension fault and do NOT insert it.
+                if (!Array.isArray(res.vector) || res.vector.length !== expectedDim) {
+                    console.error(
+                        `[Context] ❌ Rogue dimension on ok slot ${i}: got ${res.vector?.length}, expected ${expectedDim} (bad-dimension, REAL)`,
+                    );
+                    realFailures++;
+                    continue;
+                }
+
+                const chunk = item.chunk;
                 if (!chunk.metadata.filePath) {
-                    throw new Error(`Missing filePath in chunk metadata at index ${index}`);
+                    throw new Error(`Missing filePath in chunk metadata at index ${i}`);
                 }
 
                 const relativePath = path.relative(codebasePath, chunk.metadata.filePath);
                 const fileExtension = path.extname(chunk.metadata.filePath);
                 const { filePath, startLine, endLine, ...restMetadata } = chunk.metadata;
 
-                return {
+                const doc: VectorDocument = {
                     id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
                     content: chunk.content, // Full text content for BM25 and storage
-                    vector: embeddings[index].vector, // Dense vector
+                    vector: res.vector, // Dense vector (paired, not positional re-index)
                     relativePath,
                     startLine: chunk.metadata.startLine || 0,
                     endLine: chunk.metadata.endLine || 0,
@@ -1086,56 +1239,55 @@ export class Context {
                         ...restMetadata,
                         codebasePath,
                         language: chunk.metadata.language || 'unknown',
-                        chunkIndex: index
+                        chunkIndex: i
                     }
                 };
-            });
-
-            // Store to vector database (private collection)
-            await this.vectorDatabase.insertHybrid(this.getCollectionName(codebasePath), documents);
-
-            // Dual-write to shared collection if configured (same embeddings, no extra API cost)
-            const writableShared = this.getWritableSharedCollectionName();
-            if (writableShared && writableShared !== this.getCollectionName(codebasePath)) {
-                await this.vectorDatabase.insertHybrid(writableShared, documents);
-            }
-        } else {
-            // Create regular vector documents
-            const documents: VectorDocument[] = chunks.map((chunk, index) => {
-                if (!chunk.metadata.filePath) {
-                    throw new Error(`Missing filePath in chunk metadata at index ${index}`);
+                docs.push(doc);
+                docItems.push({ relativePath: item.relativePath });
+            } else {
+                const reason: EmbedReason = res && res.ok === false ? res.reason : 'worker-error';
+                if (REAL_REASONS.has(reason)) {
+                    realFailures++;
+                } else {
+                    waitFailures++;
                 }
-
-                const relativePath = path.relative(codebasePath, chunk.metadata.filePath);
-                const fileExtension = path.extname(chunk.metadata.filePath);
-                const { filePath, startLine, endLine, ...restMetadata } = chunk.metadata;
-
-                return {
-                    id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
-                    vector: embeddings[index].vector,
-                    content: chunk.content,
-                    relativePath,
-                    startLine: chunk.metadata.startLine || 0,
-                    endLine: chunk.metadata.endLine || 0,
-                    fileExtension,
-                    metadata: {
-                        ...restMetadata,
-                        codebasePath,
-                        language: chunk.metadata.language || 'unknown',
-                        chunkIndex: index
-                    }
-                };
-            });
-
-            // Store to vector database (private collection)
-            await this.vectorDatabase.insert(this.getCollectionName(codebasePath), documents);
-
-            // Dual-write to shared collection if configured (same embeddings, no extra API cost)
-            const writableShared = this.getWritableSharedCollectionName();
-            if (writableShared && writableShared !== this.getCollectionName(codebasePath)) {
-                await this.vectorDatabase.insert(writableShared, documents);
             }
         }
+
+        let successes = 0;
+
+        if (docs.length > 0) {
+            const collectionName = this.getCollectionName(codebasePath);
+            const writableShared = this.getWritableSharedCollectionName();
+            try {
+                // Commit 1 made insert/insertHybrid THROW on a non-Success
+                // Milvus result. A throw here means NONE of these docs landed,
+                // so the whole batch's docs count as REAL insert-error failures.
+                if (isHybrid === true) {
+                    await this.vectorDatabase.insertHybrid(collectionName, docs);
+                    if (writableShared && writableShared !== collectionName) {
+                        await this.vectorDatabase.insertHybrid(writableShared, docs);
+                    }
+                } else {
+                    await this.vectorDatabase.insert(collectionName, docs);
+                    if (writableShared && writableShared !== collectionName) {
+                        await this.vectorDatabase.insert(writableShared, docs);
+                    }
+                }
+                // Confirmed inserted — tally per file.
+                for (const di of docItems) {
+                    bump(di.relativePath, 'inserted');
+                    successes++;
+                }
+            } catch (insertError) {
+                // Classify the failed insert as REAL (insert-error) for every
+                // doc and return the outcome so the three-way counter decides.
+                console.error(`[Context] ❌ Insert failed for batch (${docs.length} docs), counting as REAL insert-error:`, insertError);
+                realFailures += docs.length;
+            }
+        }
+
+        return { perFile, realFailures, waitFailures, successes };
     }
 
     /**
