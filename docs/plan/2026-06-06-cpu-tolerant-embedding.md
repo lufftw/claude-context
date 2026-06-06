@@ -10,7 +10,7 @@
 
 **Design spec:** `docs/lufftw/design-2026-06-06-cpu-tolerant-embedding.md` (authoritative).
 
-**Plan revision:** rev1.1 (hardened by the ARB³ closed-loop review — full verdict + 44-item patch-list in `docs/plan/2026-06-06-arb3-review-rev1.1.md`).
+**Plan revision:** rev1.2 (ARB³ closed-loop review → `docs/plan/2026-06-06-arb3-review-rev1.1.md`; Round-4 execution-digital-twin → `docs/plan/2026-06-06-round4-digital-twin-rev1.2.md`).
 
 ---
 
@@ -33,10 +33,24 @@ A 13-agent, 3-round closed-loop review (domain → meta+simulation+adversarial �
 | P22 | split `test` / `test:int` so unit gate runs offline | Task 0 Step 2 |
 | P24 | RESTful `queryAll` documented as best-effort ≤16384 (gRPC is the active driver) | Hotfix Step 6 |
 
-### Tier-1 — the Round-4 trace target (PENDING; gates Phase 1/2 code)
-- **P30 (FATAL G1):** rewrite the resume read at `context.ts:903` to consult the ledger (`led.complete===true && led.fileHash===fileHash`), not chunk-metadata hash alone — else Phase 2 is a silent no-op. → Task 2.3.
-- **P31 (FATAL G2):** redefine the abort trigger from "did the batch throw" to "batch has ≥1 REAL-class failed slot"; `processChunkBatch` throws a tagged aggregate. → Task 1.6. Includes the rogue-worker regression test (a 1536-dim `success:true` reply MUST increment the counter).
-- **P33 (HIGH G4):** thread `relativePath` onto the chunk buffer (`context.ts:951`); per-file `{produced,inserted}` map; fire `onFileComplete` only after a file's last chunk flushes (incl. final-batch flush at 1012). → Task 2.3.
+### Round 4 (execution digital-twin) — verdict: NO-GO as scoped → GO against rev1.2
+Three twins + an adversary traced P30+P31+P33 against the **real code** + the live duplicate-PK finding. Result: **the trio does NOT compose correctly as three isolated patches** — it must become an **atomic 16-edit unit**. Full resolved design (5 layers, exact signatures, end-to-end data flow) in `docs/plan/2026-06-06-round4-digital-twin-rev1.2.md`. **Phase 1/2 code is unblocked against rev1.2** (build target = the artifact's patch-list); Round 5 would be a confirmation pass, not a re-derivation.
+
+**The blocking trace (hard data loss) — and its fix:** at the `CHUNK_LIMIT` break (`context.ts:984-988`) a file can flush some chunks with `produced===inserted` while later chunks are never produced → P33 mints a false `complete:true` → P30 skips the file *forever* → **chunks lost**, worse than today. **Fix (the headline rev1.2 correctness rule):** completeness gate is `complete = produced === inserted && produced === fileChunkTotals.get(relativePath)` (the splitter's per-file total), and the CHUNK_LIMIT break tags the in-flight file `incompleteByLimit` → `complete:false`.
+
+### Tier-1 atomic unit (rev1.2) — PENDING; gates Phase 1/2 code. NONE may ship without the others.
+- **P40 (promoted Tier-3→Tier-1):** dim+norm-band reject **before** `rabbitmq-embedding.ts:197 pending.resolve` (loop-sum norm, never `Math.hypot(...v)`); a 1536-dim `success:true` rogue becomes a REAL `bad-dimension` failure. **Without this, P31 has nothing to classify and the rogue-worker guard is defeated.**
+- **P31 (FATAL G2):** three-way abort counter reading a `BatchOutcome` partition (REAL→`++`; clean+productive→`=0`; pure-WAIT→**unchanged**). Cannot be a void+try/catch — `processChunkBatch`/`processChunkBuffer` must return `BatchOutcome{perFile, realFailures, waitFailures, successes}`. Same branch on the final-batch flush (`context.ts:1008-1020`). Rogue regression test routes through the **real** reply consumer.
+- **P33 (HIGH G4) + the Attack-1 fix:** thread `relativePath` onto the buffer (`context.ts:951`); record `fileChunkTotals` after `split` (~935); `complete` gated on `=== chunks.length` (above).
+- **P30 (FATAL G1) + absent-vs-false:** ledger-gated skip at `context.ts:903`; **absent** ledger entry (snapshot race) ⇒ verify/idempotent re-embed **without** destructive pre-delete; explicit `complete:false` ⇒ delete+re-embed.
+- **P7+P34+P6 (promoted to Tier-1):** `files?` on `CodebaseInfoIndexing` (`config.ts:49-52`); `setCodebaseIndexing` carries `files` forward (else the 2s tick clobbers it — killed run leaves no readable ledger → resume degrades to full re-index); field-merge `files` in `mergeAndWriteSnapshot`; retain on interrupted `indexing` reload.
+- **P32:** result-check the Milvus `insert` (`milvus-vectordb.ts:365-368` discards `MutationResult`) — non-`Success`/`insert_cnt!==len` ⇒ REAL `insert-error`; never seal `complete` on a partial insert.
+- **P5:** cross-layer `onFileComplete` callback (core→handlers→`setFileComplete`); core never imports mcp.
+
+### Phase 3 — duplicate-PK call (definite, from Round 4)
+- **Upsert is sufficient for new writes** (deterministic PK collapses to 1 row) — stops manufacturing dups.
+- **Retain a per-file `deleteByFilter(relativePath)` sweep even with upsert** — `generateId` is boundary-keyed, so edits that shift chunk lines orphan old PKs (upsert only touches PKs in the write set). Correctness, not hygiene.
+- **A one-time per-collection dedup is REQUIRED before the ledger read is trustworthy on existing collections:** duplicate PKs with divergent `fileHash` make `loadExistingFileHashes`'s relativePath-dedup pick a non-deterministic winner → mis-skip/needless-re-embed. This is a **destructive migration on shared collections → owner approval required** (see [[feedback_never_purge_shared_queue]] ethos). Recurring Milvus segment compaction is hygiene only (auto).
 
 ### Tier-2/3/4 — PENDING, applied as each phase is reached
 Full list (P5–P52) in the review artifact. Headlines: **P5/F4** cross-layer `onFileComplete` callback (core cannot call mcp `SnapshotManager` — wire in `handlers.ts`); **P6/F5** field-level `files` deep-merge in `mergeAndWriteSnapshot`; **P7/F6** `files?` on `CodebaseInfoIndexing` + carry on progress ticks; **P14** `processChunkBuffer`/`processChunkBatch` return `{failedIndices,insertedIds,perFile}`; **P32/G3** result-check the Milvus `insert` (currently discarded); **P8/P38** tagged `resetState(reason, embedClass)`; **P36** clamp indexing priority ≤7; **P43/P20** reconcile `timeoutMs × (maxRetries+1) < 7_200_000` as a tested invariant (provisional `timeoutMs=1_800_000`, `maxRetries=3`).
