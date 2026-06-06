@@ -1191,9 +1191,23 @@ export class Context {
         let realFailures = 0;
         let waitFailures = 0;
 
-        const results: EmbedItemResult[] = await this.embedding.embedBatchPartial(
-            items.map(it => it.chunk.content),
-        );
+        // Base providers (OpenAI/Voyage/Gemini/Ollama) use the default embedBatchPartial,
+        // which wraps an all-or-nothing embedBatch — a whole-batch embed failure throws here.
+        // Catch it and convert to a REAL batch failure (symmetric with the insert-throw path
+        // below) so (a) the three-way abort counter still advances for non-RabbitMQ providers
+        // — otherwise a melting-down provider would be swallowed file-by-file forever, the exact
+        // zombie-indexer failure mode the MAX-consecutive guard exists to prevent — and (b) the
+        // caller's unconditional `chunkBuffer = []` reset always runs (processChunkBatch returns
+        // instead of throwing).
+        let results: EmbedItemResult[];
+        try {
+            results = await this.embedding.embedBatchPartial(items.map(it => it.chunk.content));
+        } catch (embedErr) {
+            console.error(
+                `[Context] ❌ Whole-batch embed failed (REAL): ${embedErr instanceof Error ? embedErr.message : String(embedErr)}`,
+            );
+            return { perFile, realFailures: items.length, waitFailures: 0, successes: 0 };
+        }
 
         // Partition into succeeded slots (paired with their source item) and
         // classify failed slots. Build docs ONLY from succeeded slots using
@@ -1263,6 +1277,13 @@ export class Context {
                 // Commit 1 made insert/insertHybrid THROW on a non-Success
                 // Milvus result. A throw here means NONE of these docs landed,
                 // so the whole batch's docs count as REAL insert-error failures.
+                // NOTE (dual-write asymmetry): if the private insert succeeds but
+                // the shared dual-write throws, the whole batch counts REAL and
+                // `inserted` stays 0 for those chunks even though the private
+                // collection has them. This is intentionally pessimistic — the
+                // state is still safe (deterministic generateId PKs make a re-run
+                // idempotent), the ledger just under-counts. Dual-write is enabled
+                // only on a few maintainer projects, so blast radius is small.
                 if (isHybrid === true) {
                     await this.vectorDatabase.insertHybrid(collectionName, docs);
                     if (writableShared && writableShared !== collectionName) {

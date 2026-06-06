@@ -134,6 +134,31 @@ describe('processChunkBatch — partial insert (paired indices)', () => {
     });
 });
 
+// ── 1b. Whole-batch embed throw counts as REAL (base-provider path) ───────
+
+describe('processChunkBatch — whole-batch embed throw counts as REAL', () => {
+    it('returns realFailures=items.length (does not throw) so the counter advances + buffer resets', async () => {
+        const ctx = makeContext({
+            // Base providers' default embedBatchPartial wraps all-or-nothing embedBatch;
+            // a provider 500 throws the whole batch.
+            embedBatchPartial: async (_texts) => { throw new Error('OpenAI 500: upstream error'); },
+            hybrid: false,
+        });
+        const items = [
+            { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
+            { chunk: makeChunk('/repo/a.ts', 3, 'BBB'), codebasePath: '/repo', relativePath: 'a.ts' },
+        ];
+
+        // Must NOT throw — must return a REAL outcome so the three-way counter sees it.
+        const outcome = await (ctx as any).processChunkBatch(items);
+
+        expect(outcome.realFailures).toBe(2);
+        expect(outcome.successes).toBe(0);
+        expect(outcome.waitFailures).toBe(0);
+        expect(outcome.perFile.get('a.ts')).toEqual({ produced: 2, inserted: 0 });
+    });
+});
+
 // ── 2. Three-way abort counter (via processFileList) ──────────────────────
 
 describe('processFileList — three-way abort counter', () => {
