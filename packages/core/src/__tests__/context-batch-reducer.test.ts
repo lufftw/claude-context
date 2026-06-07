@@ -55,15 +55,24 @@ function makeContext(opts: {
     embedBatchPartial: (texts: string[]) => Promise<EmbedItemResult[]>;
     insert?: (collection: string, docs: any[]) => Promise<void>;
     insertHybrid?: (collection: string, docs: any[]) => Promise<void>;
+    upsert?: (collection: string, docs: any[]) => Promise<void>;
+    upsertHybrid?: (collection: string, docs: any[]) => Promise<void>;
     dimension?: number;
     hybrid?: boolean;
 }): Context {
+    // Phase 3: processChunkBatch now writes via upsert/upsertHybrid. For backward
+    // compatibility with the existing `insert`/`insertHybrid` test handlers, map
+    // upsert→insert and upsertHybrid→insertHybrid unless an explicit upsert handler
+    // is provided. insert/insertHybrid remain on the stub so a regression to the
+    // old insert path would be observable (those handlers would fire instead).
     const stubDb: any = {
         hasCollection: async () => false,
         query: async () => [],
         queryAll: async () => [],
         insert: opts.insert || (async () => { }),
         insertHybrid: opts.insertHybrid || (async () => { }),
+        upsert: opts.upsert || opts.insert || (async () => { }),
+        upsertHybrid: opts.upsertHybrid || opts.insertHybrid || (async () => { }),
         deleteByFilter: async () => { },
         createCollection: async () => { },
         createHybridCollection: async () => { },
@@ -336,6 +345,84 @@ describe('processChunkBatch — insert throw counts as REAL (insert-error)', () 
         expect(outcome.realFailures).toBe(2);
         expect(outcome.successes).toBe(0);
         expect(outcome.perFile.get('a.ts')).toEqual({ produced: 2, inserted: 0 });
+    });
+});
+
+// ── 4b. Phase 3: processChunkBatch writes via upsert (NOT insert) ──────────
+
+describe('processChunkBatch — Phase 3 uses upsert/upsertHybrid (not insert/insertHybrid)', () => {
+    it('non-hybrid: calls vectorDatabase.upsert and never insert', async () => {
+        const upsertCalls: any[][] = [];
+        let insertCalled = false;
+        const ctx = makeContext({
+            embedBatchPartial: async (_texts) => [ok(0), ok(1)],
+            insert: async () => { insertCalled = true; },     // must NOT fire
+            upsert: async (_c, docs) => { upsertCalls.push(docs); },
+            dimension: DIM,
+            hybrid: false,
+        });
+        const items = [
+            { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
+            { chunk: makeChunk('/repo/a.ts', 3, 'BBB'), codebasePath: '/repo', relativePath: 'a.ts' },
+        ];
+        const outcome = await (ctx as any).processChunkBatch(items);
+        expect(insertCalled).toBe(false);
+        expect(upsertCalls.length).toBe(1);
+        expect(upsertCalls[0].length).toBe(2);
+        expect(outcome.successes).toBe(2);
+        expect(outcome.perFile.get('a.ts')).toEqual({ produced: 2, inserted: 2 });
+    });
+
+    it('hybrid: calls vectorDatabase.upsertHybrid and never insertHybrid', async () => {
+        const upsertHybridCalls: any[][] = [];
+        let insertHybridCalled = false;
+        const ctx = makeContext({
+            embedBatchPartial: async (_texts) => [ok(0)],
+            insertHybrid: async () => { insertHybridCalled = true; }, // must NOT fire
+            upsertHybrid: async (_c, docs) => { upsertHybridCalls.push(docs); },
+            dimension: DIM,
+            hybrid: true,
+        });
+        const items = [
+            { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
+        ];
+        const outcome = await (ctx as any).processChunkBatch(items);
+        expect(insertHybridCalled).toBe(false);
+        expect(upsertHybridCalls.length).toBe(1);
+        expect(upsertHybridCalls[0].length).toBe(1);
+        expect(outcome.successes).toBe(1);
+    });
+
+    it('a thrown upsert still classifies as REAL insert-error (counter advances)', async () => {
+        const ctx = makeContext({
+            embedBatchPartial: async (_texts) => [ok(0), ok(1)],
+            upsert: async () => { throw new Error("upsert failed for 'c1': CollectionNotExists"); },
+            dimension: DIM,
+            hybrid: false,
+        });
+        const items = [
+            { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
+            { chunk: makeChunk('/repo/a.ts', 3, 'BBB'), codebasePath: '/repo', relativePath: 'a.ts' },
+        ];
+        const outcome = await (ctx as any).processChunkBatch(items);
+        expect(outcome.realFailures).toBe(2);
+        expect(outcome.successes).toBe(0);
+        expect(outcome.perFile.get('a.ts')).toEqual({ produced: 2, inserted: 0 });
+    });
+
+    it('a thrown upsertHybrid (hybrid path) also classifies as REAL insert-error', async () => {
+        const ctx = makeContext({
+            embedBatchPartial: async (_texts) => [ok(0)],
+            upsertHybrid: async () => { throw new Error("upsert failed for 'c1': OutOfMemory"); },
+            dimension: DIM,
+            hybrid: true,
+        });
+        const items = [
+            { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
+        ];
+        const outcome = await (ctx as any).processChunkBatch(items);
+        expect(outcome.realFailures).toBe(1);
+        expect(outcome.successes).toBe(0);
     });
 });
 

@@ -55,12 +55,16 @@ function makeContext(opts: {
     dimension?: number;
     hybrid?: boolean;
 }): Context {
+    // Phase 3: processChunkBatch writes via upsert/upsertHybrid. Map both to the
+    // same opts.insert handler so the completeness ledger sees the writes land.
     const stubDb: any = {
         hasCollection: async () => false,
         query: async () => [],
         queryAll: async () => [],
         insert: opts.insert || (async () => { }),
         insertHybrid: opts.insert || (async () => { }),
+        upsert: opts.insert || (async () => { }),
+        upsertHybrid: opts.insert || (async () => { }),
         deleteByFilter: async () => { },
         createCollection: async () => { },
         createHybridCollection: async () => { },

@@ -1005,14 +1005,14 @@ export class Context {
                     continue;
                 }
 
-                // Not verified-complete → (re)embed. Delete old chunks first whenever ANY
-                // exist. Add-2: pre-Phase-3 the insert is NOT idempotent, so an
-                // absent/incomplete ledger WITH a matching Milvus hash must STILL
-                // delete-before-reembed — a plain re-insert would manufacture duplicate
-                // deterministic-PK rows (the live-discovered dup-PK class). `existingHash`
-                // truthy covers both "changed" (hash differs) and "matching hash but not
-                // verified-complete".
-                if (existingHash) {
+                // Not verified-complete → (re)embed.
+                // Phase 3: with idempotent upsert, only a CHANGED file (different hash → every
+                // chunk's deterministic PK changes → old rows orphaned) needs a delete-by-path
+                // orphan sweep. A same-hash-but-incomplete / absent-ledger file is re-embedded
+                // via upsert, which overwrites the present chunks and inserts the missing ones
+                // with no kill-window and no duplicate PKs — so NO pre-delete for that case.
+                // This removes Add-2's delete-then-insert kill-window for the partial-resume case.
+                if (existingHash && existingHash !== fileHash) {
                     changedFiles++;
                     try {
                         const escapedPath = relativePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -1364,10 +1364,11 @@ export class Context {
             const collectionName = this.getCollectionName(codebasePath);
             const writableShared = this.getWritableSharedCollectionName();
             try {
-                // Commit 1 made insert/insertHybrid THROW on a non-Success
-                // Milvus result. A throw here means NONE of these docs landed,
-                // so the whole batch's docs count as REAL insert-error failures.
-                // NOTE (dual-write asymmetry): if the private insert succeeds but
+                // Phase 3: idempotent native upsert (insert-or-overwrite by deterministic PK).
+                // Commit 1's result-check is preserved on the upsert path — upsert/upsertHybrid
+                // THROW on a non-Success Milvus result. A throw here means NONE of these docs
+                // landed, so the whole batch's docs count as REAL upsert-error failures.
+                // NOTE (dual-write asymmetry): if the private upsert succeeds but
                 // the shared dual-write throws, the whole batch counts REAL and
                 // `inserted` stays 0 for those chunks even though the private
                 // collection has them. This is intentionally pessimistic — the
@@ -1375,25 +1376,25 @@ export class Context {
                 // idempotent), the ledger just under-counts. Dual-write is enabled
                 // only on a few maintainer projects, so blast radius is small.
                 if (isHybrid === true) {
-                    await this.vectorDatabase.insertHybrid(collectionName, docs);
+                    await this.vectorDatabase.upsertHybrid(collectionName, docs);
                     if (writableShared && writableShared !== collectionName) {
-                        await this.vectorDatabase.insertHybrid(writableShared, docs);
+                        await this.vectorDatabase.upsertHybrid(writableShared, docs);
                     }
                 } else {
-                    await this.vectorDatabase.insert(collectionName, docs);
+                    await this.vectorDatabase.upsert(collectionName, docs);
                     if (writableShared && writableShared !== collectionName) {
-                        await this.vectorDatabase.insert(writableShared, docs);
+                        await this.vectorDatabase.upsert(writableShared, docs);
                     }
                 }
-                // Confirmed inserted — tally per file.
+                // Confirmed upserted — tally per file.
                 for (const di of docItems) {
                     bump(di.relativePath, 'inserted');
                     successes++;
                 }
             } catch (insertError) {
-                // Classify the failed insert as REAL (insert-error) for every
+                // Classify the failed upsert as REAL (insert-error) for every
                 // doc and return the outcome so the three-way counter decides.
-                console.error(`[Context] ❌ Insert failed for batch (${docs.length} docs), counting as REAL insert-error:`, insertError);
+                console.error(`[Context] ❌ Upsert failed for batch (${docs.length} docs), counting as REAL insert-error:`, insertError);
                 realFailures += docs.length;
             }
         }

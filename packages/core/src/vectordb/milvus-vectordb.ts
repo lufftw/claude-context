@@ -374,6 +374,38 @@ export class MilvusVectorDatabase implements VectorDatabase {
         }
     }
 
+    async upsert(collectionName: string, documents: VectorDocument[]): Promise<void> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        if (!this.client) {
+            throw new Error('MilvusClient is not initialized after ensureInitialized().');
+        }
+
+        console.log('Upserting documents into collection:', collectionName);
+        const data = documents.map(doc => ({
+            id: doc.id,
+            vector: doc.vector,
+            content: doc.content,
+            relativePath: doc.relativePath,
+            startLine: doc.startLine,
+            endLine: doc.endLine,
+            fileExtension: doc.fileExtension,
+            metadata: JSON.stringify(doc.metadata),
+        }));
+
+        const res: any = await this.client.upsert({
+            collection_name: collectionName,
+            data: data,
+        });
+        // error_code may be the string 'Success' or numeric (0 / absent = success). The
+        // `&& ... !== 'Success'` shape treats numeric 0 (and undefined) as success too;
+        // do not regress to a bare truthiness check on the numeric path.
+        if (res?.status?.error_code && res.status.error_code !== 'Success') {
+            throw new Error(`[MilvusDB] upsert failed for '${collectionName}': ${res.status.reason || res.status.error_code}`);
+        }
+    }
+
     async search(collectionName: string, queryVector: number[], options?: SearchOptions): Promise<VectorSearchResult[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);
@@ -669,6 +701,39 @@ export class MilvusVectorDatabase implements VectorDatabase {
         // do not regress to a bare truthiness check on the numeric path.
         if (res?.status?.error_code && res.status.error_code !== 'Success') {
             throw new Error(`[MilvusDB] insert failed for '${collectionName}': ${res.status.reason || res.status.error_code}`);
+        }
+    }
+
+    async upsertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        if (!this.client) {
+            throw new Error('MilvusClient is not initialized after ensureInitialized().');
+        }
+
+        const data = documents.map(doc => ({
+            id: doc.id,
+            content: doc.content,
+            vector: doc.vector,
+            relativePath: doc.relativePath,
+            startLine: doc.startLine,
+            endLine: doc.endLine,
+            fileExtension: doc.fileExtension,
+            metadata: JSON.stringify(doc.metadata),
+        }));
+
+        // Probe-verified (Phase 3): native upsert on a BM25 sparse_vector function-field
+        // hybrid collection collapses same-PK rows (no dup) and regenerates sparse_vector.
+        const res: any = await this.client.upsert({
+            collection_name: collectionName,
+            data: data,
+        });
+        // error_code may be the string 'Success' or numeric (0 / absent = success). The
+        // `&& ... !== 'Success'` shape treats numeric 0 (and undefined) as success too;
+        // do not regress to a bare truthiness check on the numeric path.
+        if (res?.status?.error_code && res.status.error_code !== 'Success') {
+            throw new Error(`[MilvusDB] upsert failed for '${collectionName}': ${res.status.reason || res.status.error_code}`);
         }
     }
 

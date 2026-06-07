@@ -94,6 +94,11 @@ export interface VectorDatabase {
      */
     insertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void>;
 
+    /** Upsert vector documents (insert or overwrite by primary key). Idempotent on deterministic PKs. */
+    upsert(collectionName: string, documents: VectorDocument[]): Promise<void>;
+    /** Upsert hybrid vector documents (insert or overwrite by primary key; BM25 sparse_vector regenerates). */
+    upsertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void>;
+
     /**
      * Search similar vectors
      * @param collectionName Collection name

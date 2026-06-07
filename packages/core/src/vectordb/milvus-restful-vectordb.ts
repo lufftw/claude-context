@@ -391,6 +391,42 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
         }
     }
 
+    async upsert(collectionName: string, documents: VectorDocument[]): Promise<void> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        try {
+            const restfulConfig = this.config as MilvusRestfulConfig;
+            // Transform VectorDocument array to Milvus entity format
+            const data = documents.map(doc => ({
+                id: doc.id,
+                vector: doc.vector,
+                content: doc.content,
+                relativePath: doc.relativePath,
+                startLine: doc.startLine,
+                endLine: doc.endLine,
+                fileExtension: doc.fileExtension,
+                metadata: JSON.stringify(doc.metadata) // Convert metadata object to JSON string
+            }));
+
+            const upsertRequest = {
+                collectionName,
+                data,
+                dbName: restfulConfig.database
+            };
+
+            const response = await this.makeRequest('/entities/upsert', 'POST', upsertRequest);
+
+            if (response.code !== 0) {
+                throw new Error(`Upsert failed: ${response.message || 'Unknown error'}`);
+            }
+
+        } catch (error) {
+            console.error(`[MilvusRestfulDB] ❌ Failed to upsert documents into collection '${collectionName}':`, error);
+            throw error;
+        }
+    }
+
     async search(collectionName: string, queryVector: number[], options?: SearchOptions): Promise<VectorSearchResult[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);
@@ -738,6 +774,44 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
 
         } catch (error) {
             console.error(`[MilvusRestfulDB] ❌ Failed to insert hybrid documents to collection '${collectionName}':`, error);
+            throw error;
+        }
+    }
+
+    async upsertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        try {
+            const restfulConfig = this.config as MilvusRestfulConfig;
+
+            const data = documents.map(doc => ({
+                id: doc.id,
+                content: doc.content,
+                vector: doc.vector,
+                relativePath: doc.relativePath,
+                startLine: doc.startLine,
+                endLine: doc.endLine,
+                fileExtension: doc.fileExtension,
+                metadata: JSON.stringify(doc.metadata),
+            }));
+
+            const upsertRequest = {
+                collectionName,
+                dbName: restfulConfig.database,
+                data: data
+            };
+
+            // Native upsert; on a BM25 sparse_vector function-field hybrid collection the
+            // server regenerates sparse_vector and collapses same-PK rows (probe-verified, Phase 3).
+            const response = await this.makeRequest('/entities/upsert', 'POST', upsertRequest);
+
+            if (response.code !== 0) {
+                throw new Error(`Upsert failed: ${response.message || 'Unknown error'}`);
+            }
+
+        } catch (error) {
+            console.error(`[MilvusRestfulDB] ❌ Failed to upsert hybrid documents to collection '${collectionName}':`, error);
             throw error;
         }
     }

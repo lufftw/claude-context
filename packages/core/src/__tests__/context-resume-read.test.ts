@@ -7,17 +7,22 @@
 //                  AND the ledger says it fully completed at the SAME hash
 //                  (led.complete === true && led.fileHash === fileHash).
 //
-//   Otherwise (re)embed, and delete-before-reembed whenever ANY chunks already
-//   exist for the path (existingHash truthy) — this covers:
-//     - changed hash (the classic incremental path),
-//     - matching hash but ledger says complete:false (partial resume), and
-//     - matching hash but ledger ABSENT (Add-2 dup-PK prevention: a plain
-//       re-insert would manufacture duplicate deterministic-PK rows).
+//   Otherwise (re)embed. Phase 3 NARROWS the pre-delete: with idempotent native
+//   upsert as the write path, delete-before-reembed is needed ONLY for a CHANGED
+//   file (existingHash !== fileHash) — content changed → every chunk's
+//   deterministic PK changes → old rows orphaned → MUST sweep by path. The
+//   other re-embed cases write via upsert with NO pre-delete:
+//     - changed hash (different hash)                         → delete + upsert,
+//     - matching hash but ledger complete:false (partial resume) → NO delete, upsert
+//       (upsert overwrites the present chunks, inserts the missing ones — this is
+//        the Phase-3 kill-window removal), and
+//     - matching hash but ledger ABSENT                       → NO delete, upsert
+//       (same content → same PKs → upsert is idempotent, no dup rows).
 //
 // We follow the makeContext/runFileList pattern from context-completeness.test.ts
 // but additionally (a) seed loadExistingFileHashes, (b) pass a priorLedger, and
-// (c) spy on deleteByFilter and on embedBatchPartial so we can assert exactly
-// which files were re-embedded vs. skipped.
+// (c) spy on deleteByFilter, upsert, and embedBatchPartial so we can assert
+// exactly which files were re-embedded vs. skipped, and whether a pre-delete fired.
 
 import { Context } from '../context';
 import { CodeChunk } from '../splitter';
@@ -57,6 +62,7 @@ interface RunHandles {
     completeCalls: Array<[string, { complete: boolean; fileHash: string; chunkCount: number }]>;
     embeddedTexts: string[];          // every text passed to embedBatchPartial
     deleteFilters: string[];          // every filter passed to deleteByFilter
+    upsertedContents: string[];       // every doc.content passed to upsert (Phase 3 write path)
     run: () => Promise<any>;
 }
 
@@ -78,13 +84,19 @@ function runFileList(opts: {
     const completeCalls: Array<[string, { complete: boolean; fileHash: string; chunkCount: number }]> = [];
     const embeddedTexts: string[] = [];
     const deleteFilters: string[] = [];
+    const upsertedContents: string[] = [];
 
+    // Phase 3: the write path is upsert/upsertHybrid. insert/insertHybrid remain on
+    // the stub but should never fire (a regression to the old insert path would be
+    // caught by the upsertedContents-based assertions plus the batch-reducer suite).
     const stubDb: any = {
         hasCollection: async () => false,
         query: async () => [],
         queryAll: async () => [],
         insert: async () => { },
         insertHybrid: async () => { },
+        upsert: async (_collection: string, docs: any[]) => { for (const d of docs) upsertedContents.push(d.content); },
+        upsertHybrid: async (_collection: string, docs: any[]) => { for (const d of docs) upsertedContents.push(d.content); },
         deleteByFilter: async (_collection: string, filter: string) => { deleteFilters.push(filter); },
         createCollection: async () => { },
         createHybridCollection: async () => { },
@@ -152,11 +164,15 @@ function runFileList(opts: {
         }
     };
 
-    return { ctx, completeCalls, embeddedTexts, deleteFilters, run };
+    return { ctx, completeCalls, embeddedTexts, deleteFilters, upsertedContents, run };
 }
 
 function embeddedAnyFor(embeddedTexts: string[], base: string): boolean {
     return embeddedTexts.some(t => t.startsWith(`${base}-chunk-`));
+}
+
+function upsertedAnyFor(upsertedContents: string[], base: string): boolean {
+    return upsertedContents.some(c => c.startsWith(`${base}-chunk-`));
 }
 
 describe('processFileList — ledger-gated resume skip (Commit 4/4)', () => {
@@ -183,9 +199,9 @@ describe('processFileList — ledger-gated resume skip (Commit 4/4)', () => {
         expect(aCalls[0][1]).toEqual({ complete: true, fileHash: h, chunkCount: 2 });
     });
 
-    it('2. matching hash but ledger complete:false → RE-EMBED + deleteByFilter (partial-resume bug)', async () => {
+    it('2. (Phase 3) matching hash but ledger complete:false → RE-EMBED + UPSERT, NO deleteByFilter (kill-window removed)', async () => {
         const h = expectedHashFor('b.ts');
-        const { embeddedTexts, deleteFilters, run } = runFileList({
+        const { embeddedTexts, deleteFilters, upsertedContents, run } = runFileList({
             files: ['/repo/b.ts'],
             chunksPerFile: { 'b.ts': 2 },
             existingHashes: { 'b.ts': h },
@@ -196,13 +212,16 @@ describe('processFileList — ledger-gated resume skip (Commit 4/4)', () => {
 
         // Re-embedded despite matching hash, because the ledger says incomplete.
         expect(embeddedAnyFor(embeddedTexts, 'b.ts')).toBe(true);
-        // Delete-before-reembed fired for the path.
-        expect(deleteFilters.some(f => f.includes('b.ts'))).toBe(true);
+        // Phase 3: same content → same PKs → upsert overwrites present chunks and
+        // inserts the missing ones idempotently. NO pre-delete (no kill-window).
+        expect(upsertedAnyFor(upsertedContents, 'b.ts')).toBe(true);
+        expect(deleteFilters.some(f => f.includes('b.ts'))).toBe(false);
+        expect(deleteFilters.length).toBe(0);
     });
 
-    it('3. matching hash but ledger ABSENT → RE-EMBED + deleteByFilter (Add-2 dup-PK prevention)', async () => {
+    it('3. (Phase 3) matching hash but ledger ABSENT → RE-EMBED + UPSERT, NO deleteByFilter (idempotent, no dup PKs)', async () => {
         const h = expectedHashFor('c.ts');
-        const { embeddedTexts, deleteFilters, run } = runFileList({
+        const { embeddedTexts, deleteFilters, upsertedContents, run } = runFileList({
             files: ['/repo/c.ts'],
             chunksPerFile: { 'c.ts': 2 },
             existingHashes: { 'c.ts': h },
@@ -211,17 +230,20 @@ describe('processFileList — ledger-gated resume skip (Commit 4/4)', () => {
         });
         await run();
 
-        // Even with a matching Milvus hash, an absent ledger entry must NOT skip:
-        // a plain re-insert would create duplicate deterministic-PK rows. So we
-        // re-embed, AND we delete-before-reembed (not a plain re-insert).
+        // An absent ledger entry with a matching Milvus hash must NOT skip (the file
+        // may be incomplete). It re-embeds, but since content is unchanged the PKs are
+        // identical — upsert is idempotent (collapses same-PK rows, no dup). So Phase 3
+        // issues NO pre-delete here (Add-2's delete is no longer needed for this case).
         expect(embeddedAnyFor(embeddedTexts, 'c.ts')).toBe(true);
-        expect(deleteFilters.some(f => f.includes('c.ts'))).toBe(true);
+        expect(upsertedAnyFor(upsertedContents, 'c.ts')).toBe(true);
+        expect(deleteFilters.some(f => f.includes('c.ts'))).toBe(false);
+        expect(deleteFilters.length).toBe(0);
     });
 
-    it('4. changed hash → RE-EMBED + deleteByFilter (existing incremental behavior preserved)', async () => {
+    it('4. changed hash → RE-EMBED + deleteByFilter THEN upsert (orphan-on-shrink sweep preserved)', async () => {
         const oldHash = 'deadbeef-stale-hash';
         const newHash = expectedHashFor('d.ts');
-        const { embeddedTexts, deleteFilters, run } = runFileList({
+        const { embeddedTexts, deleteFilters, upsertedContents, run } = runFileList({
             files: ['/repo/d.ts'],
             chunksPerFile: { 'd.ts': 2 },
             existingHashes: { 'd.ts': oldHash }, // stale hash differs from current
@@ -234,11 +256,14 @@ describe('processFileList — ledger-gated resume skip (Commit 4/4)', () => {
 
         expect(newHash).not.toBe(oldHash);
         expect(embeddedAnyFor(embeddedTexts, 'd.ts')).toBe(true);
+        // CHANGED file: content changed → every chunk's PK changes → old rows
+        // orphaned → MUST delete-by-path before upserting the new chunks.
         expect(deleteFilters.some(f => f.includes('d.ts'))).toBe(true);
+        expect(upsertedAnyFor(upsertedContents, 'd.ts')).toBe(true);
     });
 
-    it('5. new file (no existingHash, no ledger) → embed, NO deleteByFilter', async () => {
-        const { embeddedTexts, deleteFilters, run } = runFileList({
+    it('5. new file (no existingHash, no ledger) → embed + upsert, NO deleteByFilter', async () => {
+        const { embeddedTexts, deleteFilters, upsertedContents, run } = runFileList({
             files: ['/repo/e.ts'],
             chunksPerFile: { 'e.ts': 2 },
             existingHashes: {},          // nothing in Milvus
@@ -248,6 +273,7 @@ describe('processFileList — ledger-gated resume skip (Commit 4/4)', () => {
         await run();
 
         expect(embeddedAnyFor(embeddedTexts, 'e.ts')).toBe(true);
+        expect(upsertedAnyFor(upsertedContents, 'e.ts')).toBe(true);
         // No prior chunks → nothing to delete.
         expect(deleteFilters.length).toBe(0);
     });
@@ -258,7 +284,7 @@ describe('processFileList — ledger-gated resume skip (Commit 4/4)', () => {
         // `existingHash === fileHash` arm is false → we re-embed. No prior chunks
         // exist for this path, so no delete is issued.
         const h = expectedHashFor('f.ts');
-        const { embeddedTexts, deleteFilters, run } = runFileList({
+        const { embeddedTexts, deleteFilters, upsertedContents, run } = runFileList({
             files: ['/repo/f.ts'],
             chunksPerFile: { 'f.ts': 2 },
             existingHashes: {}, // Milvus has nothing
@@ -268,17 +294,20 @@ describe('processFileList — ledger-gated resume skip (Commit 4/4)', () => {
         await run();
 
         expect(embeddedAnyFor(embeddedTexts, 'f.ts')).toBe(true);
+        expect(upsertedAnyFor(upsertedContents, 'f.ts')).toBe(true);
         expect(deleteFilters.length).toBe(0);
     });
 
-    it('7. SIGKILL-resume: a partial prior run resumes — complete files skipped, the incomplete one re-embedded, new file embedded', async () => {
+    it('7. (Phase 3) SIGKILL-resume: complete files skipped, the incomplete one re-embedded via UPSERT with NO delete, new file embedded', async () => {
         // Faithful seeded-state resume (T3). A prior run was killed mid-flight:
-        //   done.ts     — fully indexed last run (complete:true, hash matches)   → SKIP
-        //   partial.ts  — was mid-insert when killed (complete:false, hash matches) → RE-EMBED + delete
-        //   fresh.ts    — never seen before (no Milvus hash, no ledger)          → embed, no delete
+        //   done.ts     — fully indexed last run (complete:true, hash matches)      → SKIP
+        //   partial.ts  — was mid-insert when killed (complete:false, hash matches) → RE-EMBED + UPSERT, NO delete
+        //                 (same content → same PKs → upsert overwrites present chunks
+        //                  and inserts the missing ones; the Phase-3 kill-window removal)
+        //   fresh.ts    — never seen before (no Milvus hash, no ledger)             → embed + upsert, no delete
         const hDone = expectedHashFor('done.ts');
         const hPartial = expectedHashFor('partial.ts');
-        const { completeCalls, embeddedTexts, deleteFilters, run } = runFileList({
+        const { completeCalls, embeddedTexts, deleteFilters, upsertedContents, run } = runFileList({
             files: ['/repo/done.ts', '/repo/partial.ts', '/repo/fresh.ts'],
             chunksPerFile: { 'done.ts': 2, 'partial.ts': 3, 'fresh.ts': 1 },
             existingHashes: { 'done.ts': hDone, 'partial.ts': hPartial }, // both present in Milvus
@@ -297,15 +326,18 @@ describe('processFileList — ledger-gated resume skip (Commit 4/4)', () => {
         expect(doneCalls.length).toBe(1);
         expect(doneCalls[0][1]).toEqual({ complete: true, fileHash: hDone, chunkCount: 2 });
 
-        // partial.ts: re-embedded + delete-before-reembed.
+        // partial.ts: re-embedded + UPSERT, but NO delete (same hash → idempotent upsert).
         expect(embeddedAnyFor(embeddedTexts, 'partial.ts')).toBe(true);
-        expect(deleteFilters.some(f => f.includes('partial.ts'))).toBe(true);
+        expect(upsertedAnyFor(upsertedContents, 'partial.ts')).toBe(true);
+        expect(deleteFilters.some(f => f.includes('partial.ts'))).toBe(false);
 
-        // fresh.ts: embedded, no delete.
+        // fresh.ts: embedded + upsert, no delete.
         expect(embeddedAnyFor(embeddedTexts, 'fresh.ts')).toBe(true);
+        expect(upsertedAnyFor(upsertedContents, 'fresh.ts')).toBe(true);
         expect(deleteFilters.some(f => f.includes('fresh.ts'))).toBe(false);
 
-        // The only delete issued was for partial.ts (done skipped, fresh new).
-        expect(deleteFilters.length).toBe(1);
+        // Phase 3: NO delete issued at all — done skipped, partial same-hash (upsert),
+        // fresh new. The kill-window for the partial-resume case is gone.
+        expect(deleteFilters.length).toBe(0);
     });
 });
