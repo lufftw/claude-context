@@ -194,6 +194,28 @@ describe('processFileList — onFileComplete completeness ledger', () => {
         });
     });
 
+    it('1b. a 0-chunk file (empty/comment-only) fires complete:true with chunkCount 0', async () => {
+        const { calls, run } = runFileList({
+            files: ['/repo/empty.ts', '/repo/a.ts'],
+            chunksPerFile: { 'empty.ts': 0, 'a.ts': 1 },
+            batchSize: 100,
+        });
+        const r = await run();
+        expect(r.status).toBe('completed');
+
+        // The 0-chunk file never enters a batch (no chunks), so the incremental
+        // fireCompleted never sees it; the end-of-run sweep over fileChunkTotals
+        // must still give it a complete:true entry (0 === 0 === 0) — otherwise a
+        // resume would re-process it forever.
+        const emptyCalls = calls.filter(([rp]) => rp === 'empty.ts');
+        expect(emptyCalls.length).toBe(1);
+        expect(emptyCalls[0][1]).toEqual({
+            complete: true,
+            fileHash: expectedHashFor('empty.ts'),
+            chunkCount: 0,
+        });
+    });
+
     it('2. a file with 1 of 2 chunks failing REAL fires complete:false (never complete:true)', async () => {
         const { calls, run } = runFileList({
             files: ['/repo/b.ts'],

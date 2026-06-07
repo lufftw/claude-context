@@ -1122,16 +1122,23 @@ export class Context {
             // pure WAIT-class: neutral.
         }
 
-        // End-of-run sweep: every file that was produced but never reached
-        // complete:true fires complete:false now. Two ways a file lands here:
-        //   1. a chunk failed to embed/insert (produced > inserted), or
-        //   2. CHUNK_LIMIT truncated it mid-file (produced < total).
-        // Either way the ledger must record the file as incomplete so a later
-        // resume (Commit 4) does NOT skip it as fully indexed.
+        // End-of-run sweep over the AUTHORITATIVE set of files that went through
+        // the splitter this run (fileChunkTotals). Re-applies the completeness
+        // gate so any file not already fired gets a terminal verdict:
+        //   - complete:true  — produced === inserted === total. Covers 0-chunk
+        //     files (total===0, no fileProgress entry → 0===0===0) which the
+        //     incremental fireCompleted never sees because they never enter a batch.
+        //   - complete:false — a chunk failed to embed/insert (produced > inserted)
+        //     or CHUNK_LIMIT truncated the file mid-way (produced < total).
+        // Iterating fileChunkTotals (not fileProgress) is what lets a legitimately
+        // complete empty/comment-only file get a complete:true ledger entry instead
+        // of no entry at all (which would make Commit 4's resume re-process it forever).
         if (onFileComplete) {
-            for (const [rp, p] of fileProgress) {
+            for (const [rp, total] of fileChunkTotals) {
                 if (firedComplete.has(rp)) continue;
-                onFileComplete(rp, { complete: false, fileHash: fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
+                const p = fileProgress.get(rp) ?? { produced: 0, inserted: 0 };
+                const complete = p.produced === p.inserted && p.produced === total;
+                onFileComplete(rp, { complete, fileHash: fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
                 firedComplete.add(rp);
             }
         }
