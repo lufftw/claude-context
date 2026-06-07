@@ -420,6 +420,15 @@ export class ToolHandlers {
             const embeddingProvider = this.context.getEmbedding();
             console.log(`[BACKGROUND-INDEX] 🧠 Using embedding provider: ${embeddingProvider.getProvider()} with dimension: ${embeddingProvider.getDimension()}`);
 
+            // Capture the prior-run completeness ledger BEFORE indexing mutates
+            // the live snapshot entry (Commit 4/4 — the resume read). This is the
+            // snapshot state loaded at MCP startup / the prior run; core's resume
+            // skip consults it to decide which files are verified-complete and may
+            // be skipped vs. partial and must be re-embedded. getFileLedger returns
+            // a COPY, so the in-run setFileComplete mutations below don't perturb
+            // what the resume read sees.
+            const priorLedger = this.snapshotManager.getFileLedger(absolutePath);
+
             // Start indexing with the appropriate context and progress tracking
             console.log(`[BACKGROUND-INDEX] 🚀 Beginning codebase indexing process...`);
             const stats = await contextForThisTask.indexCodebase(absolutePath, (progress) => {
@@ -440,7 +449,7 @@ export class ToolHandlers {
                 // snapshot entry in place; the 2s periodic save above (and the
                 // terminal setCodebaseIndexed) then persists it durably.
                 this.snapshotManager.setFileComplete(absolutePath, relativePath, info);
-            });
+            }, undefined /* forceReindex — keep default */, priorLedger);
             console.log(`[BACKGROUND-INDEX] ✅ Indexing completed successfully! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
 
             // Set codebase to indexed status with complete statistics

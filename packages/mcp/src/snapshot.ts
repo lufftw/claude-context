@@ -436,6 +436,33 @@ export class SnapshotManager {
     }
 
     /**
+     * Build the prior-run completeness ledger for a codebase (Commit 4/4 — the
+     * resume read). Reflects the snapshot loaded at MCP startup / the prior run.
+     * Core's resume skip consults this: a file may be skipped ONLY when its
+     * ledger entry says complete:true at the same hash Milvus holds.
+     *
+     * Returns a NEW Map (a COPY): the in-progress run mutates the LIVE
+     * codebaseInfoMap entry via setFileComplete, but the resume read must see the
+     * PRIOR state, so the copy is decoupled from later mutation. Empty Map if
+     * there is no entry or it carries no `files` ledger.
+     */
+    public getFileLedger(codebasePath: string): Map<string, { complete: boolean; fileHash: string; chunkCount: number }> {
+        const ledger = new Map<string, { complete: boolean; fileHash: string; chunkCount: number }>();
+        const entry = this.codebaseInfoMap.get(codebasePath);
+        const files = entry && (entry as CodebaseInfoIndexing | CodebaseInfoIndexed).files;
+        if (files) {
+            for (const [relativePath, fc] of Object.entries(files)) {
+                ledger.set(relativePath, {
+                    complete: fc.complete,
+                    fileHash: fc.fileHash,
+                    chunkCount: fc.chunkCount,
+                });
+            }
+        }
+        return ledger;
+    }
+
+    /**
      * Get codebase status
      */
     public getCodebaseStatus(codebasePath: string): 'indexed' | 'indexing' | 'indexfailed' | 'not_found' {

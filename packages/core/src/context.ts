@@ -318,26 +318,35 @@ export class Context {
      *        completeness ledger (Commit 3/4). Core never imports the mcp package
      *        — this callback is the only bridge.
      * @param forceReindex Whether to recreate the collection even if it exists
+     * @param priorLedger Optional per-file completeness ledger from a prior run
+     *        (the snapshot loaded at MCP startup). Keyed by relativePath. Read by
+     *        the resume skip (Commit 4/4): a file may be skipped ONLY when Milvus
+     *        already has it at the same hash AND this ledger says it fully
+     *        completed at that same hash. A partially-indexed file has
+     *        matching-hash chunks but complete:false, so it must be re-embedded.
+     *        Defined inline here — core must NOT import mcp's FileCompleteness.
      * @returns Indexing statistics
      */
     async indexCodebase(
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
         onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
-        forceReindex: boolean = false
+        forceReindex: boolean = false,
+        priorLedger?: Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         // Scope project-`.env` reads (MILVUS_COLLECTION_PRIVATE, _SHARED, _STRATEGY, etc.)
         // to this call only via AsyncLocalStorage. Critical for parallel safety:
         // sibling indexCodebase() calls must not see each other's project context.
         // Bug history: see docs/lufftw/bugfix-2026-05-04-envmanager-concurrency.md
-        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, onFileComplete, forceReindex));
+        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, onFileComplete, forceReindex, priorLedger));
     }
 
     private async _indexCodebaseImpl(
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
         onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
-        forceReindex: boolean = false
+        forceReindex: boolean = false,
+        priorLedger?: Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
@@ -382,7 +391,8 @@ export class Context {
                     percentage: Math.round(progressPercentage)
                 });
             },
-            onFileComplete
+            onFileComplete,
+            priorLedger
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
@@ -901,7 +911,8 @@ export class Context {
         filePaths: string[],
         codebasePath: string,
         onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void,
-        onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void
+        onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
+        priorLedger?: Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
@@ -972,19 +983,35 @@ export class Context {
             const filePath = filePaths[i];
 
             try {
-                // ── File hash check: skip unchanged files ──
+                // ── File hash check: skip unchanged + verified-complete files ──
                 const relativePath = path.relative(codebasePath, filePath);
                 const fileHash = await this.computeFileHash(filePath);
                 const existingHash = existingHashes.get(relativePath);
+                const led = priorLedger?.get(relativePath);   // { complete, fileHash, chunkCount? } | undefined
 
-                if (existingHash === fileHash) {
+                // Skip ONLY when Milvus has the file at this hash AND the ledger says it
+                // fully completed at the SAME hash. The ledger is the completeness
+                // authority (P30): a partially-indexed file has matching-hash chunks but
+                // complete:false, so the old `existingHash === fileHash` test alone would
+                // wrongly skip it (the live-discovered partial-resume bug).
+                if (existingHash === fileHash && led?.complete === true && led.fileHash === fileHash) {
                     skippedFiles++;
                     processedFiles++;
+                    // P46: re-fire the ledger entry on skip so it survives this run's
+                    // snapshot rewrite (otherwise a skipped file's entry could be dropped
+                    // on the next save and a subsequent resume would re-process it).
+                    onFileComplete?.(relativePath, { complete: true, fileHash, chunkCount: led.chunkCount ?? 0 });
                     onFileProcessed?.(filePath, i + 1, filePaths.length);
-                    continue;  // File unchanged — skip embedding entirely
+                    continue;
                 }
 
-                // File is new or changed — delete old chunks if they exist
+                // Not verified-complete → (re)embed. Delete old chunks first whenever ANY
+                // exist. Add-2: pre-Phase-3 the insert is NOT idempotent, so an
+                // absent/incomplete ledger WITH a matching Milvus hash must STILL
+                // delete-before-reembed — a plain re-insert would manufacture duplicate
+                // deterministic-PK rows (the live-discovered dup-PK class). `existingHash`
+                // truthy covers both "changed" (hash differs) and "matching hash but not
+                // verified-complete".
                 if (existingHash) {
                     changedFiles++;
                     try {
