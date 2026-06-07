@@ -435,6 +435,11 @@ export class ToolHandlers {
                 }
 
                 console.log(`[BACKGROUND-INDEX] Progress: ${progress.phase} - ${progress.percentage}% (${progress.current}/${progress.total})`);
+            }, (relativePath, info) => {
+                // Per-file completeness ledger (Commit 3/4). Mutates the in-memory
+                // snapshot entry in place; the 2s periodic save above (and the
+                // terminal setCodebaseIndexed) then persists it durably.
+                this.snapshotManager.setFileComplete(absolutePath, relativePath, info);
             });
             console.log(`[BACKGROUND-INDEX] ✅ Indexing completed successfully! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
 

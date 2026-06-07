@@ -311,24 +311,32 @@ export class Context {
      * Index a codebase for semantic search
      * @param codebasePath Codebase root path
      * @param progressCallback Optional progress callback function
+     * @param onFileComplete Optional per-file completeness callback. Fires once
+     *        per produced file: complete:true ⇔ every chunk the splitter produced
+     *        for that file was embedded AND inserted; complete:false otherwise
+     *        (failed chunk, chunk-limit truncation). Drives the snapshot
+     *        completeness ledger (Commit 3/4). Core never imports the mcp package
+     *        — this callback is the only bridge.
      * @param forceReindex Whether to recreate the collection even if it exists
      * @returns Indexing statistics
      */
     async indexCodebase(
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
         forceReindex: boolean = false
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         // Scope project-`.env` reads (MILVUS_COLLECTION_PRIVATE, _SHARED, _STRATEGY, etc.)
         // to this call only via AsyncLocalStorage. Critical for parallel safety:
         // sibling indexCodebase() calls must not see each other's project context.
         // Bug history: see docs/lufftw/bugfix-2026-05-04-envmanager-concurrency.md
-        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, forceReindex));
+        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, onFileComplete, forceReindex));
     }
 
     private async _indexCodebaseImpl(
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
         forceReindex: boolean = false
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
@@ -373,7 +381,8 @@ export class Context {
                     total: totalFiles,
                     percentage: Math.round(progressPercentage)
                 });
-            }
+            },
+            onFileComplete
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
@@ -891,7 +900,8 @@ export class Context {
     private async processFileList(
         filePaths: string[],
         codebasePath: string,
-        onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void
+        onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void,
+        onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
@@ -925,10 +935,38 @@ export class Context {
         // Per-file accounting threaded through the batch reducer (Commit 2/4).
         //  - fileChunkTotals: how many chunks the splitter produced per file.
         //  - fileProgress:    cumulative produced/inserted as batches drain.
-        // Both accumulate here but are NOT yet read for completeness; the
-        // snapshot completeness ledger / onFileComplete wiring is Commit 3.
+        // Read for completeness here (Commit 3/4) to drive onFileComplete.
         const fileChunkTotals = new Map<string, number>();
         const fileProgress = new Map<string, { produced: number; inserted: number }>();
+
+        // Completeness ledger plumbing (Commit 3/4).
+        //  - fileHashByPath: the per-file SHA-256 captured at split time, so the
+        //    onFileComplete payload carries the exact hash that was embedded into
+        //    each chunk's metadata (lets a resume compare hashes durably).
+        //  - firedComplete:  guards against double-firing for a file once we have
+        //    emitted a terminal (complete:true OR complete:false) verdict.
+        const fileHashByPath = new Map<string, string>();
+        const firedComplete = new Set<string>();
+
+        // Fire complete:true for every file whose FULL splitter output has been
+        // embedded AND inserted. The `produced === total` arm is load-bearing:
+        // it guards the chunk-limit orphan — a CHUNK_LIMIT-truncated file has
+        // produced < total even when produced === inserted, so it must NOT be
+        // reported complete here (the end-of-run sweep emits complete:false).
+        const fireCompleted = () => {
+            if (!onFileComplete) return;
+            for (const [rp, p] of fileProgress) {
+                if (firedComplete.has(rp)) continue;
+                const total = fileChunkTotals.get(rp);
+                // complete ⇔ every produced chunk was inserted AND we produced the file's
+                // FULL splitter count (guards the chunk-limit orphan: a CHUNK_LIMIT-truncated
+                // file has produced < total even when produced === inserted).
+                if (total !== undefined && p.produced === p.inserted && p.produced === total) {
+                    onFileComplete(rp, { complete: true, fileHash: fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
+                    firedComplete.add(rp);
+                }
+            }
+        };
 
         for (let i = 0; i < filePaths.length; i++) {
             const filePath = filePaths[i];
@@ -974,9 +1012,11 @@ export class Context {
                 const chunks = await this.codeSplitter.split(content, language, filePath);
 
                 // Record how many chunks the splitter produced for this file so
-                // a later completeness check (Commit 3) can compare against the
-                // number actually inserted. Accumulated now; not yet read.
+                // the completeness check (Commit 3) can compare against the
+                // number actually inserted, and capture the file's hash for the
+                // onFileComplete payload.
                 fileChunkTotals.set(relativePath, chunks.length);
+                fileHashByPath.set(relativePath, fileHash);
 
                 // Inject fileHash into each chunk's metadata so future runs can skip
                 for (const chunk of chunks) {
@@ -1005,6 +1045,7 @@ export class Context {
                         const r = await this.processChunkBuffer(chunkBuffer);
                         chunkBuffer = []; // ALWAYS reset, regardless of outcome
                         this.mergeFileProgress(fileProgress, r.perFile);
+                        fireCompleted();
                         if (r.realFailures > 0) {
                             consecutiveBatchErrors++;
                             const searchType = isHybrid === true ? 'hybrid' : 'regular';
@@ -1064,6 +1105,7 @@ export class Context {
             const r = await this.processChunkBuffer(chunkBuffer);
             chunkBuffer = [];
             this.mergeFileProgress(fileProgress, r.perFile);
+            fireCompleted();
             if (r.realFailures > 0) {
                 consecutiveBatchErrors++;
                 console.error(
@@ -1078,6 +1120,20 @@ export class Context {
                 consecutiveBatchErrors = 0;
             }
             // pure WAIT-class: neutral.
+        }
+
+        // End-of-run sweep: every file that was produced but never reached
+        // complete:true fires complete:false now. Two ways a file lands here:
+        //   1. a chunk failed to embed/insert (produced > inserted), or
+        //   2. CHUNK_LIMIT truncated it mid-file (produced < total).
+        // Either way the ledger must record the file as incomplete so a later
+        // resume (Commit 4) does NOT skip it as fully indexed.
+        if (onFileComplete) {
+            for (const [rp, p] of fileProgress) {
+                if (firedComplete.has(rp)) continue;
+                onFileComplete(rp, { complete: false, fileHash: fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
+                firedComplete.add(rp);
+            }
         }
 
         // ── Log incremental stats ──

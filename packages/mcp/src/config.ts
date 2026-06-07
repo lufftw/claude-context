@@ -41,6 +41,16 @@ export interface CodebaseSnapshotV1 {
 
 // New format (v2) - structured with codebase information
 
+// Per-file completeness ledger entry (Commit 3/4).
+// Written durably by the snapshot manager from core's onFileComplete callback.
+// `complete` is the gate a resume reads (Commit 4): only complete:true files
+// may be skipped; a partial/orphaned file (complete:false) must be re-indexed.
+export interface FileCompleteness {
+    fileHash: string;    // SHA-256 of the file content embedded into its chunks
+    chunkCount: number;  // chunks confirmed inserted for this file
+    complete: boolean;   // true ⇔ every produced chunk for the file was inserted
+}
+
 // Base interface for common fields
 interface CodebaseInfoBase {
     lastUpdated: string;
@@ -50,6 +60,7 @@ interface CodebaseInfoBase {
 export interface CodebaseInfoIndexing extends CodebaseInfoBase {
     status: 'indexing';
     indexingPercentage: number;  // Current progress percentage
+    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4)
 }
 
 // Indexed state - when indexing completed successfully
@@ -58,6 +69,7 @@ export interface CodebaseInfoIndexed extends CodebaseInfoBase {
     indexedFiles: number;        // Number of files indexed
     totalChunks: number;         // Total number of chunks generated
     indexStatus: 'completed' | 'limit_reached';  // Status from indexing result
+    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4)
 }
 
 // Index failed state - when indexing failed
