@@ -94,6 +94,11 @@ export interface VectorDatabase {
      */
     insertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void>;
 
+    /** Upsert vector documents (insert or overwrite by primary key). Idempotent on deterministic PKs. */
+    upsert(collectionName: string, documents: VectorDocument[]): Promise<void>;
+    /** Upsert hybrid vector documents (insert or overwrite by primary key; BM25 sparse_vector regenerates). */
+    upsertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void>;
+
     /**
      * Search similar vectors
      * @param collectionName Collection name
@@ -132,6 +137,12 @@ export interface VectorDatabase {
      * @param limit Maximum number of results
      */
     query(collectionName: string, filter: string, outputFields: string[], limit?: number): Promise<Record<string, any>[]>;
+
+    /**
+     * Full-scan query that drains ALL matching rows (no 16384 window cap),
+     * using server-side iteration. Use for resume/readback over large collections.
+     */
+    queryAll(collectionName: string, outputFields: string[], filter?: string, batchSize?: number): Promise<Record<string, any>[]>;
 
     /**
      * Get collection description

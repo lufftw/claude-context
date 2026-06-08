@@ -9,7 +9,8 @@ import {
     CodebaseInfo,
     CodebaseInfoIndexing,
     CodebaseInfoIndexed,
-    CodebaseInfoIndexFailed
+    CodebaseInfoIndexFailed,
+    FileCompleteness
 } from "./config.js";
 
 export class SnapshotManager {
@@ -338,6 +339,24 @@ export class SnapshotManager {
     }
 
     /**
+     * Record per-file completeness into the in-memory ledger (Commit 3/4).
+     * Mutates the existing codebase entry in place so the next periodic 2s
+     * save (or terminal transition) persists it durably. If no entry exists
+     * yet (callback raced ahead of the first setCodebaseIndexing tick), seed a
+     * minimal 'indexing' entry so the ledger is never dropped.
+     */
+    public setFileComplete(codebasePath: string, relativePath: string, info: FileCompleteness): void {
+        let entry = this.codebaseInfoMap.get(codebasePath);
+        if (!entry) {
+            entry = { status: 'indexing', indexingPercentage: 0, lastUpdated: new Date().toISOString() } as CodebaseInfoIndexing;
+            this.codebaseInfoMap.set(codebasePath, entry);
+        }
+        const e = entry as CodebaseInfoIndexing | CodebaseInfoIndexed;
+        if (!e.files) e.files = {};
+        e.files[relativePath] = info;
+    }
+
+    /**
      * Set codebase to indexing status
      */
     public setCodebaseIndexing(codebasePath: string, progress: number = 0): void {
@@ -347,11 +366,15 @@ export class SnapshotManager {
         this.indexedCodebases = this.indexedCodebases.filter(path => path !== codebasePath);
         this.codebaseFileCount.delete(codebasePath);
 
-        // Update info map
+        // Update info map. Carry any prior completeness ledger forward — the 2s
+        // progress tick would otherwise clobber it on every save (Attack-3).
+        const prior = this.codebaseInfoMap.get(codebasePath);
+        const priorFiles = (prior && (prior as CodebaseInfoIndexing | CodebaseInfoIndexed).files) || undefined;
         const info: CodebaseInfoIndexing = {
             status: 'indexing',
             indexingPercentage: progress,
-            lastUpdated: new Date().toISOString()
+            lastUpdated: new Date().toISOString(),
+            ...(priorFiles ? { files: priorFiles } : {}),
         };
         this.codebaseInfoMap.set(codebasePath, info);
     }
@@ -374,12 +397,17 @@ export class SnapshotManager {
         // Update file count and info
         this.codebaseFileCount.set(codebasePath, stats.indexedFiles);
 
+        // Carry the completeness ledger across the terminal indexing→indexed
+        // transition so a later resume can still consult per-file completeness.
+        const prior = this.codebaseInfoMap.get(codebasePath);
+        const priorFiles = (prior && (prior as CodebaseInfoIndexing | CodebaseInfoIndexed).files) || undefined;
         const info: CodebaseInfoIndexed = {
             status: 'indexed',
             indexedFiles: stats.indexedFiles,
             totalChunks: stats.totalChunks,
             indexStatus: stats.status,
-            lastUpdated: new Date().toISOString()
+            lastUpdated: new Date().toISOString(),
+            ...(priorFiles ? { files: priorFiles } : {}),
         };
         this.codebaseInfoMap.set(codebasePath, info);
     }
@@ -405,6 +433,33 @@ export class SnapshotManager {
             lastUpdated: new Date().toISOString()
         };
         this.codebaseInfoMap.set(codebasePath, info);
+    }
+
+    /**
+     * Build the prior-run completeness ledger for a codebase (Commit 4/4 — the
+     * resume read). Reflects the snapshot loaded at MCP startup / the prior run.
+     * Core's resume skip consults this: a file may be skipped ONLY when its
+     * ledger entry says complete:true at the same hash Milvus holds.
+     *
+     * Returns a NEW Map (a COPY): the in-progress run mutates the LIVE
+     * codebaseInfoMap entry via setFileComplete, but the resume read must see the
+     * PRIOR state, so the copy is decoupled from later mutation. Empty Map if
+     * there is no entry or it carries no `files` ledger.
+     */
+    public getFileLedger(codebasePath: string): Map<string, { complete: boolean; fileHash: string; chunkCount: number }> {
+        const ledger = new Map<string, { complete: boolean; fileHash: string; chunkCount: number }>();
+        const entry = this.codebaseInfoMap.get(codebasePath);
+        const files = entry && (entry as CodebaseInfoIndexing | CodebaseInfoIndexed).files;
+        if (files) {
+            for (const [relativePath, fc] of Object.entries(files)) {
+                ledger.set(relativePath, {
+                    complete: fc.complete,
+                    fileHash: fc.fileHash,
+                    chunkCount: fc.chunkCount,
+                });
+            }
+        }
+        return ledger;
     }
 
     /**
@@ -519,9 +574,20 @@ export class SnapshotManager {
         // Merge: start with existing codebases, then apply this session's entries on top.
         const codebases: Record<string, CodebaseInfo> = { ...existingCodebases };
 
-        // Apply all codebases from this session's info map (overwrites same paths, preserves others)
+        // Apply all codebases from this session's info map (overwrites same paths, preserves others).
+        // The per-file completeness ledger (`files`) must be FIELD-MERGED with the
+        // existing on-disk entry, not whole-object-replaced: two sessions (or this
+        // session's 2s tick vs. an earlier write) each hold only the files they
+        // touched, so a plain replace would clobber the other session's ledger.
         for (const [codebasePath, info] of this.codebaseInfoMap) {
-            codebases[codebasePath] = info;
+            const existing = codebases[codebasePath];
+            const existingFiles = (existing && (existing as CodebaseInfoIndexing | CodebaseInfoIndexed).files) || undefined;
+            const infoFiles = (info as CodebaseInfoIndexing | CodebaseInfoIndexed).files;
+            if (existingFiles || infoFiles) {
+                codebases[codebasePath] = { ...info, files: { ...existingFiles, ...infoFiles } } as CodebaseInfo;
+            } else {
+                codebases[codebasePath] = info;
+            }
         }
 
         // Remove codebases that this session explicitly removed

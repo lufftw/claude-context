@@ -391,6 +391,42 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
         }
     }
 
+    async upsert(collectionName: string, documents: VectorDocument[]): Promise<void> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        try {
+            const restfulConfig = this.config as MilvusRestfulConfig;
+            // Transform VectorDocument array to Milvus entity format
+            const data = documents.map(doc => ({
+                id: doc.id,
+                vector: doc.vector,
+                content: doc.content,
+                relativePath: doc.relativePath,
+                startLine: doc.startLine,
+                endLine: doc.endLine,
+                fileExtension: doc.fileExtension,
+                metadata: JSON.stringify(doc.metadata) // Convert metadata object to JSON string
+            }));
+
+            const upsertRequest = {
+                collectionName,
+                data,
+                dbName: restfulConfig.database
+            };
+
+            const response = await this.makeRequest('/entities/upsert', 'POST', upsertRequest);
+
+            if (response.code !== 0) {
+                throw new Error(`Upsert failed: ${response.message || 'Unknown error'}`);
+            }
+
+        } catch (error) {
+            console.error(`[MilvusRestfulDB] ❌ Failed to upsert documents into collection '${collectionName}':`, error);
+            throw error;
+        }
+    }
+
     async search(collectionName: string, queryVector: number[], options?: SearchOptions): Promise<VectorSearchResult[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);
@@ -535,6 +571,37 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
 
         } catch (error) {
             console.error(`[MilvusRestfulDB] ❌ Failed to query collection '${collectionName}':`, error);
+            throw error;
+        }
+    }
+
+    async queryAll(collectionName: string, outputFields: string[], filter?: string, batchSize: number = 10000): Promise<Record<string, any>[]> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+        try {
+            const restfulConfig = this.config as MilvusRestfulConfig;
+            const out: Record<string, any>[] = [];
+            let offset = 0;
+            // NOTE: Milvus REST caps offset+limit at the 16384 query window, so this is
+            // best-effort for the RESTful driver (the MCP uses the gRPC driver). Kept for
+            // interface completeness; do NOT rely on it for >16384-row full scans.
+            const pageSize = Math.min(batchSize, 16384);
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                const req: Record<string, any> = { collectionName, dbName: restfulConfig.database, outputFields, offset, limit: pageSize };
+                if (filter && filter.trim() !== '') req.filter = filter;
+                const response = await this.makeRequest('/entities/query', 'POST', req);
+                if (response.code !== 0) {
+                    throw new Error(`Failed to queryAll Milvus: ${response.message || 'Unknown error'}`);
+                }
+                const page = (response.data || []) as Record<string, any>[];
+                out.push(...page);
+                if (page.length < pageSize) break;
+                offset += pageSize;
+            }
+            return out;
+        } catch (error) {
+            console.error(`[MilvusRestfulDB] ❌ Failed to queryAll collection '${collectionName}':`, error);
             throw error;
         }
     }
@@ -707,6 +774,44 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
 
         } catch (error) {
             console.error(`[MilvusRestfulDB] ❌ Failed to insert hybrid documents to collection '${collectionName}':`, error);
+            throw error;
+        }
+    }
+
+    async upsertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        try {
+            const restfulConfig = this.config as MilvusRestfulConfig;
+
+            const data = documents.map(doc => ({
+                id: doc.id,
+                content: doc.content,
+                vector: doc.vector,
+                relativePath: doc.relativePath,
+                startLine: doc.startLine,
+                endLine: doc.endLine,
+                fileExtension: doc.fileExtension,
+                metadata: JSON.stringify(doc.metadata),
+            }));
+
+            const upsertRequest = {
+                collectionName,
+                dbName: restfulConfig.database,
+                data: data
+            };
+
+            // Native upsert; on a BM25 sparse_vector function-field hybrid collection the
+            // server regenerates sparse_vector and collapses same-PK rows (probe-verified, Phase 3).
+            const response = await this.makeRequest('/entities/upsert', 'POST', upsertRequest);
+
+            if (response.code !== 0) {
+                throw new Error(`Upsert failed: ${response.message || 'Unknown error'}`);
+            }
+
+        } catch (error) {
+            console.error(`[MilvusRestfulDB] ❌ Failed to upsert hybrid documents to collection '${collectionName}':`, error);
             throw error;
         }
     }

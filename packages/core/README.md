@@ -163,7 +163,7 @@ interface ContextConfig {
 
 #### Methods
 
-- `indexCodebase(path, progressCallback?, forceReindex?)` - Index an entire codebase
+- `indexCodebase(path, progressCallback?, onFileComplete?, forceReindex?, priorLedger?)` - Index an entire codebase. `onFileComplete(relativePath, { complete, fileHash, chunkCount })` fires once per produced file to drive the snapshot completeness ledger. `priorLedger` (a `Map<relativePath, { complete, fileHash, chunkCount? }>` from a prior run's snapshot) gates the incremental resume skip: a file is skipped only when both its stored chunk hash AND its ledger entry are complete at the same hash; a partially-indexed file (matching hash but `complete:false`, or no ledger entry) is re-embedded.
 - `reindexByChange(path, progressCallback?)` - Incrementally re-index only changed files
 - `semanticSearch(path, query, topK?, threshold?, filterExpr?)` - Search indexed code semantically
 - `hasIndex(path)` - Check if codebase is already indexed
