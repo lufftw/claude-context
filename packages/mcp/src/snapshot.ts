@@ -50,14 +50,6 @@ export class SnapshotManager {
     }
 
     /**
-     * @deprecated retained for any external caller; delegates to isV2OrLater.
-     * Check if snapshot is the structured (v2-or-later) format.
-     */
-    private isV2Format(snapshot: any): snapshot is CodebaseSnapshotV2 {
-        return this.isV2OrLater(snapshot);
-    }
-
-    /**
      * Convert v1 format to internal state
      */
     private loadV1Format(snapshot: CodebaseSnapshotV1): void {
@@ -176,7 +168,7 @@ export class SnapshotManager {
             const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
             const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
 
-            if (this.isV2Format(snapshot)) {
+            if (this.isV2OrLater(snapshot)) {
                 return Object.entries(snapshot.codebases)
                     .filter(([_, info]) => info.status === 'indexed')
                     .map(([path, _]) => path);
@@ -201,7 +193,7 @@ export class SnapshotManager {
             const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
             const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
 
-            if (this.isV2Format(snapshot)) {
+            if (this.isV2OrLater(snapshot)) {
                 return Object.entries(snapshot.codebases)
                     .filter(([_, info]) => info.status === 'indexing')
                     .map(([path, _]) => path);
@@ -241,7 +233,7 @@ export class SnapshotManager {
             const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
             const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
 
-            if (this.isV2Format(snapshot)) {
+            if (this.isV2OrLater(snapshot)) {
                 const info = snapshot.codebases[codebasePath];
                 if (info && info.status === 'indexing') {
                     return info.indexingPercentage || 0;
@@ -369,14 +361,11 @@ export class SnapshotManager {
      * minimal 'indexing' entry so the ledger is never dropped.
      */
     public setFileComplete(codebasePath: string, relativePath: string, info: FileCompleteness): void {
-        let entry = this.codebaseInfoMap.get(codebasePath);
-        if (!entry) {
-            entry = { status: 'indexing', indexingPercentage: 0, lastUpdated: new Date().toISOString() } as CodebaseInfoIndexing;
-            this.codebaseInfoMap.set(codebasePath, entry);
-        }
-        const e = entry as CodebaseInfoIndexing | CodebaseInfoIndexed;
-        if (!e.files) e.files = {};
-        e.files[relativePath] = info;
+        // Delegate to the per-model writer under the primary id (mirrors how
+        // getFileLedger delegates to getFileLedgerForModel). The primary branch of
+        // setFileCompleteForModel writes the legacy top-level `files` byte-for-byte
+        // identically, so this path is unchanged for all existing callers.
+        this.setFileCompleteForModel(codebasePath, DEFAULT_PRIMARY_MODEL_ID, relativePath, info);
     }
 
     /**
@@ -466,7 +455,12 @@ export class SnapshotManager {
         this.indexingCodebases.delete(codebasePath);
         this.codebaseFileCount.delete(codebasePath);
 
-        // Update info map
+        // Update info map. DELIBERATE ASYMMETRY vs. setCodebaseIndexing/setCodebaseIndexed:
+        // those EXHAUSTIVELY carry forward the prior per-file/per-model ledgers (files,
+        // filesByModel, coverageByModel). A FAILED transition intentionally DROPS the
+        // in-memory ledger — a retry re-indexes the codebase from scratch, so a stale
+        // partial ledger must not survive to short-circuit the next run. (The on-disk
+        // entry is then replaced wholesale by this failed info on the next merge-save.)
         const info: CodebaseInfoIndexFailed = {
             status: 'indexfailed',
             errorMessage: errorMessage,
@@ -474,6 +468,19 @@ export class SnapshotManager {
             lastUpdated: new Date().toISOString()
         };
         this.codebaseInfoMap.set(codebasePath, info);
+    }
+
+    /**
+     * Reject model ids that would pollute a plain-object map's prototype chain.
+     * `filesByModel` / `coverageByModel` are plain objects keyed by model id;
+     * '__proto__' / 'constructor' / 'prototype' must never be used as keys. Throwing
+     * here (rather than silently skipping) makes a bad id loud at the boundary and
+     * guarantees no write touches Object.prototype.
+     */
+    private assertSafeModelId(modelId: string): void {
+        if (modelId === '__proto__' || modelId === 'constructor' || modelId === 'prototype') {
+            throw new Error(`invalid model id: ${modelId}`);
+        }
     }
 
     /**
@@ -489,6 +496,11 @@ export class SnapshotManager {
         codebasePath: string,
         modelId: string
     ): Map<string, { complete: boolean; fileHash: string; chunkCount: number }> {
+        // Prototype-pollution guard (foundational code on a SHARED snapshot file):
+        // model ids index a plain-object map, so a id of '__proto__' / 'constructor'
+        // / 'prototype' would read/poison Object.prototype. Model ids are registry-
+        // controlled today, but reject the dangerous keys at the boundary anyway.
+        this.assertSafeModelId(modelId);
         const ledger = new Map<string, { complete: boolean; fileHash: string; chunkCount: number }>();
         const entry = this.codebaseInfoMap.get(codebasePath) as
             (CodebaseInfoIndexing | CodebaseInfoIndexed | undefined);
@@ -521,6 +533,10 @@ export class SnapshotManager {
         relativePath: string,
         info: FileCompleteness
     ): void {
+        // Prototype-pollution guard: modelId keys a plain-object map below. Reject
+        // '__proto__' / 'constructor' / 'prototype' so a malicious/buggy id cannot
+        // poison Object.prototype (see assertSafeModelId).
+        this.assertSafeModelId(modelId);
         let entry = this.codebaseInfoMap.get(codebasePath);
         if (!entry) {
             entry = { status: 'indexing', indexingPercentage: 0, lastUpdated: new Date().toISOString() } as CodebaseInfoIndexing;

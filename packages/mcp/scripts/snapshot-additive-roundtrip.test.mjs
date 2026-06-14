@@ -25,6 +25,16 @@
 //       0.6B ledger for codebase P; runtime#2 (fresh SnapshotManager, same temp home)
 //       writes a DIFFERENT codebase Q via the PUBLIC saveCodebaseSnapshot; re-read from
 //       disk -> BOTH P's filesByModel AND Q survive (the Attack-3 multi-user class).
+//   T-same-codebase-merge (M2 keystone CORE): two runtimes write the SAME codebase P
+//       under DIFFERENT model ids (runtime#1 -> 0.6B 'a.ts'; runtime#2 -> 8B 'b.ts')
+//       via the PUBLIC saveCodebaseSnapshot; re-read from disk -> BOTH model ledgers
+//       for the SAME codebase coexist. This is the literal keystone premise that
+//       T-cross-session (two DIFFERENT codebases) does NOT exercise.
+//   T-coverage-merge (Phase 4 contract): two runtimes write coverageByModel for the
+//       SAME codebase under DIFFERENT model ids; re-read from disk -> both model
+//       entries coexist (the per-model union the merge must honor).
+//   T-proto-guard: setFileCompleteForModel(P,'__proto__',...) THROWS and does NOT
+//       pollute Object.prototype ({}).somekey stays undefined.
 //   T1 emit-invariant: after load + saveCodebaseSnapshot(), the on-disk formatVersion
 //       is still 'v2' (rev1.2 T1: MUST save before re-reading — load does NOT auto-save
 //       the migrated doc in a way we can rely on for this assertion's intent).
@@ -194,6 +204,103 @@ withTempHome((home) => {
     eq('disk Q.files (8B) intact', disk.codebases[Q].files['q.ts'],
         { complete: true, fileHash: 'hq', chunkCount: 1 });
     eq('emitted formatVersion stays v2', disk.formatVersion, 'v2');
+});
+
+// ── T-same-codebase-merge: SAME codebase P, two model ids, two runtimes coexist ──
+// This is the LITERAL keystone premise: two sessions indexing the SAME codebase under
+// DIFFERENT models must both survive. T-cross-session uses two DIFFERENT codebases and
+// therefore does NOT cover this — the on-disk read-merge-write must field-merge the
+// per-model sub-ledgers of the SAME codebase entry, not whole-object-replace it.
+console.log('\nT-same-codebase-merge. same codebase P, 0.6B (rt#1) + 8B (rt#2) coexist on disk');
+withTempHome((home) => {
+    // Runtime #1: codebase P, write the SECONDARY (0.6B) ledger for 'a.ts', save PUBLIC.
+    const r1 = new SnapshotManager();
+    r1.setCodebaseIndexing(P, 0);
+    r1.setFileCompleteForModel(P, SECONDARY, 'a.ts', { complete: true, fileHash: 'sa', chunkCount: 5 });
+    r1.saveCodebaseSnapshot();
+
+    // Runtime #2: fresh manager, SAME temp home, SAME codebase P, write the PRIMARY (8B)
+    // ledger (legacy top-level `files`) for a DIFFERENT file 'b.ts'. Save through PUBLIC
+    // saveCodebaseSnapshot — the read-merge-write is the ONLY thing that can keep rt#1's
+    // 0.6B ledger alive on the SAME codebase entry.
+    const r2 = new SnapshotManager();
+    r2.setCodebaseIndexing(P, 0);
+    r2.setFileComplete(P, 'b.ts', { complete: true, fileHash: 'pb', chunkCount: 9 });
+    r2.saveCodebaseSnapshot();
+
+    // Re-read FROM DISK: BOTH model ledgers for the SAME codebase P coexist (parsed objs).
+    const disk = readDisk(home);
+    eq('disk P.filesByModel[0.6b].a.ts survived rt#2 save (same codebase)',
+        disk.codebases[P].filesByModel[SECONDARY]['a.ts'],
+        { complete: true, fileHash: 'sa', chunkCount: 5 });
+    eq('disk P.files[b.ts] (8B) written by rt#2 present (same codebase)',
+        disk.codebases[P].files['b.ts'],
+        { complete: true, fileHash: 'pb', chunkCount: 9 });
+    eq('emitted formatVersion stays v2', disk.formatVersion, 'v2');
+
+    // And via a fresh runtime's per-model accessors, both ledgers read back.
+    const r3 = new SnapshotManager();
+    r3.loadCodebaseSnapshot();
+    eq('rt#3 reads P 0.6B a.ts', r3.getFileLedgerForModel(P, SECONDARY).get('a.ts'),
+        { complete: true, fileHash: 'sa', chunkCount: 5 });
+    eq('rt#3 reads P 8B b.ts', r3.getFileLedgerForModel(P, PRIMARY).get('b.ts'),
+        { complete: true, fileHash: 'pb', chunkCount: 9 });
+});
+
+// ── T-coverage-merge: coverageByModel unions per model id across two runtimes ─────
+// Phase 4 will WRITE coverageByModel; this pins the merge contract NOW so Phase 4 has a
+// spec, not a guess. No public coverage setter exists yet, so we (a) persist model-A
+// coverage to disk as a prior session's state, then (b) place model-B coverage on the
+// live in-memory entry (getCodebaseInfo returns the live object) and save. The merge
+// must union: disk{A} ∪ memory{B} = {A,B}.
+console.log('\nT-coverage-merge. coverageByModel unions per model id (Phase 4 contract)');
+withTempHome((home) => {
+    // Runtime #1: create P, save, then stamp coverage for model A directly on disk
+    // (simulating Phase 4's future persisted coverageByModel for a prior session).
+    const r1 = new SnapshotManager();
+    r1.setCodebaseIndexed(P, { indexedFiles: 1, totalChunks: 1, status: 'completed' });
+    r1.saveCodebaseSnapshot();
+    const onDisk = readDisk(home);
+    onDisk.codebases[P].coverageByModel = { [PRIMARY]: 1.0 };
+    fs.writeFileSync(snapPath(home), JSON.stringify(onDisk, null, 2));
+
+    // Runtime #2: load (in-memory now carries coverage{A}); write coverage for a
+    // DIFFERENT model B onto the LIVE in-memory entry, then save. The on-disk read
+    // (coverage{A}) ∪ incoming (coverage{B}) must yield both keys.
+    const r2 = new SnapshotManager();
+    r2.loadCodebaseSnapshot();
+    const live = r2.getCodebaseInfo(P);
+    live.coverageByModel = { [SECONDARY]: 0.5 }; // different model id than on disk
+    r2.saveCodebaseSnapshot();
+
+    const disk = readDisk(home);
+    eq('coverage[8B] (disk, rt#1) survived the merge', disk.codebases[P].coverageByModel[PRIMARY], 1.0);
+    eq('coverage[0.6B] (rt#2) merged in', disk.codebases[P].coverageByModel[SECONDARY], 0.5);
+    eq('coverageByModel has exactly the two model ids',
+        Object.keys(disk.codebases[P].coverageByModel).sort(), [SECONDARY, PRIMARY].sort());
+});
+
+// ── T-proto-guard: '__proto__' model id throws and does NOT pollute Object.prototype ──
+console.log('\nT-proto-guard. setFileCompleteForModel(__proto__) throws, no prototype pollution');
+withTempHome((home) => {
+    const mgr = new SnapshotManager();
+    mgr.setCodebaseIndexing(P, 0);
+    let threw = false;
+    try {
+        mgr.setFileCompleteForModel(P, '__proto__', 'x.ts', { complete: true, fileHash: 'x', chunkCount: 1 });
+    } catch {
+        threw = true;
+    }
+    check('setFileCompleteForModel(__proto__) throws', threw, 'expected an Error');
+    // Prototype must NOT be polluted: a fresh object literal must not gain rogue keys.
+    check('Object.prototype not polluted (somekey undefined)', ({}).somekey === undefined,
+        `({}).somekey = ${JSON.stringify(({}).somekey)}`);
+    check('Object.prototype not polluted (x.ts undefined)', ({})['x.ts'] === undefined,
+        `({})['x.ts'] = ${JSON.stringify(({})['x.ts'])}`);
+    // getFileLedgerForModel(__proto__) must also throw (guard applied symmetrically).
+    let getThrew = false;
+    try { mgr.getFileLedgerForModel(P, '__proto__'); } catch { getThrew = true; }
+    check('getFileLedgerForModel(__proto__) throws', getThrew, 'expected an Error');
 });
 
 // ── T1: emit-invariant — after load + explicit save, on-disk version stays 'v2' ──
