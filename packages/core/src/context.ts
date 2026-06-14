@@ -12,6 +12,10 @@ import {
     REAL_REASONS
 } from './embedding';
 import {
+    getModelSpec,
+    DEFAULT_PRIMARY_MODEL_ID,
+} from './embedding/model-registry';
+import {
     VectorDatabase,
     VectorDocument,
     VectorSearchResult,
@@ -92,6 +96,13 @@ const DEFAULT_IGNORE_PATTERNS = [
 
 export interface ContextConfig {
     embedding?: Embedding;
+    /**
+     * Optional secondary embedding instance (dual-embedding, Option B). When
+     * present, indexing dual-targets a second per-model collection (LD-2/LD-5).
+     * Constructed by the MCP factory ONLY when the secondary is configured;
+     * absence ⇒ single-model byte-identical path.
+     */
+    secondaryEmbedding?: Embedding;
     vectorDatabase?: VectorDatabase;
     codeSplitter?: Splitter;
     supportedExtensions?: string[];
@@ -129,8 +140,49 @@ interface BatchOutcome {
     successes: number;
 }
 
+/**
+ * A single (model × collection × embedding-instance) target for the inner index
+ * loop (Option B — one collection per model). The outer Merkle scan + AST split
+ * runs ONCE; each IndexTarget then embeds the already-split chunks with its own
+ * embedding instance and upserts to its own collection. (LD-5.)
+ *
+ *  - modelId        — canonical registry id; ALSO the per-model ledger key. The
+ *                     synthetic '__writable_shared__' key (C2) routes its
+ *                     embedding/dim from the primary but keeps a distinct ledger
+ *                     key so it never clobbers the primary's per-model ledger. It
+ *                     is invisible to search/status, which enumerate canonical
+ *                     model ids by name.
+ *  - collectionName — resolved via getCollectionNameForModel (suffix '' ⇒ the
+ *                     literal primary name, byte-identical to today).
+ *  - embedding      — this target's Embedding instance (its getDimension() is the
+ *                     expectedDim for the rogue-dimension guard AND the source of
+ *                     embedBatchPartial — M7).
+ *  - isHybrid       — process-wide getIsHybrid(); both targets share the same
+ *                     sparse_vector shape so the 0.6B collection inherits hybrid
+ *                     (M6 / R3-HYBRID-SPARSE).
+ *  - priorLedger    — per-model completeness ledger captured at run start (the
+ *                     resume read, M8). Keyed by relativePath. undefined ⇒ empty.
+ *  - existingHashes — per-collection relativePath→fileHash loaded from Milvus
+ *                     (M8). Populated by processFileList before the file loop.
+ */
+interface IndexTarget {
+    modelId: string;
+    collectionName: string;
+    embedding: Embedding;
+    isHybrid: boolean;
+    priorLedger?: Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>;
+    existingHashes?: Map<string, string>;
+}
+
+/** Synthetic IndexTarget ledger key for the writable-shared dual-write (C2). It is
+ *  NOT a queryable model — search/status enumerate canonical model ids by name, so
+ *  this key is invisible to them; it only keeps the shared collection's write-only
+ *  bookkeeping ledger separate from the primary 8B ledger. */
+const WRITABLE_SHARED_MODEL_ID = '__writable_shared__';
+
 export class Context {
     private embedding: Embedding;
+    private secondaryEmbedding?: Embedding;
     private vectorDatabase: VectorDatabase;
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
@@ -145,6 +197,11 @@ export class Context {
             model: 'text-embedding-3-small',
             ...(envManager.get('OPENAI_BASE_URL') && { baseURL: envManager.get('OPENAI_BASE_URL') })
         });
+
+        // Optional secondary embedding instance (dual-embedding, Option B / LD-2).
+        // undefined when no secondary is configured ⇒ buildIndexTargets() returns a
+        // single target ⇒ the index/delete path is byte-identical to single-model.
+        this.secondaryEmbedding = config.secondaryEmbedding;
 
         if (!config.vectorDatabase) {
             throw new Error('VectorDatabase is required. Please provide a vectorDatabase instance in the config.');
@@ -308,45 +365,145 @@ export class Context {
     }
 
     /**
+     * The CANONICAL model ids active for this run (SEAM-2 / R-C4 single
+     * enumerator). Always the primary (8B); the secondary (0.6B) is added only
+     * when a secondary embedding instance is configured. The synthetic
+     * '__writable_shared__' target is NOT a model and is intentionally excluded —
+     * status/clear/search enumerate models by name via this helper, so the shared
+     * collection's write-only bookkeeping never leaks into those surfaces.
+     */
+    public getActiveModelIds(): string[] {
+        const ids: string[] = [DEFAULT_PRIMARY_MODEL_ID];
+        if (this.secondaryEmbedding) {
+            ids.push(envManager.get('RABBITMQ_SECONDARY_MODEL') || 'qwen3-embedding-0.6b');
+        }
+        return ids;
+    }
+
+    /**
+     * Resolve the Milvus collection name for a specific embedding model
+     * (Option B — one collection per model). Mirrors the MILVUS_COLLECTION_PRIVATE
+     * override pattern in getCollectionName.
+     *
+     *  - Primary (collectionSuffix === '') ⇒ the EXISTING getCollectionName result,
+     *    byte-identical to single-model today (LD-3).
+     *  - Secondary ⇒ MILVUS_COLLECTION_PRIVATE_0P6B verbatim if set, else
+     *    base + registry suffix (e.g. claude_context_own ⇒ claude_context_own_0p6b).
+     *  - Unknown model id ⇒ getModelSpec throws (fail-closed, LD-1).
+     */
+    public getCollectionNameForModel(codebasePath: string, modelId: string): string {
+        const spec = getModelSpec(modelId);
+        if (spec.collectionSuffix === '') {
+            return this.getCollectionName(codebasePath);
+        }
+        const override = envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B');
+        if (override) {
+            return override;
+        }
+        return this.getCollectionName(codebasePath) + spec.collectionSuffix;
+    }
+
+    /**
+     * Build the per-run IndexTarget array (the SHARED owner used by
+     * prepareCollection, processFileList, the per-target delete, and the syncer —
+     * Residual-Risk-1's "one IndexTarget-array builder").
+     *
+     * Emits the primary (8B) target FIRST = { DEFAULT_PRIMARY_MODEL_ID,
+     * getCollectionName, this.embedding }. Then (C2) appends the writable-shared
+     * target — a SAME-INSTANCE target (same embedding/dimension as the primary,
+     * distinct collection, synthetic '__writable_shared__' ledger key) — replacing
+     * the old inline dual-write (P1: a chunk is written to the shared collection
+     * exactly once, as this target, never inline). Finally, when a secondary
+     * embedding instance is configured, appends the 0.6B target { secondary model
+     * id, *_0p6b, this.secondaryEmbedding }.
+     *
+     * Single-model with no writable-shared ⇒ length 1, collectionName ===
+     * getCollectionName(path), embedding === this.embedding ⇒ the whole inner loop
+     * is byte-identical.
+     */
+    private buildIndexTargets(
+        codebasePath: string,
+        priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>,
+    ): IndexTarget[] {
+        const isHybrid = this.getIsHybrid();
+        const primaryCollectionName = this.getCollectionNameForModel(codebasePath, DEFAULT_PRIMARY_MODEL_ID);
+        const targets: IndexTarget[] = [{
+            modelId: DEFAULT_PRIMARY_MODEL_ID,
+            collectionName: primaryCollectionName,
+            embedding: this.embedding,
+            isHybrid,
+        }];
+
+        // C2 (rev1.2): writable-shared is a SAME-INSTANCE target (same dim as
+        // primary), NOT inline. Appended after the primary, before the secondary,
+        // so its dimension is the primary's and it is written exactly once.
+        const ws = this.getWritableSharedCollectionName();
+        if (ws && ws !== primaryCollectionName) {
+            targets.push({
+                modelId: WRITABLE_SHARED_MODEL_ID,        // synthetic key; never a queryable model
+                collectionName: ws,
+                embedding: this.embedding,                // same instance/dimension as primary
+                isHybrid,
+                priorLedger: priorLedgersByModel?.get(DEFAULT_PRIMARY_MODEL_ID) ?? new Map(),
+            });
+        }
+
+        if (this.secondaryEmbedding) {
+            const secId = envManager.get('RABBITMQ_SECONDARY_MODEL') || 'qwen3-embedding-0.6b';
+            targets.push({
+                modelId: secId,
+                collectionName: this.getCollectionNameForModel(codebasePath, secId),
+                embedding: this.secondaryEmbedding,
+                isHybrid,
+            });
+        }
+        return targets;
+    }
+
+    /**
      * Index a codebase for semantic search
      * @param codebasePath Codebase root path
      * @param progressCallback Optional progress callback function
-     * @param onFileComplete Optional per-file completeness callback. Fires once
-     *        per produced file: complete:true ⇔ every chunk the splitter produced
-     *        for that file was embedded AND inserted; complete:false otherwise
-     *        (failed chunk, chunk-limit truncation). Drives the snapshot
-     *        completeness ledger (Commit 3/4). Core never imports the mcp package
-     *        — this callback is the only bridge.
+     * @param onFileComplete Optional per-(file × model) completeness callback (M8).
+     *        Fires once per produced (file × IndexTarget): complete:true ⇔ every
+     *        chunk the splitter produced for that file was embedded AND inserted FOR
+     *        THAT MODEL; complete:false otherwise (failed chunk, chunk-limit
+     *        truncation, delete-on-change failure recovery). The first arg is the
+     *        modelId (canonical id, or the synthetic '__writable_shared__' key for
+     *        the dual-write target). Drives the per-model snapshot completeness
+     *        ledger. Core never imports the mcp package — this callback is the only
+     *        bridge.
      * @param forceReindex Whether to recreate the collection even if it exists
-     * @param priorLedger Optional per-file completeness ledger from a prior run
-     *        (the snapshot loaded at MCP startup). Keyed by relativePath. Read by
-     *        the resume skip (Commit 4/4): a file may be skipped ONLY when Milvus
-     *        already has it at the same hash AND this ledger says it fully
-     *        completed at that same hash. A partially-indexed file has
-     *        matching-hash chunks but complete:false, so it must be re-embedded.
-     *        Defined inline here — core must NOT import mcp's FileCompleteness.
+     * @param priorLedgersByModel Optional per-MODEL prior-run completeness ledgers
+     *        (the snapshot loaded at MCP startup), keyed by modelId → (relativePath
+     *        → { complete, fileHash, chunkCount? }). Read by the per-target resume
+     *        skip (M8): a target skips a file ONLY when its OWN collection has it at
+     *        the same hash AND its OWN ledger says complete:true at that same hash.
+     *        A target whose ledger disagrees re-embeds even if another target is
+     *        complete (NOT all-or-nothing). Defined inline — core must NOT import
+     *        mcp's FileCompleteness.
      * @returns Indexing statistics
      */
     async indexCodebase(
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
-        onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
+        onFileComplete?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
         forceReindex: boolean = false,
-        priorLedger?: Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>
+        priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         // Scope project-`.env` reads (MILVUS_COLLECTION_PRIVATE, _SHARED, _STRATEGY, etc.)
         // to this call only via AsyncLocalStorage. Critical for parallel safety:
         // sibling indexCodebase() calls must not see each other's project context.
         // Bug history: see docs/lufftw/bugfix-2026-05-04-envmanager-concurrency.md
-        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, onFileComplete, forceReindex, priorLedger));
+        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, onFileComplete, forceReindex, priorLedgersByModel));
     }
 
     private async _indexCodebaseImpl(
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
-        onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
+        onFileComplete?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
         forceReindex: boolean = false,
-        priorLedger?: Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>
+        priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
@@ -392,7 +549,7 @@ export class Context {
                 });
             },
             onFileComplete,
-            priorLedger
+            priorLedgersByModel
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
@@ -422,8 +579,11 @@ export class Context {
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
     ): Promise<{ added: number, removed: number, modified: number }> {
-        const collectionName = this.getCollectionName(codebasePath);
-        const synchronizer = this.synchronizers.get(collectionName);
+        // P2: the syncer is the SECOND live entry point — bring it under the same
+        // IndexTarget abstraction so a user edit can't desync the secondary _0p6b.
+        const targets = this.buildIndexTargets(codebasePath);
+        const primaryCollection = targets[0].collectionName;   // synchronizer key (filesystem-tracked, model-blind)
+        const synchronizer = this.synchronizers.get(primaryCollection);
 
         if (!synchronizer) {
             // Load project-specific ignore patterns before creating FileSynchronizer
@@ -432,10 +592,10 @@ export class Context {
             // To be safe, let's initialize if it's not there.
             const newSynchronizer = new FileSynchronizer(codebasePath, this.ignorePatterns, this.includeDotDirs, this.supportedExtensions);
             await newSynchronizer.initialize();
-            this.synchronizers.set(collectionName, newSynchronizer);
+            this.synchronizers.set(primaryCollection, newSynchronizer);
         }
 
-        const currentSynchronizer = this.synchronizers.get(collectionName)!;
+        const currentSynchronizer = this.synchronizers.get(primaryCollection)!;
 
         progressCallback?.({ phase: 'Checking for file changes...', current: 0, total: 100, percentage: 0 });
         const { added, removed, modified } = await currentSynchronizer.checkForChanges();
@@ -456,28 +616,35 @@ export class Context {
             progressCallback?.({ phase, current: processedChanges, total: totalChanges, percentage });
         };
 
-        // Handle removed files
+        // Removed + modified files: delete stale chunks from EVERY target's
+        // collection (P2 — else _0p6b keeps orphaned rows for the edited path).
         for (const file of removed) {
-            await this.deleteFileChunks(collectionName, file);
+            for (const target of targets) {
+                await this.deleteFileChunks(target.collectionName, file);
+            }
             updateProgress(`Removed ${file}`);
         }
-
-        // Handle modified files
         for (const file of modified) {
-            await this.deleteFileChunks(collectionName, file);
+            for (const target of targets) {
+                await this.deleteFileChunks(target.collectionName, file);
+            }
             updateProgress(`Deleted old chunks for ${file}`);
         }
 
-        // Handle added and modified files
+        // Added + modified files: re-embed for ALL targets via processFileList.
+        // Empty per-model prior ledgers ⇒ every target re-embeds the changed set
+        // (we already deleted stale rows above; upsert is idempotent by PK). The
+        // syncer does not persist the completeness ledger (snapshot writes happen
+        // in the index path); pass a no-op onFileComplete so processFileList's new
+        // arity is satisfied.
         const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
-
         if (filesToIndex.length > 0) {
             await this.processFileList(
                 filesToIndex,
                 codebasePath,
-                (filePath, fileIndex, totalFiles) => {
-                    updateProgress(`Indexed ${filePath} (${fileIndex}/${totalFiles})`);
-                }
+                (filePath, fileIndex, totalFiles) => { updateProgress(`Indexed ${filePath} (${fileIndex}/${totalFiles})`); },
+                undefined,                 // syncer does not write the per-model ledger here
+                new Map(),                 // empty per-model prior ledgers ⇒ re-embed the changed set for every target
             );
         }
 
@@ -772,47 +939,70 @@ export class Context {
     }
 
     /**
-     * Prepare vector collection
+     * Prepare vector collection(s) — one per active IndexTarget (M6, Option B).
+     *
+     * For each canonical-model target: hasCollection(target.collectionName); if
+     * missing, create with target.embedding.detectDimension() (4096 for 8B, 1024
+     * for 0.6B) using the SAME hybrid/non-hybrid branch — the secondary inherits
+     * the process-wide getIsHybrid(), so the _0p6b collection gets the same
+     * sparse_vector shape and per-target hybrid upsert populates the sparse field
+     * (R3-HYBRID-SPARSE).
+     *
+     * The writable-shared target (synthetic '__writable_shared__' key, C2) is
+     * skipped in this loop and prepared ONCE below at the PRIMARY target's
+     * dimension — a 1024-dim 0.6B vector must never be written into the 4096-dim
+     * shared space (M5/M6 dimension-lock), and we keep the descriptive create
+     * message for the shared collection.
+     *
+     * Single-model (no secondary, no writable-shared) ⇒ targets.length === 1 ⇒
+     * the create path is byte-identical.
      */
     private async prepareCollection(codebasePath: string, forceReindex: boolean = false): Promise<void> {
         const isHybrid = this.getIsHybrid();
         const collectionType = isHybrid === true ? 'hybrid vector' : 'vector';
-        console.log(`[Context] 🔧 Preparing ${collectionType} collection for codebase: ${codebasePath}${forceReindex ? ' (FORCE REINDEX)' : ''}`);
-        const collectionName = this.getCollectionName(codebasePath);
-
-        // Check if collection already exists
-        const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
-
-        if (collectionExists && !forceReindex) {
-            console.log(`📋 Collection ${collectionName} already exists, skipping creation`);
-            return;
-        }
-
-        if (collectionExists && forceReindex) {
-            console.log(`[Context] 🗑️  Dropping existing collection ${collectionName} for force reindex...`);
-            await this.vectorDatabase.dropCollection(collectionName);
-            console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
-        }
-
-        console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
-        const dimension = await this.embedding.detectDimension();
-        console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
+        const targets = this.buildIndexTargets(codebasePath);
         const dirName = path.basename(codebasePath);
 
-        if (isHybrid === true) {
-            await this.vectorDatabase.createHybridCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
-        } else {
-            await this.vectorDatabase.createCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
+        for (const target of targets) {
+            if (target.modelId === WRITABLE_SHARED_MODEL_ID) {
+                continue; // handled once below at primary dim
+            }
+            console.log(`[Context] 🔧 Preparing ${collectionType} collection '${target.collectionName}' for model ${target.modelId}${forceReindex ? ' (FORCE REINDEX)' : ''}`);
+
+            const collectionExists = await this.vectorDatabase.hasCollection(target.collectionName);
+
+            if (collectionExists && !forceReindex) {
+                console.log(`📋 Collection ${target.collectionName} already exists, skipping creation`);
+                continue;
+            }
+
+            if (collectionExists && forceReindex) {
+                console.log(`[Context] 🗑️  Dropping existing collection ${target.collectionName} for force reindex...`);
+                await this.vectorDatabase.dropCollection(target.collectionName);
+                console.log(`[Context] ✅ Collection ${target.collectionName} dropped successfully`);
+            }
+
+            console.log(`[Context] 🔍 Detecting embedding dimension for ${target.embedding.getProvider()} provider (model ${target.modelId})...`);
+            const dimension = await target.embedding.detectDimension();
+            console.log(`[Context] 📏 Detected dimension: ${dimension} for ${target.embedding.getProvider()}`);
+
+            if (target.isHybrid === true) {
+                await this.vectorDatabase.createHybridCollection(target.collectionName, dimension, `codebasePath:${codebasePath}`);
+            } else {
+                await this.vectorDatabase.createCollection(target.collectionName, dimension, `codebasePath:${codebasePath}`);
+            }
+            console.log(`[Context] ✅ Collection ${target.collectionName} created successfully (dimension: ${dimension})`);
         }
 
-        console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);
-
-        // Also prepare writable shared collection if configured (dual-write support)
+        // Writable shared collection (dual-write) — prepared ONCE at the PRIMARY
+        // target's dimension. The primary is targets[0] by construction.
+        const primary = targets[0];
         const writableShared = this.getWritableSharedCollectionName();
-        if (writableShared && writableShared !== collectionName) {
+        if (writableShared && writableShared !== primary.collectionName) {
             const sharedExists = await this.vectorDatabase.hasCollection(writableShared);
             if (!sharedExists) {
-                console.log(`[Context] 🔧 Also preparing writable shared collection: ${writableShared}`);
+                const dimension = await primary.embedding.detectDimension();
+                console.log(`[Context] 🔧 Also preparing writable shared collection: ${writableShared} (dim ${dimension})`);
                 if (isHybrid === true) {
                     await this.vectorDatabase.createHybridCollection(writableShared, dimension, `Shared hybrid index (writable from ${dirName})`);
                 } else {
@@ -911,10 +1101,9 @@ export class Context {
         filePaths: string[],
         codebasePath: string,
         onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void,
-        onFileComplete?: (relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
-        priorLedger?: Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>
+        onFileComplete?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
+        priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>,
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
-        const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
         const CHUNK_LIMIT = 450000;
         // 2026-05-05 deepinfra-rogue-worker incident: silently absorbing every
@@ -930,252 +1119,208 @@ export class Context {
         );
         console.log(`[Context] 🔧 Using EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE}`);
 
-        // ── Incremental indexing: load existing file hashes ──
-        const collectionName = this.getCollectionName(codebasePath);
-        const existingHashes = await this.loadExistingFileHashes(collectionName);
-        let skippedFiles = 0;
-        let changedFiles = 0;
-        let deletedChunkFiles = 0;
+        // ── Build the per-run targets and hydrate each with its OWN existingHashes
+        //    (loadExistingFileHashes is already collection-parameterized) and its
+        //    OWN priorLedger (M8 — per-(codebase × model) resume state). ──
+        const targets = this.buildIndexTargets(codebasePath, priorLedgersByModel);
+        for (const target of targets) {
+            target.existingHashes = await this.loadExistingFileHashes(target.collectionName);
+            // The writable-shared target shares the primary 8B ledger key by design
+            // (buildIndexTargets already seeded its priorLedger); for canonical
+            // targets, pull the per-model ledger from the map (empty when absent).
+            if (target.priorLedger === undefined) {
+                target.priorLedger = priorLedgersByModel?.get(target.modelId) ?? new Map();
+            }
+        }
 
-        let chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string; relativePath: string }> = [];
+        // Per-target accounting (M8 — each target tracks its own progress so
+        // completeness is per (file × model)).
+        type Acc = {
+            fileChunkTotals: Map<string, number>;
+            fileProgress: Map<string, { produced: number; inserted: number }>;
+            fileHashByPath: Map<string, string>;
+            firedComplete: Set<string>;
+            buffer: Array<{ chunk: CodeChunk; codebasePath: string; relativePath: string }>;
+            consecutiveBatchErrors: number;
+        };
+        const acc = new Map<string, Acc>();
+        for (const t of targets) {
+            acc.set(t.modelId, {
+                fileChunkTotals: new Map(), fileProgress: new Map(), fileHashByPath: new Map(),
+                firedComplete: new Set(), buffer: [], consecutiveBatchErrors: 0,
+            });
+        }
+
         let processedFiles = 0;
         let totalChunks = 0;
         let limitReached = false;
-        let consecutiveBatchErrors = 0;
+        let skippedAllTargets = 0;
+        let changedAnyTarget = 0;
 
-        // Per-file accounting threaded through the batch reducer (Commit 2/4).
-        //  - fileChunkTotals: how many chunks the splitter produced per file.
-        //  - fileProgress:    cumulative produced/inserted as batches drain.
-        // Read for completeness here (Commit 3/4) to drive onFileComplete.
-        const fileChunkTotals = new Map<string, number>();
-        const fileProgress = new Map<string, { produced: number; inserted: number }>();
-
-        // Completeness ledger plumbing (Commit 3/4).
-        //  - fileHashByPath: the per-file SHA-256 captured at split time, so the
-        //    onFileComplete payload carries the exact hash that was embedded into
-        //    each chunk's metadata (lets a resume compare hashes durably).
-        //  - firedComplete:  guards against double-firing for a file once we have
-        //    emitted a terminal (complete:true OR complete:false) verdict.
-        const fileHashByPath = new Map<string, string>();
-        const firedComplete = new Set<string>();
-
-        // Fire complete:true for every file whose FULL splitter output has been
-        // embedded AND inserted. The `produced === total` arm is load-bearing:
-        // it guards the chunk-limit orphan — a CHUNK_LIMIT-truncated file has
-        // produced < total even when produced === inserted, so it must NOT be
-        // reported complete here (the end-of-run sweep emits complete:false).
-        const fireCompleted = () => {
+        // Fire complete:true for files whose FULL splitter output has been embedded
+        // AND inserted FOR A GIVEN TARGET. Per target (M8).
+        const fireCompletedFor = (target: IndexTarget) => {
             if (!onFileComplete) return;
-            for (const [rp, p] of fileProgress) {
-                if (firedComplete.has(rp)) continue;
-                const total = fileChunkTotals.get(rp);
-                // complete ⇔ every produced chunk was inserted AND we produced the file's
-                // FULL splitter count (guards the chunk-limit orphan: a CHUNK_LIMIT-truncated
-                // file has produced < total even when produced === inserted).
+            const a = acc.get(target.modelId)!;
+            for (const [rp, p] of a.fileProgress) {
+                if (a.firedComplete.has(rp)) continue;
+                const total = a.fileChunkTotals.get(rp);
                 if (total !== undefined && p.produced === p.inserted && p.produced === total) {
-                    onFileComplete(rp, { complete: true, fileHash: fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
-                    firedComplete.add(rp);
+                    onFileComplete(target.modelId, rp, { complete: true, fileHash: a.fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
+                    a.firedComplete.add(rp);
                 }
             }
         };
 
+        // Flush one target's buffer through processChunkBuffer with that target's
+        // OWN three-way abort counter. Per-target abort isolation: a REAL-abort in
+        // the 8B target throws ONLY here for the 8B target; the 0.6B target's flush
+        // (separate call) is unaffected and vice versa (M7). The thrown abort is
+        // the SAME __isIndexAbort sentinel so the outer per-file catch re-throws it.
+        const flushTarget = async (target: IndexTarget, isFinal: boolean) => {
+            const a = acc.get(target.modelId)!;
+            if (a.buffer.length === 0) return;
+            const r = await this.processChunkBuffer(target, a.buffer);
+            a.buffer = [];
+            this.mergeFileProgress(a.fileProgress, r.perFile);
+            fireCompletedFor(target);
+            if (r.realFailures > 0) {
+                a.consecutiveBatchErrors++;
+                const searchType = target.isHybrid === true ? 'hybrid' : 'regular';
+                console.error(
+                    `[Context] ❌ [${target.modelId}] ${isFinal ? 'Final ' : ''}chunk batch for ${searchType} had ${r.realFailures} ` +
+                    `REAL-class slot failure(s) (${a.consecutiveBatchErrors}/${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive)`,
+                );
+                if (a.consecutiveBatchErrors >= MAX_CONSECUTIVE_BATCH_ERRORS) {
+                    throw this.makeAbortError(MAX_CONSECUTIVE_BATCH_ERRORS);
+                }
+            } else if (r.successes > 0) {
+                a.consecutiveBatchErrors = 0;
+            }
+            // pure WAIT-class: neutral.
+        };
+
         for (let i = 0; i < filePaths.length; i++) {
             const filePath = filePaths[i];
-
             try {
-                // ── File hash check: skip unchanged + verified-complete files ──
                 const relativePath = path.relative(codebasePath, filePath);
                 const fileHash = await this.computeFileHash(filePath);
-                const existingHash = existingHashes.get(relativePath);
-                const led = priorLedger?.get(relativePath);   // { complete, fileHash, chunkCount? } | undefined
 
-                // Skip ONLY when Milvus has the file at this hash AND the ledger says it
-                // fully completed at the SAME hash. The ledger is the completeness
-                // authority (P30): a partially-indexed file has matching-hash chunks but
-                // complete:false, so the old `existingHash === fileHash` test alone would
-                // wrongly skip it (the live-discovered partial-resume bug).
-                if (existingHash === fileHash && led?.complete === true && led.fileHash === fileHash) {
-                    skippedFiles++;
-                    processedFiles++;
-                    // P46: re-fire the ledger entry on skip so it survives this run's
-                    // snapshot rewrite (otherwise a skipped file's entry could be dropped
-                    // on the next save and a subsequent resume would re-process it).
-                    onFileComplete?.(relativePath, { complete: true, fileHash, chunkCount: led.chunkCount ?? 0 });
-                    onFileProcessed?.(filePath, i + 1, filePaths.length);
-                    continue;
-                }
-
-                // Not verified-complete → (re)embed.
-                // Phase 3: with idempotent upsert, only a CHANGED file (different hash → every
-                // chunk's deterministic PK changes → old rows orphaned) needs a delete-by-path
-                // orphan sweep. A same-hash-but-incomplete / absent-ledger file is re-embedded
-                // via upsert, which overwrites the present chunks and inserts the missing ones
-                // with no kill-window and no duplicate PKs — so NO pre-delete for that case.
-                // This removes Add-2's delete-then-insert kill-window for the partial-resume case.
-                if (existingHash && existingHash !== fileHash) {
-                    changedFiles++;
-                    try {
-                        const escapedPath = relativePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-                        await this.vectorDatabase.deleteByFilter(
-                            collectionName,
-                            `relativePath == "${escapedPath}"`
-                        );
-                        // Also delete from shared collection if dual-write is enabled
-                        const writableShared = this.getWritableSharedCollectionName();
-                        if (writableShared && writableShared !== collectionName) {
-                            await this.vectorDatabase.deleteByFilter(
-                                writableShared,
-                                `relativePath == "${escapedPath}"`
-                            );
-                        }
-                        deletedChunkFiles++;
-                    } catch (delError) {
-                        console.warn(`[Context] ⚠️  Failed to delete old chunks for ${relativePath}: ${delError}`);
+                // ── Per-target skip decision (M8) ──
+                // A target "needs" the file unless Milvus has it at this hash AND
+                // that target's ledger says complete:true at the SAME hash.
+                const needers: IndexTarget[] = [];
+                for (const target of targets) {
+                    const existingHash = target.existingHashes!.get(relativePath);
+                    const led = target.priorLedger!.get(relativePath);
+                    const verifiedComplete = existingHash === fileHash && led?.complete === true && led.fileHash === fileHash;
+                    if (verifiedComplete) {
+                        // Re-fire so the per-model ledger entry survives this run's
+                        // snapshot rewrite (P46, now per target).
+                        onFileComplete?.(target.modelId, relativePath, { complete: true, fileHash, chunkCount: led!.chunkCount ?? 0 });
+                        acc.get(target.modelId)!.firedComplete.add(relativePath);
+                    } else {
+                        needers.push(target);
                     }
                 }
 
+                if (needers.length === 0) {
+                    // Every target already has this file complete at this hash.
+                    skippedAllTargets++;
+                    processedFiles++;
+                    onFileProcessed?.(filePath, i + 1, filePaths.length);
+                    continue;
+                }
+                changedAnyTarget++;
+
+                // ── Per-target delete-on-change (LD-6 / P1) ──
+                // Each NEEDING target deletes from its OWN collection only when its
+                // OWN existingHash !== fileHash; on a delete failure that target's
+                // ledger is marked complete:false for recovery.
+                await this.deleteChangedForTargets(needers, relativePath, fileHash, onFileComplete);
+
+                // ── AST split ONCE (model-independent) ──
                 const content = await fs.promises.readFile(filePath, 'utf-8');
                 const language = this.getLanguageFromExtension(path.extname(filePath));
                 const chunks = await this.codeSplitter.split(content, language, filePath);
 
-                // Record how many chunks the splitter produced for this file so
-                // the completeness check (Commit 3) can compare against the
-                // number actually inserted, and capture the file's hash for the
-                // onFileComplete payload.
-                fileChunkTotals.set(relativePath, chunks.length);
-                fileHashByPath.set(relativePath, fileHash);
-
-                // Inject fileHash into each chunk's metadata so future runs can skip
+                // Inject fileHash into each chunk's metadata (model-blind; both
+                // targets reuse the same chunk objects — embedBatchPartial only
+                // reads .content). Record per-target totals/hash for needing targets.
                 for (const chunk of chunks) {
                     chunk.metadata = { ...chunk.metadata, fileHash };
                 }
+                for (const target of needers) {
+                    const a = acc.get(target.modelId)!;
+                    a.fileChunkTotals.set(relativePath, chunks.length);
+                    a.fileHashByPath.set(relativePath, fileHash);
+                }
 
-                // Log files with many chunks or large content
                 if (chunks.length > 50) {
                     console.warn(`[Context] ⚠️  File ${filePath} generated ${chunks.length} chunks (${Math.round(content.length / 1024)}KB)`);
                 } else if (content.length > 100000) {
                     console.log(`📄 Large file ${filePath}: ${Math.round(content.length / 1024)}KB -> ${chunks.length} chunks`);
                 }
 
-                // Add chunks to buffer
+                // Push chunks into EACH needing target's buffer; flush per target
+                // when that target's buffer fills. totalChunks counts splitter work
+                // ONCE (chunk-limit guard is model-independent).
                 for (const chunk of chunks) {
-                    chunkBuffer.push({ chunk, codebasePath, relativePath });
-                    totalChunks++;
-
-                    // Process batch when buffer reaches EMBEDDING_BATCH_SIZE.
-                    // The reducer no longer throws for per-slot embedding faults
-                    // — it returns a BatchOutcome and we apply the three-way
-                    // abort counter (REAL → ++/maybe-abort; clean+productive →
-                    // reset; pure-WAIT → neutral). Only a thrown abort (or a
-                    // genuinely unexpected infra error) escapes here.
-                    if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
-                        const r = await this.processChunkBuffer(chunkBuffer);
-                        chunkBuffer = []; // ALWAYS reset, regardless of outcome
-                        this.mergeFileProgress(fileProgress, r.perFile);
-                        fireCompleted();
-                        if (r.realFailures > 0) {
-                            consecutiveBatchErrors++;
-                            const searchType = isHybrid === true ? 'hybrid' : 'regular';
-                            console.error(
-                                `[Context] ❌ Chunk batch for ${searchType} had ${r.realFailures} ` +
-                                `REAL-class slot failure(s) ` +
-                                `(${consecutiveBatchErrors}/${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive)`,
-                            );
-                            if (consecutiveBatchErrors >= MAX_CONSECUTIVE_BATCH_ERRORS) {
-                                throw this.makeAbortError(MAX_CONSECUTIVE_BATCH_ERRORS);
-                            }
-                        } else if (r.successes > 0) {
-                            // Clean, productive batch — a transient blip is forgiven.
-                            consecutiveBatchErrors = 0;
+                    for (const target of needers) {
+                        const a = acc.get(target.modelId)!;
+                        a.buffer.push({ chunk, codebasePath, relativePath });
+                        if (a.buffer.length >= EMBEDDING_BATCH_SIZE) {
+                            await flushTarget(target, false);
                         }
-                        // pure WAIT-class (realFailures===0 && successes===0):
-                        // leave consecutiveBatchErrors UNCHANGED (neutral).
                     }
-
-                    // Check if chunk limit is reached
+                    totalChunks++;
                     if (totalChunks >= CHUNK_LIMIT) {
                         console.warn(`[Context] ⚠️  Chunk limit of ${CHUNK_LIMIT} reached. Stopping indexing.`);
                         limitReached = true;
-                        break; // Exit the inner loop (over chunks)
+                        break;
                     }
                 }
 
                 processedFiles++;
                 onFileProcessed?.(filePath, i + 1, filePaths.length);
-
-                if (limitReached) {
-                    break; // Exit the outer loop (over files)
-                }
+                if (limitReached) break;
 
             } catch (error) {
-                // The MAX-consecutive abort must NOT be swallowed by this
-                // per-file skip handler — it has to propagate to the caller
-                // (handlers.ts startBackgroundIndexing → indexfailed). Only
-                // genuine per-file faults (unreadable file, splitter crash, an
-                // unexpected infra error from a batch flush) are skipped.
                 if (this.isAbortError(error)) {
-                    throw error;
+                    throw error;   // per-target abort still propagates to handlers.ts → indexfailed
                 }
                 console.warn(`[Context] ⚠️  Skipping file ${filePath}: ${error}`);
             }
         }
 
-        // Process any remaining chunks in the buffer.
-        // Final batch is critical — if it fails we'd end up with a partial
-        // index that the snapshot reports as 'completed', silently losing the
-        // last EMBEDDING_BATCH_SIZE - 1 chunks. The same three-way classification
-        // applies here (REAL → ++/maybe-abort; clean+productive → reset; pure-WAIT
-        // → neutral). The final batch must NOT silently swallow a REAL failure.
-        if (chunkBuffer.length > 0) {
-            const searchType = isHybrid === true ? 'hybrid' : 'regular';
-            console.log(`📝 Processing final batch of ${chunkBuffer.length} chunks for ${searchType}`);
-            const r = await this.processChunkBuffer(chunkBuffer);
-            chunkBuffer = [];
-            this.mergeFileProgress(fileProgress, r.perFile);
-            fireCompleted();
-            if (r.realFailures > 0) {
-                consecutiveBatchErrors++;
-                console.error(
-                    `[Context] ❌ Final chunk batch for ${searchType} had ${r.realFailures} ` +
-                    `REAL-class slot failure(s) ` +
-                    `(${consecutiveBatchErrors}/${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive)`,
-                );
-                if (consecutiveBatchErrors >= MAX_CONSECUTIVE_BATCH_ERRORS) {
-                    throw this.makeAbortError(MAX_CONSECUTIVE_BATCH_ERRORS);
-                }
-            } else if (r.successes > 0) {
-                consecutiveBatchErrors = 0;
+        // Final per-target buffer flush.
+        for (const target of targets) {
+            const a = acc.get(target.modelId)!;
+            if (a.buffer.length > 0) {
+                const searchType = target.isHybrid === true ? 'hybrid' : 'regular';
+                console.log(`📝 [${target.modelId}] Processing final batch of ${a.buffer.length} chunks for ${searchType}`);
+                await flushTarget(target, true);
             }
-            // pure WAIT-class: neutral.
         }
 
-        // End-of-run sweep over the AUTHORITATIVE set of files that went through
-        // the splitter this run (fileChunkTotals). Re-applies the completeness
-        // gate so any file not already fired gets a terminal verdict:
-        //   - complete:true  — produced === inserted === total. Covers 0-chunk
-        //     files (total===0, no fileProgress entry → 0===0===0) which the
-        //     incremental fireCompleted never sees because they never enter a batch.
-        //   - complete:false — a chunk failed to embed/insert (produced > inserted)
-        //     or CHUNK_LIMIT truncated the file mid-way (produced < total).
-        // Iterating fileChunkTotals (not fileProgress) is what lets a legitimately
-        // complete empty/comment-only file get a complete:true ledger entry instead
-        // of no entry at all (which would make Commit 4's resume re-process it forever).
+        // End-of-run completeness sweep, per target (covers 0-chunk files and
+        // partial/truncated files; iterate fileChunkTotals not fileProgress).
         if (onFileComplete) {
-            for (const [rp, total] of fileChunkTotals) {
-                if (firedComplete.has(rp)) continue;
-                const p = fileProgress.get(rp) ?? { produced: 0, inserted: 0 };
-                const complete = p.produced === p.inserted && p.produced === total;
-                onFileComplete(rp, { complete, fileHash: fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
-                firedComplete.add(rp);
+            for (const target of targets) {
+                const a = acc.get(target.modelId)!;
+                for (const [rp, total] of a.fileChunkTotals) {
+                    if (a.firedComplete.has(rp)) continue;
+                    const p = a.fileProgress.get(rp) ?? { produced: 0, inserted: 0 };
+                    const complete = p.produced === p.inserted && p.produced === total;
+                    onFileComplete(target.modelId, rp, { complete, fileHash: a.fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
+                    a.firedComplete.add(rp);
+                }
             }
         }
 
-        // ── Log incremental stats ──
-        if (existingHashes.size > 0) {
-            console.log(`[Context] 📊 Incremental indexing: ${skippedFiles} files unchanged (skipped), ${changedFiles} files changed (re-embedded), ${filePaths.length - skippedFiles - changedFiles} new files`);
-            if (deletedChunkFiles > 0) {
-                console.log(`[Context] 🗑️  Deleted old chunks for ${deletedChunkFiles} changed files`);
-            }
+        const anyExisting = targets.some(t => (t.existingHashes?.size ?? 0) > 0);
+        if (anyExisting) {
+            console.log(`[Context] 📊 Incremental indexing: ${skippedAllTargets} files complete in ALL targets (skipped), ${changedAnyTarget} files needed ≥1 target, ${filePaths.length - skippedAllTargets - changedAnyTarget} files new`);
         }
 
         return {
@@ -1183,6 +1328,44 @@ export class Context {
             totalChunks,
             status: limitReached ? 'limit_reached' : 'completed'
         };
+    }
+
+    /**
+     * Per-target delete-on-change with recovery (LD-6 + P1). Called inside the
+     * per-file loop for the NEEDING targets only. Each target deletes from its OWN
+     * collection only when its OWN existingHash !== fileHash (a CHANGED file's PKs
+     * rotate, orphaning the old rows). The writable-shared target (if present) is
+     * just another IndexTarget here, so it deletes from the shared collection in
+     * its own iteration — there is no monolithic private+shared delete (P1).
+     *
+     * On a target delete FAILURE: write a complete:false ledger entry for THAT
+     * target so the next run re-sweeps that target (pair every abort with
+     * recovery — no silent warn-and-continue). The other targets are unaffected.
+     */
+    private async deleteChangedForTargets(
+        targets: IndexTarget[],
+        relativePath: string,
+        fileHash: string,
+        onFileComplete?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
+    ): Promise<void> {
+        const escapedPath = relativePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        for (const target of targets) {
+            const existingHash = target.existingHashes?.get(relativePath);
+            if (existingHash && existingHash !== fileHash) {
+                try {
+                    await this.vectorDatabase.deleteByFilter(
+                        target.collectionName,
+                        `relativePath == "${escapedPath}"`,
+                    );
+                    console.log(`[Context] 🗑️  [${target.modelId}] Deleted stale chunks for ${relativePath} from ${target.collectionName}`);
+                } catch (delError) {
+                    // Recovery, not silent warn: mark this file incomplete in THIS
+                    // target's ledger so the next run re-embeds it for this target.
+                    console.error(`[Context] ❌ [${target.modelId}] Delete-on-change FAILED for ${relativePath} in ${target.collectionName}; marking complete:false for recovery:`, delError);
+                    onFileComplete?.(target.modelId, relativePath, { complete: false, fileHash, chunkCount: 0 });
+                }
+            }
+        }
     }
 
     /**
@@ -1225,12 +1408,13 @@ export class Context {
     }
 
     /**
-     * Process accumulated chunk buffer. Forwards the FULL tuple (including
-     * relativePath) to processChunkBatch and returns its BatchOutcome so
-     * per-file accounting survives. Does NOT throw for per-slot embedding faults
-     * — those are classified inside the returned outcome.
+     * Process accumulated chunk buffer for a SINGLE IndexTarget (M7). Forwards
+     * the FULL tuple plus the target to processChunkBatch and returns its
+     * BatchOutcome so per-file accounting survives. Does NOT throw for per-slot
+     * embedding faults — those are classified inside the returned outcome.
      */
     private async processChunkBuffer(
+        target: IndexTarget,
         chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string; relativePath: string }>,
     ): Promise<BatchOutcome> {
         if (chunkBuffer.length === 0) {
@@ -1243,28 +1427,33 @@ export class Context {
             0,
         );
 
-        const isHybrid = this.getIsHybrid();
-        const searchType = isHybrid === true ? 'hybrid' : 'regular';
-        console.log(`[Context] 🔄 Processing batch of ${chunkBuffer.length} chunks (~${estimatedTokens} tokens) for ${searchType}`);
-        return this.processChunkBatch(chunkBuffer);
+        const searchType = target.isHybrid === true ? 'hybrid' : 'regular';
+        console.log(`[Context] 🔄 [${target.modelId}] Processing batch of ${chunkBuffer.length} chunks (~${estimatedTokens} tokens) for ${searchType}`);
+        return this.processChunkBatch(target, chunkBuffer);
     }
 
     /**
-     * Process a batch of chunks with partial-tolerant embedding.
+     * Process a batch of chunks for ONE IndexTarget with partial-tolerant
+     * embedding (M7 + P1).
      *
-     * Consumes embedBatchPartial's index-aligned per-item results, builds
-     * documents from ONLY the succeeded slots (paired indices — never positional
-     * re-index after dropping a slot), inserts them, and returns a BatchOutcome
-     * that classifies each slot for the three-way abort counter. Per-slot
-     * embedding faults and Milvus insert failures are recorded in the outcome
-     * (never thrown); only genuinely unexpected conditions propagate.
+     * Reads target.embedding for BOTH the expectedDim rogue-dimension guard AND
+     * embedBatchPartial, and target.collectionName for the upsert. The
+     * BatchOutcome / REAL-vs-WAIT classification is unchanged and is per target,
+     * so the three-way abort counter is evaluated per target by the caller
+     * (per-target abort isolation: an 8B REAL-abort throws only inside the 8B
+     * target's loop; the 0.6B pass runs in its own loop iteration — see
+     * processFileList M7/M8). The residual inline writable-shared upsert is GONE:
+     * writable-shared is written ONLY as its own same-instance IndexTarget (added
+     * by buildIndexTargets when MILVUS_WRITABLE_SHARED is set), so a chunk is
+     * never double-written into one collection (P1 — else duplicate-PK).
      */
     private async processChunkBatch(
+        target: IndexTarget,
         items: Array<{ chunk: CodeChunk; codebasePath: string; relativePath: string }>,
     ): Promise<BatchOutcome> {
-        const isHybrid = this.getIsHybrid();
+        const isHybrid = target.isHybrid;
         const codebasePath = items[0].codebasePath;
-        const expectedDim = this.embedding.getDimension();
+        const expectedDim = target.embedding.getDimension();
 
         const perFile = new Map<string, { produced: number; inserted: number }>();
         const bump = (rp: string, key: 'produced' | 'inserted', n = 1) => {
@@ -1291,10 +1480,10 @@ export class Context {
         // instead of throwing).
         let results: EmbedItemResult[];
         try {
-            results = await this.embedding.embedBatchPartial(items.map(it => it.chunk.content));
+            results = await target.embedding.embedBatchPartial(items.map(it => it.chunk.content));
         } catch (embedErr) {
             console.error(
-                `[Context] ❌ Whole-batch embed failed (REAL): ${embedErr instanceof Error ? embedErr.message : String(embedErr)}`,
+                `[Context] ❌ [${target.modelId}] Whole-batch embed failed (REAL): ${embedErr instanceof Error ? embedErr.message : String(embedErr)}`,
             );
             return { perFile, realFailures: items.length, waitFailures: 0, successes: 0 };
         }
@@ -1316,7 +1505,7 @@ export class Context {
                 // REAL bad-dimension fault and do NOT insert it.
                 if (!Array.isArray(res.vector) || res.vector.length !== expectedDim) {
                     console.error(
-                        `[Context] ❌ Rogue dimension on ok slot ${i}: got ${res.vector?.length}, expected ${expectedDim} (bad-dimension, REAL)`,
+                        `[Context] ❌ [${target.modelId}] Rogue dimension on ok slot ${i}: got ${res.vector?.length}, expected ${expectedDim} (bad-dimension, REAL)`,
                     );
                     realFailures++;
                     continue;
@@ -1361,30 +1550,17 @@ export class Context {
         let successes = 0;
 
         if (docs.length > 0) {
-            const collectionName = this.getCollectionName(codebasePath);
-            const writableShared = this.getWritableSharedCollectionName();
             try {
-                // Phase 3: idempotent native upsert (insert-or-overwrite by deterministic PK).
-                // Commit 1's result-check is preserved on the upsert path — upsert/upsertHybrid
-                // THROW on a non-Success Milvus result. A throw here means NONE of these docs
-                // landed, so the whole batch's docs count as REAL upsert-error failures.
-                // NOTE (dual-write asymmetry): if the private upsert succeeds but
-                // the shared dual-write throws, the whole batch counts REAL and
-                // `inserted` stays 0 for those chunks even though the private
-                // collection has them. This is intentionally pessimistic — the
-                // state is still safe (deterministic generateId PKs make a re-run
-                // idempotent), the ledger just under-counts. Dual-write is enabled
-                // only on a few maintainer projects, so blast radius is small.
+                // Idempotent native upsert into THIS target's collection only
+                // (insert-or-overwrite by deterministic PK). upsert/upsertHybrid
+                // THROW on a non-Success Milvus result; a throw means NONE of these
+                // docs landed, so the whole batch's docs count as REAL upsert-error
+                // failures. (P1: no inline writable-shared dual-write here —
+                // writable-shared is its own IndexTarget when configured.)
                 if (isHybrid === true) {
-                    await this.vectorDatabase.upsertHybrid(collectionName, docs);
-                    if (writableShared && writableShared !== collectionName) {
-                        await this.vectorDatabase.upsertHybrid(writableShared, docs);
-                    }
+                    await this.vectorDatabase.upsertHybrid(target.collectionName, docs);
                 } else {
-                    await this.vectorDatabase.upsert(collectionName, docs);
-                    if (writableShared && writableShared !== collectionName) {
-                        await this.vectorDatabase.upsert(writableShared, docs);
-                    }
+                    await this.vectorDatabase.upsert(target.collectionName, docs);
                 }
                 // Confirmed upserted — tally per file.
                 for (const di of docItems) {
@@ -1394,7 +1570,7 @@ export class Context {
             } catch (insertError) {
                 // Classify the failed upsert as REAL (insert-error) for every
                 // doc and return the outcome so the three-way counter decides.
-                console.error(`[Context] ❌ Upsert failed for batch (${docs.length} docs), counting as REAL insert-error:`, insertError);
+                console.error(`[Context] ❌ [${target.modelId}] Upsert failed for batch (${docs.length} docs) into ${target.collectionName}, counting as REAL insert-error:`, insertError);
                 realFailures += docs.length;
             }
         }

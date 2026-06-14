@@ -159,8 +159,13 @@ function runFileList(opts: {
                 opts.files,
                 '/repo',
                 undefined, // onFileProcessed
-                (rp: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => {
-                    calls.push([rp, info]);
+                // New per-model arity (modelId, rp, info). Single-model path fires
+                // exclusively for the primary 8B target; record only those so the
+                // existing single-model assertions stay valid (byte-identical).
+                (modelId: string, rp: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => {
+                    if (modelId === 'qwen3-embedding-8b') {
+                        calls.push([rp, info]);
+                    }
                 },
             );
         } finally {

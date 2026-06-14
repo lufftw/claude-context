@@ -96,6 +96,18 @@ function makeContext(opts: {
     return ctx;
 }
 
+// Build the single primary IndexTarget that processChunkBatch/Buffer now require
+// (M7). Reads the injected fake embedding + getIsHybrid so the dim-guard / embed /
+// upsert collection match what these unit tests expect (collection 'c1').
+function targetFor(ctx: Context): any {
+    return {
+        modelId: 'qwen3-embedding-8b',
+        collectionName: 'c1',
+        embedding: (ctx as any).embedding,
+        isHybrid: (ctx as any).getIsHybrid(),
+    };
+}
+
 // ── 1. Partial insert: succeeded slots only, paired indices ───────────────
 
 describe('processChunkBatch — partial insert (paired indices)', () => {
@@ -114,7 +126,7 @@ describe('processChunkBatch — partial insert (paired indices)', () => {
             { chunk: makeChunk('/repo/b.ts', 1, 'CCC'), codebasePath: '/repo', relativePath: 'b.ts' },
         ];
 
-        const outcome = await (ctx as any).processChunkBatch(items);
+        const outcome = await (ctx as any).processChunkBatch(targetFor(ctx), items);
 
         expect(outcome.successes).toBe(2);
         expect(outcome.realFailures).toBe(1);
@@ -159,7 +171,7 @@ describe('processChunkBatch — whole-batch embed throw counts as REAL', () => {
         ];
 
         // Must NOT throw — must return a REAL outcome so the three-way counter sees it.
-        const outcome = await (ctx as any).processChunkBatch(items);
+        const outcome = await (ctx as any).processChunkBatch(targetFor(ctx), items);
 
         expect(outcome.realFailures).toBe(2);
         expect(outcome.successes).toBe(0);
@@ -289,7 +301,7 @@ describe('processChunkBatch — rogue dimension counts as REAL', () => {
         const items = [
             { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
         ];
-        const outcome = await (ctx as any).processChunkBatch(items);
+        const outcome = await (ctx as any).processChunkBatch(targetFor(ctx), items);
         expect(outcome.realFailures).toBe(1);
         expect(outcome.successes).toBe(0);
         expect(outcome.perFile.get('a.ts')).toEqual({ produced: 1, inserted: 0 });
@@ -341,7 +353,7 @@ describe('processChunkBatch — insert throw counts as REAL (insert-error)', () 
             { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
             { chunk: makeChunk('/repo/a.ts', 3, 'BBB'), codebasePath: '/repo', relativePath: 'a.ts' },
         ];
-        const outcome = await (ctx as any).processChunkBatch(items);
+        const outcome = await (ctx as any).processChunkBatch(targetFor(ctx), items);
         expect(outcome.realFailures).toBe(2);
         expect(outcome.successes).toBe(0);
         expect(outcome.perFile.get('a.ts')).toEqual({ produced: 2, inserted: 0 });
@@ -365,7 +377,7 @@ describe('processChunkBatch — Phase 3 uses upsert/upsertHybrid (not insert/ins
             { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
             { chunk: makeChunk('/repo/a.ts', 3, 'BBB'), codebasePath: '/repo', relativePath: 'a.ts' },
         ];
-        const outcome = await (ctx as any).processChunkBatch(items);
+        const outcome = await (ctx as any).processChunkBatch(targetFor(ctx), items);
         expect(insertCalled).toBe(false);
         expect(upsertCalls.length).toBe(1);
         expect(upsertCalls[0].length).toBe(2);
@@ -386,7 +398,7 @@ describe('processChunkBatch — Phase 3 uses upsert/upsertHybrid (not insert/ins
         const items = [
             { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
         ];
-        const outcome = await (ctx as any).processChunkBatch(items);
+        const outcome = await (ctx as any).processChunkBatch(targetFor(ctx), items);
         expect(insertHybridCalled).toBe(false);
         expect(upsertHybridCalls.length).toBe(1);
         expect(upsertHybridCalls[0].length).toBe(1);
@@ -404,7 +416,7 @@ describe('processChunkBatch — Phase 3 uses upsert/upsertHybrid (not insert/ins
             { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
             { chunk: makeChunk('/repo/a.ts', 3, 'BBB'), codebasePath: '/repo', relativePath: 'a.ts' },
         ];
-        const outcome = await (ctx as any).processChunkBatch(items);
+        const outcome = await (ctx as any).processChunkBatch(targetFor(ctx), items);
         expect(outcome.realFailures).toBe(2);
         expect(outcome.successes).toBe(0);
         expect(outcome.perFile.get('a.ts')).toEqual({ produced: 2, inserted: 0 });
@@ -420,7 +432,7 @@ describe('processChunkBatch — Phase 3 uses upsert/upsertHybrid (not insert/ins
         const items = [
             { chunk: makeChunk('/repo/a.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'a.ts' },
         ];
-        const outcome = await (ctx as any).processChunkBatch(items);
+        const outcome = await (ctx as any).processChunkBatch(targetFor(ctx), items);
         expect(outcome.realFailures).toBe(1);
         expect(outcome.successes).toBe(0);
     });
@@ -440,7 +452,7 @@ describe('processChunkBuffer — forwards relativePath tuple to processChunkBatc
             { chunk: makeChunk('/repo/x.ts', 1, 'AAA'), codebasePath: '/repo', relativePath: 'x.ts' },
             { chunk: makeChunk('/repo/y.ts', 1, 'BBB'), codebasePath: '/repo', relativePath: 'y.ts' },
         ];
-        const outcome = await (ctx as any).processChunkBuffer(buffer);
+        const outcome = await (ctx as any).processChunkBuffer(targetFor(ctx), buffer);
         expect(outcome.perFile.has('x.ts')).toBe(true);
         expect(outcome.perFile.has('y.ts')).toBe(true);
         expect(outcome.perFile.get('x.ts')).toEqual({ produced: 1, inserted: 1 });
