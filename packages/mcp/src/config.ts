@@ -69,7 +69,15 @@ interface CodebaseInfoBase {
 export interface CodebaseInfoIndexing extends CodebaseInfoBase {
     status: 'indexing';
     indexingPercentage: number;  // Current progress percentage
-    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4)
+    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4) — the literal 8B (primary) ledger.
+    // ADDITIVE (dual-embedding, rev1.1/M1): per-secondary-model ledgers keyed by CANONICAL model id
+    // (e.g. 'qwen3-embedding-0.6b'). The primary 8B model is NEVER stored here — it stays in `files`
+    // so the deployed dist (which knows only `files`) round-trips it untouched. Unknown keys are
+    // ignored by loadV2Format (snapshot.ts stores `info` verbatim), preserving forward-compat.
+    filesByModel?: Record<string, Record<string, FileCompleteness>>;
+    // ADDITIVE (P4 coverage gate): per-secondary-model distinct-PK overlap ratio vs the 8B source
+    // (0..1). Optional; absence ⇒ "unknown" (treated as below-threshold by the search degrade gate).
+    coverageByModel?: Record<string, number>;
 }
 
 // Indexed state - when indexing completed successfully
@@ -78,7 +86,10 @@ export interface CodebaseInfoIndexed extends CodebaseInfoBase {
     indexedFiles: number;        // Number of files indexed
     totalChunks: number;         // Total number of chunks generated
     indexStatus: 'completed' | 'limit_reached';  // Status from indexing result
-    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4)
+    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4) — the literal 8B (primary) ledger.
+    // ADDITIVE (dual-embedding, rev1.1/M1) — see CodebaseInfoIndexing.
+    filesByModel?: Record<string, Record<string, FileCompleteness>>;
+    coverageByModel?: Record<string, number>;
 }
 
 // Index failed state - when indexing failed
