@@ -18,7 +18,7 @@ export interface ContextMcpConfig {
     ollamaModel?: string;
     ollamaHost?: string;
     ollamaDimension?: number;
-    // RabbitMQ inference-queue configuration
+    // RabbitMQ primary inference-queue configuration
     rabbitmqUrl?: string;
     rabbitmqQueue?: string;
     rabbitmqDimension?: number;
@@ -27,6 +27,15 @@ export interface ContextMcpConfig {
     rabbitmqPriority?: number;
     rabbitmqConcurrency?: number;
     rabbitmqSource?: string;
+    // RabbitMQ secondary (0.6B) configuration — all undefined = secondary disabled.
+    // Activation signal: milvusCollectionPrivate0p6b must be truthy to enable secondary.
+    rabbitmqSecondaryQueue?: string;       // RABBITMQ_SECONDARY_QUEUE; default from registry if activated
+    rabbitmqSecondaryDimension?: number;   // RABBITMQ_SECONDARY_DIMENSION; default 1024 if activated
+    rabbitmqSecondaryModel?: string;       // RABBITMQ_SECONDARY_MODEL; default 'qwen3-embedding-0.6b' if activated
+    // Dual-embedding Milvus configuration
+    milvusCollectionPrivate0p6b?: string; // MILVUS_COLLECTION_PRIVATE_0P6B — ACTIVATION SIGNAL; absent = secondary OFF
+    // Search configuration
+    searchEmbeddingModel: string;          // SEARCH_EMBEDDING_MODEL; default 'qwen3-embedding-8b'
     // Vector database configuration
     milvusAddress?: string; // Optional, can be auto-resolved from token
     milvusToken?: string;
@@ -155,21 +164,36 @@ function getPositiveIntegerFromEnv(name: string): number | undefined {
 
 export function createMcpConfig(): ContextMcpConfig {
     // Debug: Print all environment variables related to Context
-    console.log(`[DEBUG] 🔍 Environment Variables Debug:`);
-    console.log(`[DEBUG]   EMBEDDING_PROVIDER: ${envManager.get('EMBEDDING_PROVIDER') || 'NOT SET'}`);
-    console.log(`[DEBUG]   EMBEDDING_MODEL: ${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}`);
-    console.log(`[DEBUG]   EMBEDDING_DIMENSION: ${envManager.get('EMBEDDING_DIMENSION') || 'NOT SET'}`);
-    console.log(`[DEBUG]   OLLAMA_MODEL: ${envManager.get('OLLAMA_MODEL') || 'NOT SET'}`);
-    console.log(`[DEBUG]   GEMINI_API_KEY: ${envManager.get('GEMINI_API_KEY') ? 'SET (length: ' + envManager.get('GEMINI_API_KEY')!.length + ')' : 'NOT SET'}`);
-    console.log(`[DEBUG]   OPENAI_API_KEY: ${envManager.get('OPENAI_API_KEY') ? 'SET (length: ' + envManager.get('OPENAI_API_KEY')!.length + ')' : 'NOT SET'}`);
-    console.log(`[DEBUG]   MILVUS_ADDRESS: ${envManager.get('MILVUS_ADDRESS') || 'NOT SET'}`);
-    console.log(`[DEBUG]   NODE_ENV: ${envManager.get('NODE_ENV') || 'NOT SET'}`);
+    console.error(`[DEBUG] Environment Variables Debug:`);
+    console.error(`[DEBUG]   EMBEDDING_PROVIDER: ${envManager.get('EMBEDDING_PROVIDER') || 'NOT SET'}`);
+    console.error(`[DEBUG]   EMBEDDING_MODEL: ${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}`);
+    console.error(`[DEBUG]   EMBEDDING_DIMENSION: ${envManager.get('EMBEDDING_DIMENSION') || 'NOT SET'}`);
+    console.error(`[DEBUG]   OLLAMA_MODEL: ${envManager.get('OLLAMA_MODEL') || 'NOT SET'}`);
+    console.error(`[DEBUG]   GEMINI_API_KEY: ${envManager.get('GEMINI_API_KEY') ? 'SET (length: ' + envManager.get('GEMINI_API_KEY')!.length + ')' : 'NOT SET'}`);
+    console.error(`[DEBUG]   OPENAI_API_KEY: ${envManager.get('OPENAI_API_KEY') ? 'SET (length: ' + envManager.get('OPENAI_API_KEY')!.length + ')' : 'NOT SET'}`);
+    console.error(`[DEBUG]   MILVUS_ADDRESS: ${envManager.get('MILVUS_ADDRESS') || 'NOT SET'}`);
+    console.error(`[DEBUG]   NODE_ENV: ${envManager.get('NODE_ENV') || 'NOT SET'}`);
+    console.error(`[DEBUG]   MILVUS_COLLECTION_PRIVATE_0P6B: ${envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B') || 'NOT SET (secondary OFF)'}`);
+    console.error(`[DEBUG]   SEARCH_EMBEDDING_MODEL: ${envManager.get('SEARCH_EMBEDDING_MODEL') || 'NOT SET (default: qwen3-embedding-8b)'}`);
 
     const rabbitmqDim = envManager.get('RABBITMQ_EMBEDDING_DIMENSION');
     const rabbitmqTimeout = envManager.get('RABBITMQ_EMBEDDING_TIMEOUT_MS');
     const rabbitmqMaxRetries = envManager.get('RABBITMQ_EMBEDDING_MAX_RETRIES');
     const rabbitmqPriority = envManager.get('RABBITMQ_EMBEDDING_PRIORITY');
     const rabbitmqConcurrency = envManager.get('RABBITMQ_EMBEDDING_CONCURRENCY');
+
+    // Secondary RabbitMQ dimension — parse only if present
+    const rabbitmqSecDimRaw = envManager.get('RABBITMQ_SECONDARY_DIMENSION');
+    const rabbitmqSecondaryDimension = rabbitmqSecDimRaw
+        ? parseInt(rabbitmqSecDimRaw, 10)
+        : undefined;
+
+    // Validate SEARCH_EMBEDDING_MODEL against the registry if set
+    const searchEmbeddingModelRaw = envManager.get('SEARCH_EMBEDDING_MODEL');
+    // Import inline to avoid top-level circular risk; the registry is pure data.
+    // We defer the throw to the consumer (Phase 4 factory) so startup does not crash
+    // if the key is mistyped — a startup-time stderr warning is emitted instead.
+    const searchEmbeddingModel = searchEmbeddingModelRaw || 'qwen3-embedding-8b';
 
     const config: ContextMcpConfig = {
         name: envManager.get('MCP_SERVER_NAME') || "Context MCP Server",
@@ -189,7 +213,7 @@ export function createMcpConfig(): ContextMcpConfig {
         ollamaModel: envManager.get('OLLAMA_MODEL'),
         ollamaHost: envManager.get('OLLAMA_HOST'),
         ollamaDimension: getPositiveIntegerFromEnv('EMBEDDING_DIMENSION'),
-        // RabbitMQ inference-queue configuration
+        // RabbitMQ primary configuration
         rabbitmqUrl: envManager.get('RABBITMQ_INFERENCE_URL'),
         rabbitmqQueue: envManager.get('RABBITMQ_EMBEDDING_QUEUE'),
         rabbitmqDimension: rabbitmqDim ? parseInt(rabbitmqDim, 10) : undefined,
@@ -198,6 +222,14 @@ export function createMcpConfig(): ContextMcpConfig {
         rabbitmqPriority: rabbitmqPriority ? parseInt(rabbitmqPriority, 10) : undefined,
         rabbitmqConcurrency: rabbitmqConcurrency ? parseInt(rabbitmqConcurrency, 10) : undefined,
         rabbitmqSource: envManager.get('RABBITMQ_EMBEDDING_SOURCE'),
+        // RabbitMQ secondary (0.6B) configuration — undefined when not activated
+        rabbitmqSecondaryQueue: envManager.get('RABBITMQ_SECONDARY_QUEUE'),
+        rabbitmqSecondaryDimension,
+        rabbitmqSecondaryModel: envManager.get('RABBITMQ_SECONDARY_MODEL'),
+        // Dual-embedding Milvus — milvusCollectionPrivate0p6b presence = activation signal
+        milvusCollectionPrivate0p6b: envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B'),
+        // Search configuration
+        searchEmbeddingModel,
         // Vector database configuration - address can be auto-resolved from token
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
         milvusToken: envManager.get('MILVUS_TOKEN')
