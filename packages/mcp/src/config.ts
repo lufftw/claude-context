@@ -1,4 +1,4 @@
-import { envManager } from "@zilliz/claude-context-core";
+import { envManager, DEFAULT_PRIMARY_MODEL_ID } from "@zilliz/claude-context-core";
 
 export interface ContextMcpConfig {
     name: string;
@@ -126,14 +126,14 @@ export function getEmbeddingModelForProvider(provider: string): string {
         case 'Ollama':
             // For Ollama, prioritize OLLAMA_MODEL over EMBEDDING_MODEL for backward compatibility
             const ollamaModel = envManager.get('OLLAMA_MODEL') || envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
-            console.log(`[DEBUG] 🎯 Ollama model selection: OLLAMA_MODEL=${envManager.get('OLLAMA_MODEL') || 'NOT SET'}, EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${ollamaModel}`);
+            console.error(`[DEBUG] 🎯 Ollama model selection: OLLAMA_MODEL=${envManager.get('OLLAMA_MODEL') || 'NOT SET'}, EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${ollamaModel}`);
             return ollamaModel;
         case 'RabbitMQ':
             // RabbitMQ passes the logical model name in the task body. The worker on the
             // other side ignores this field for routing (routing is by queue name) but we
             // still include it so worker-side observability / metrics stay meaningful.
             const rmqModel = envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
-            console.log(`[DEBUG] 🎯 RabbitMQ model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${rmqModel}`);
+            console.error(`[DEBUG] 🎯 RabbitMQ model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${rmqModel}`);
             return rmqModel;
         case 'OpenAI':
         case 'VoyageAI':
@@ -142,7 +142,7 @@ export function getEmbeddingModelForProvider(provider: string): string {
         default:
             // For all other providers, use EMBEDDING_MODEL or default
             const selectedModel = envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
-            console.log(`[DEBUG] 🎯 ${provider} model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${selectedModel}`);
+            console.error(`[DEBUG] 🎯 ${provider} model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${selectedModel}`);
             return selectedModel;
     }
 }
@@ -188,12 +188,10 @@ export function createMcpConfig(): ContextMcpConfig {
         ? parseInt(rabbitmqSecDimRaw, 10)
         : undefined;
 
-    // Validate SEARCH_EMBEDDING_MODEL against the registry if set
+    // SEARCH_EMBEDDING_MODEL: default to the primary model id; registry validation
+    // is deferred to the Phase 4 factory.
     const searchEmbeddingModelRaw = envManager.get('SEARCH_EMBEDDING_MODEL');
-    // Import inline to avoid top-level circular risk; the registry is pure data.
-    // We defer the throw to the consumer (Phase 4 factory) so startup does not crash
-    // if the key is mistyped — a startup-time stderr warning is emitted instead.
-    const searchEmbeddingModel = searchEmbeddingModelRaw || 'qwen3-embedding-8b';
+    const searchEmbeddingModel = searchEmbeddingModelRaw || DEFAULT_PRIMARY_MODEL_ID;
 
     const config: ContextMcpConfig = {
         name: envManager.get('MCP_SERVER_NAME') || "Context MCP Server",
