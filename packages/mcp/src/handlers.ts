@@ -426,8 +426,15 @@ export class ToolHandlers {
             // mutations don't perturb what the resume read sees. Building the map for
             // BOTH known models keeps the 0.6B target from re-embedding fully on every
             // MCP restart (R2-HANDLER-PRIORLEDGER).
+            // Fix 3 (R-C4 single enumerator): consume the ONE definition of the
+            // active canonical model ids — contextForThisTask.getActiveModelIds() —
+            // instead of a hardcoded ['qwen3-embedding-8b','qwen3-embedding-0.6b'].
+            // It returns just the 8B primary when no secondary embedding is
+            // configured, and adds the 0.6B (or RABBITMQ_SECONDARY_MODEL) id only
+            // when one is. The synthetic '__writable_shared__' key is intentionally
+            // NOT in this list — it is not a queryable model and never reads a ledger.
             const priorLedgersByModel = new Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>();
-            for (const modelId of ['qwen3-embedding-8b', 'qwen3-embedding-0.6b']) {
+            for (const modelId of contextForThisTask.getActiveModelIds()) {
                 priorLedgersByModel.set(modelId, this.snapshotManager.getFileLedgerForModel(absolutePath, modelId));
             }
 
@@ -450,10 +457,13 @@ export class ToolHandlers {
                 // Per-(file × model) completeness ledger (M8). Writes the 8B path
                 // into the legacy top-level `files` (byte-identical) and the 0.6B
                 // path into filesByModel[modelId] (snapshot v2-additive). The
-                // synthetic '__writable_shared__' target is filtered out by the
-                // assertSafeModelId guard upstream — it never reaches here because
-                // canonical onFileComplete is only fired for queryable models, but
-                // route defensively through setFileCompleteForModel regardless.
+                // synthetic '__writable_shared__' key NEVER reaches here: the core
+                // gates it out at every onFileComplete fire site (Fix 1, the
+                // fireLedger closure in processFileList), so this callback only ever
+                // sees canonical, queryable model ids. (Note: assertSafeModelId in
+                // setFileCompleteForModel only blocks '__proto__'/'constructor'/
+                // 'prototype' — it would NOT have filtered '__writable_shared__';
+                // the suppression is the core's responsibility, done above.)
                 this.snapshotManager.setFileCompleteForModel(absolutePath, modelId, relativePath, info);
             }, undefined /* forceReindex — keep default */, priorLedgersByModel);
             console.log(`[BACKGROUND-INDEX] ✅ Indexing completed successfully! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);

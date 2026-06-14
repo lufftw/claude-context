@@ -177,8 +177,31 @@ interface IndexTarget {
 /** Synthetic IndexTarget ledger key for the writable-shared dual-write (C2). It is
  *  NOT a queryable model — search/status enumerate canonical model ids by name, so
  *  this key is invisible to them; it only keeps the shared collection's write-only
- *  bookkeeping ledger separate from the primary 8B ledger. */
+ *  bookkeeping ledger separate from the primary 8B ledger.
+ *
+ *  Ledger policy (Fix 1): because this key is never read back (the writable-shared
+ *  target's priorLedger is seeded from the PRIMARY 8B ledger, see buildIndexTargets),
+ *  firing onFileComplete for it would only grow write-only dead weight on the SHARED
+ *  snapshot every run. We therefore SUPPRESS every onFileComplete for this key at the
+ *  core; buffer/flush/abort accounting for the target still runs. */
 const WRITABLE_SHARED_MODEL_ID = '__writable_shared__';
+
+/**
+ * Typed abort sentinel (Fix 4) thrown when a target hits
+ * MAX_CONSECUTIVE_BATCH_ERRORS REAL-class chunk-batch failures in a row. Carries
+ * a literal-`true` discriminant so {@link isIndexAbort} can narrow without `any`.
+ * Per-target abort isolation (Fix 2) decides whether catching it drops a single
+ * non-primary target or re-throws to fail the whole run (primary death).
+ */
+interface IndexAbortError extends Error {
+    __isIndexAbort: true;
+}
+
+/** Type guard for the {@link IndexAbortError} sentinel (Fix 4 — replaces the
+ *  `(err as any).__isIndexAbort` casts at the throw + both catch sites). */
+function isIndexAbort(e: unknown): e is IndexAbortError {
+    return !!e && typeof e === 'object' && (e as { __isIndexAbort?: unknown }).__isIndexAbort === true;
+}
 
 export class Context {
     private embedding: Embedding;
@@ -426,36 +449,42 @@ export class Context {
         priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>,
     ): IndexTarget[] {
         const isHybrid = this.getIsHybrid();
+
+        // Fix 3 (R-C4 single enumerator): the canonical model ids come from the ONE
+        // definition — getActiveModelIds() — never re-derived inline here. The
+        // primary embedding instance is this.embedding; each non-primary id maps to
+        // this.secondaryEmbedding (only the 0.6B secondary is non-primary today).
+        const activeModelIds = this.getActiveModelIds();
         const primaryCollectionName = this.getCollectionNameForModel(codebasePath, DEFAULT_PRIMARY_MODEL_ID);
-        const targets: IndexTarget[] = [{
-            modelId: DEFAULT_PRIMARY_MODEL_ID,
-            collectionName: primaryCollectionName,
-            embedding: this.embedding,
-            isHybrid,
-        }];
+        const targets: IndexTarget[] = [];
 
-        // C2 (rev1.2): writable-shared is a SAME-INSTANCE target (same dim as
-        // primary), NOT inline. Appended after the primary, before the secondary,
-        // so its dimension is the primary's and it is written exactly once.
-        const ws = this.getWritableSharedCollectionName();
-        if (ws && ws !== primaryCollectionName) {
+        for (const modelId of activeModelIds) {
+            const isPrimary = modelId === DEFAULT_PRIMARY_MODEL_ID;
             targets.push({
-                modelId: WRITABLE_SHARED_MODEL_ID,        // synthetic key; never a queryable model
-                collectionName: ws,
-                embedding: this.embedding,                // same instance/dimension as primary
-                isHybrid,
-                priorLedger: priorLedgersByModel?.get(DEFAULT_PRIMARY_MODEL_ID) ?? new Map(),
-            });
-        }
-
-        if (this.secondaryEmbedding) {
-            const secId = envManager.get('RABBITMQ_SECONDARY_MODEL') || 'qwen3-embedding-0.6b';
-            targets.push({
-                modelId: secId,
-                collectionName: this.getCollectionNameForModel(codebasePath, secId),
-                embedding: this.secondaryEmbedding,
+                modelId,
+                collectionName: isPrimary ? primaryCollectionName : this.getCollectionNameForModel(codebasePath, modelId),
+                embedding: isPrimary ? this.embedding : this.secondaryEmbedding!,
                 isHybrid,
             });
+
+            // C2 (rev1.2): writable-shared is a SAME-INSTANCE target (same dim as
+            // primary), NOT inline. Inserted immediately AFTER the primary (and
+            // before any secondary), so its dimension is the primary's, it is
+            // written exactly once, and targets[0] stays the primary for the
+            // prepareCollection primary-dim path. The synthetic key is kept OUT of
+            // getActiveModelIds (it is not a queryable model) — see Fix 3.
+            if (isPrimary) {
+                const ws = this.getWritableSharedCollectionName();
+                if (ws && ws !== primaryCollectionName) {
+                    targets.push({
+                        modelId: WRITABLE_SHARED_MODEL_ID,        // synthetic key; never a queryable model
+                        collectionName: ws,
+                        embedding: this.embedding,                // same instance/dimension as primary
+                        isHybrid,
+                        priorLedger: priorLedgersByModel?.get(DEFAULT_PRIMARY_MODEL_ID) ?? new Map(),
+                    });
+                }
+            }
         }
         return targets;
     }
@@ -1142,12 +1171,17 @@ export class Context {
             firedComplete: Set<string>;
             buffer: Array<{ chunk: CodeChunk; codebasePath: string; relativePath: string }>;
             consecutiveBatchErrors: number;
+            // Fix 2 (per-target abort isolation): once a NON-primary target hits
+            // MAX_CONSECUTIVE_BATCH_ERRORS it is DROPPED — no more buffering/flushing
+            // for the rest of the run — while the primary (and any healthy target)
+            // continues. The primary never sets this; its abort fails the whole run.
+            dropped: boolean;
         };
         const acc = new Map<string, Acc>();
         for (const t of targets) {
             acc.set(t.modelId, {
                 fileChunkTotals: new Map(), fileProgress: new Map(), fileHashByPath: new Map(),
-                firedComplete: new Set(), buffer: [], consecutiveBatchErrors: 0,
+                firedComplete: new Set(), buffer: [], consecutiveBatchErrors: 0, dropped: false,
             });
         }
 
@@ -1157,8 +1191,22 @@ export class Context {
         let skippedAllTargets = 0;
         let changedAnyTarget = 0;
 
+        // Fix 1: the SINGLE ledger-fire gate. The synthetic writable-shared target
+        // STILL participates in all buffer/flush/abort accounting, but its ledger is
+        // never read back (its priorLedger is seeded from the primary 8B ledger), so
+        // firing onFileComplete for it would only grow write-only dead weight on the
+        // SHARED snapshot. Every onFileComplete call in this method routes through
+        // here so the synthetic key is suppressed in exactly one place.
+        const fireLedger = (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => {
+            if (modelId === WRITABLE_SHARED_MODEL_ID) return;   // Fix 1: never write a ledger for the synthetic key
+            onFileComplete?.(modelId, relativePath, info);
+        };
+
         // Fire complete:true for files whose FULL splitter output has been embedded
-        // AND inserted FOR A GIVEN TARGET. Per target (M8).
+        // AND inserted FOR A GIVEN TARGET. Per target (M8). The local firedComplete
+        // bookkeeping is kept for ALL targets (incl. writable-shared) so the end-of-
+        // run sweep does not re-evaluate them; only the onFileComplete LEDGER write
+        // is gated by fireLedger (Fix 1).
         const fireCompletedFor = (target: IndexTarget) => {
             if (!onFileComplete) return;
             const a = acc.get(target.modelId)!;
@@ -1166,19 +1214,53 @@ export class Context {
                 if (a.firedComplete.has(rp)) continue;
                 const total = a.fileChunkTotals.get(rp);
                 if (total !== undefined && p.produced === p.inserted && p.produced === total) {
-                    onFileComplete(target.modelId, rp, { complete: true, fileHash: a.fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
+                    fireLedger(target.modelId, rp, { complete: true, fileHash: a.fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
                     a.firedComplete.add(rp);
                 }
             }
         };
 
+        // Fix 2 (per-target abort isolation) — DROP a single NON-primary target.
+        // Mark its accumulator dropped (so it is excluded from needers/flush for the
+        // rest of the run), then write complete:false for every file it had started
+        // but not yet completed (in-flight + this-file's chunks), so a LATER run
+        // resumes it. For the synthetic writable-shared key fireLedger is a no-op
+        // (Fix 1), so this is just a "drop + clear buffer + log" with no ledger
+        // write. The PRIMARY is NEVER passed here — its abort fails the whole run.
+        const dropTarget = (target: IndexTarget, reason: string) => {
+            const a = acc.get(target.modelId)!;
+            a.dropped = true;
+            a.buffer = [];   // stop flushing this target
+            // Recovery: any file this target produced chunks for but did NOT fire
+            // complete:true for is now incomplete → complete:false (next run resumes
+            // it). The sweep is skipped for dropped targets, so do it here.
+            for (const [rp] of a.fileChunkTotals) {
+                if (a.firedComplete.has(rp)) continue;
+                fireLedger(target.modelId, rp, { complete: false, fileHash: a.fileHashByPath.get(rp) ?? '', chunkCount: 0 });
+                a.firedComplete.add(rp);
+            }
+            console.error(
+                `[Context] ⚠️  [${target.modelId}] DROPPED non-primary target after ${reason}; ` +
+                `the primary (and any healthy target) continue. Files in-flight for this target ` +
+                `marked complete:false for resume on a later run.`,
+            );
+        };
+
         // Flush one target's buffer through processChunkBuffer with that target's
-        // OWN three-way abort counter. Per-target abort isolation: a REAL-abort in
-        // the 8B target throws ONLY here for the 8B target; the 0.6B target's flush
-        // (separate call) is unaffected and vice versa (M7). The thrown abort is
-        // the SAME __isIndexAbort sentinel so the outer per-file catch re-throws it.
+        // OWN three-way abort counter. Per-target abort ISOLATION (Fix 2):
+        //   - PRIMARY (DEFAULT_PRIMARY_MODEL_ID) hits MAX → throw the typed
+        //     IndexAbortError sentinel; the outer per-file catch re-throws it and the
+        //     WHOLE run aborts (no point continuing if the primary is dead).
+        //   - ANY NON-primary target (0.6B secondary AND the synthetic writable-
+        //     shared) hits MAX → DROP only that target (dropTarget) and return
+        //     WITHOUT throwing, so the primary and any other healthy target run to
+        //     completion. 0.6B is the optional/resilient path — its death must never
+        //     take the 8B index down.
+        // A dropped target is skipped before it ever reaches here (guarded at the
+        // buffer/flush call sites), but the early-return below is belt-and-braces.
         const flushTarget = async (target: IndexTarget, isFinal: boolean) => {
             const a = acc.get(target.modelId)!;
+            if (a.dropped) return;            // Fix 2: dropped targets do not flush
             if (a.buffer.length === 0) return;
             const r = await this.processChunkBuffer(target, a.buffer);
             a.buffer = [];
@@ -1192,7 +1274,12 @@ export class Context {
                     `REAL-class slot failure(s) (${a.consecutiveBatchErrors}/${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive)`,
                 );
                 if (a.consecutiveBatchErrors >= MAX_CONSECUTIVE_BATCH_ERRORS) {
-                    throw this.makeAbortError(MAX_CONSECUTIVE_BATCH_ERRORS);
+                    if (target.modelId === DEFAULT_PRIMARY_MODEL_ID) {
+                        throw this.makeAbortError(MAX_CONSECUTIVE_BATCH_ERRORS);   // primary death aborts the whole run
+                    }
+                    // Non-primary: isolate — drop this target, keep the run alive.
+                    dropTarget(target, `${MAX_CONSECUTIVE_BATCH_ERRORS} consecutive REAL-class chunk-batch failures`);
+                    return;
                 }
             } else if (r.successes > 0) {
                 a.consecutiveBatchErrors = 0;
@@ -1211,13 +1298,19 @@ export class Context {
                 // that target's ledger says complete:true at the SAME hash.
                 const needers: IndexTarget[] = [];
                 for (const target of targets) {
+                    // Fix 2: a DROPPED non-primary target is out for the rest of the
+                    // run — never a needer, no re-fire (its ledger must NOT be
+                    // falsely re-asserted complete after the drop).
+                    if (acc.get(target.modelId)!.dropped) continue;
                     const existingHash = target.existingHashes!.get(relativePath);
                     const led = target.priorLedger!.get(relativePath);
                     const verifiedComplete = existingHash === fileHash && led?.complete === true && led.fileHash === fileHash;
                     if (verifiedComplete) {
                         // Re-fire so the per-model ledger entry survives this run's
-                        // snapshot rewrite (P46, now per target).
-                        onFileComplete?.(target.modelId, relativePath, { complete: true, fileHash, chunkCount: led!.chunkCount ?? 0 });
+                        // snapshot rewrite (P46, now per target). Routed through
+                        // fireLedger so the synthetic writable-shared key writes no
+                        // ledger (Fix 1).
+                        fireLedger(target.modelId, relativePath, { complete: true, fileHash, chunkCount: led!.chunkCount ?? 0 });
                         acc.get(target.modelId)!.firedComplete.add(relativePath);
                     } else {
                         needers.push(target);
@@ -1236,8 +1329,10 @@ export class Context {
                 // ── Per-target delete-on-change (LD-6 / P1) ──
                 // Each NEEDING target deletes from its OWN collection only when its
                 // OWN existingHash !== fileHash; on a delete failure that target's
-                // ledger is marked complete:false for recovery.
-                await this.deleteChangedForTargets(needers, relativePath, fileHash, onFileComplete);
+                // ledger is marked complete:false for recovery. Pass fireLedger (not
+                // raw onFileComplete) so the synthetic writable-shared key is gated
+                // out of the recovery ledger write too (Fix 1).
+                await this.deleteChangedForTargets(needers, relativePath, fileHash, fireLedger);
 
                 // ── AST split ONCE (model-independent) ──
                 const content = await fs.promises.readFile(filePath, 'utf-8');
@@ -1265,9 +1360,18 @@ export class Context {
                 // Push chunks into EACH needing target's buffer; flush per target
                 // when that target's buffer fills. totalChunks counts splitter work
                 // ONCE (chunk-limit guard is model-independent).
+                // Fix 2: a target dropped mid-file (by a flush within THIS loop) is
+                // skipped for all remaining chunks — no more buffering for it. Only a
+                // PRIMARY flush throws (whole-run abort); a non-primary flush returns
+                // after dropping, so the loop keeps feeding the healthy targets.
+                // KNOWN FOLLOW-UP (deferred): the targets are flushed sequentially in
+                // this per-chunk loop, so a slow 0.6B flush latency is coupled into
+                // the 8B path. A future change could flush targets concurrently /
+                // decouple buffers per target. Not addressed here (Phase 2+3 quality).
                 for (const chunk of chunks) {
                     for (const target of needers) {
                         const a = acc.get(target.modelId)!;
+                        if (a.dropped) continue;                 // Fix 2: stop buffering a dropped target
                         a.buffer.push({ chunk, codebasePath, relativePath });
                         if (a.buffer.length >= EMBEDDING_BATCH_SIZE) {
                             await flushTarget(target, false);
@@ -1287,7 +1391,11 @@ export class Context {
 
             } catch (error) {
                 if (this.isAbortError(error)) {
-                    throw error;   // per-target abort still propagates to handlers.ts → indexfailed
+                    // Fix 2: ONLY a PRIMARY abort reaches here (flushTarget throws the
+                    // sentinel only for DEFAULT_PRIMARY_MODEL_ID; non-primary targets
+                    // are dropped in place and never throw). Re-throw so the whole run
+                    // unwinds to handlers.ts → indexfailed.
+                    throw error;
                 }
                 console.warn(`[Context] ⚠️  Skipping file ${filePath}: ${error}`);
             }
@@ -1305,14 +1413,19 @@ export class Context {
 
         // End-of-run completeness sweep, per target (covers 0-chunk files and
         // partial/truncated files; iterate fileChunkTotals not fileProgress).
+        // Fix 1: routed through fireLedger so the synthetic writable-shared key
+        // writes no ledger. Fix 2: DROPPED non-primary targets are skipped — the
+        // drop handler already marked their in-flight/remaining files complete:false
+        // for recovery, so re-sweeping here would re-fire (and could mask the drop).
         if (onFileComplete) {
             for (const target of targets) {
                 const a = acc.get(target.modelId)!;
+                if (a.dropped) continue;
                 for (const [rp, total] of a.fileChunkTotals) {
                     if (a.firedComplete.has(rp)) continue;
                     const p = a.fileProgress.get(rp) ?? { produced: 0, inserted: 0 };
                     const complete = p.produced === p.inserted && p.produced === total;
-                    onFileComplete(target.modelId, rp, { complete, fileHash: a.fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
+                    fireLedger(target.modelId, rp, { complete, fileHash: a.fileHashByPath.get(rp) ?? '', chunkCount: p.inserted });
                     a.firedComplete.add(rp);
                 }
             }
@@ -1341,13 +1454,22 @@ export class Context {
      * On a target delete FAILURE: write a complete:false ledger entry for THAT
      * target so the next run re-sweeps that target (pair every abort with
      * recovery — no silent warn-and-continue). The other targets are unaffected.
+     *
+     * The recovery write is routed through the caller's `fireLedger` closure, NOT
+     * the raw onFileComplete, so the synthetic writable-shared key writes no ledger
+     * (Fix 1) — a delete failure on the shared collection just gets retried next
+     * run via the primary's ledger, never a synthetic-key entry.
      */
     private async deleteChangedForTargets(
         targets: IndexTarget[],
         relativePath: string,
         fileHash: string,
-        onFileComplete?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
+        fireLedger?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
     ): Promise<void> {
+        // TODO(dual-embedding follow-up): qualify shared-collection delete by
+        // codebasePath. The writable-shared delete filter uses relativePath alone,
+        // so two projects with the same relativePath alias each other's rows in the
+        // shared collection. Pre-existing behavior — documented, not changed here.
         const escapedPath = relativePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
         for (const target of targets) {
             const existingHash = target.existingHashes?.get(relativePath);
@@ -1362,7 +1484,7 @@ export class Context {
                     // Recovery, not silent warn: mark this file incomplete in THIS
                     // target's ledger so the next run re-embeds it for this target.
                     console.error(`[Context] ❌ [${target.modelId}] Delete-on-change FAILED for ${relativePath} in ${target.collectionName}; marking complete:false for recovery:`, delError);
-                    onFileComplete?.(target.modelId, relativePath, { complete: false, fileHash, chunkCount: 0 });
+                    fireLedger?.(target.modelId, relativePath, { complete: false, fileHash, chunkCount: 0 });
                 }
             }
         }
@@ -1391,20 +1513,21 @@ export class Context {
      * REAL-class chunk-batch failures occur in a row. Tagged so the per-file
      * skip handler in processFileList re-throws it instead of swallowing it.
      */
-    private makeAbortError(maxConsecutive: number): Error {
+    private makeAbortError(maxConsecutive: number): IndexAbortError {
         const err = new Error(
             `Aborting indexing: ${maxConsecutive} consecutive REAL-class chunk-batch failures.`,
-        );
-        (err as any).__isIndexAbort = true;
+        ) as IndexAbortError;
+        err.__isIndexAbort = true;
         return err;
     }
 
     /**
      * Whether an error is the MAX-consecutive abort sentinel (must propagate
-     * past the per-file skip handler to handlers.ts → indexfailed).
+     * past the per-file skip handler to handlers.ts → indexfailed). Delegates to
+     * the typed {@link isIndexAbort} guard (Fix 4).
      */
-    private isAbortError(error: unknown): boolean {
-        return !!error && typeof error === 'object' && (error as any).__isIndexAbort === true;
+    private isAbortError(error: unknown): error is IndexAbortError {
+        return isIndexAbort(error);
     }
 
     /**
