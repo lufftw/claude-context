@@ -43,6 +43,11 @@ describe('Task 0.1 — embedding model registry SSOT', () => {
         expect(() => getModelSpec('nope')).toThrow(/unknown embedding model/i);
     });
 
+    it('rejects inherited Object.prototype keys (no prototype-pollution leak)', () => {
+        expect(() => getModelSpec('__proto__')).toThrow(/unknown embedding model/i);
+        expect(() => getModelSpec('constructor')).toThrow(/unknown embedding model/i);
+    });
+
     it('defaults the primary model to 8B with the byte-identical (empty) suffix', () => {
         expect(DEFAULT_PRIMARY_MODEL_ID).toBe('qwen3-embedding-8b');
         expect(getModelSpec(DEFAULT_PRIMARY_MODEL_ID).collectionSuffix).toBe('');
