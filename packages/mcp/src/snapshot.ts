@@ -12,6 +12,10 @@ import {
     CodebaseInfoIndexFailed,
     FileCompleteness
 } from "./config.js";
+// Canonical primary model id (SSOT, Phase 0). The primary 8B ledger lives in the legacy
+// top-level `files`; secondaries live in `filesByModel[modelId]`. Importing the constant
+// (not hardcoding the string) keeps the ledger key in lock-step with the registry.
+import { DEFAULT_PRIMARY_MODEL_ID } from "@zilliz/claude-context-core";
 
 export class SnapshotManager {
     private snapshotFilePath: string;
@@ -28,10 +32,21 @@ export class SnapshotManager {
     }
 
     /**
-     * Check if snapshot is v2 format
+     * Forward-tolerant format predicate (M1). True for the current emitted format
+     * ('v2') AND any future additive successor ('v3', 'v4', …) whose shape is still
+     * { formatVersion, codebases: {...} }. We MUST read-merge such files rather than
+     * treat them as v1 — otherwise mergeAndWriteSnapshot would discard the existing
+     * `codebases` map and the next save would WIPE other users' entries from the
+     * SHARED multi-user snapshot (the M1 blast radius). v1 has NO `codebases` key, so
+     * presence of `codebases` is the structural discriminator; the version string is
+     * only used to reject the legacy v1 array shape.
      */
-    private isV2Format(snapshot: any): snapshot is CodebaseSnapshotV2 {
-        return snapshot && snapshot.formatVersion === 'v2';
+    private isV2OrLater(snapshot: any): snapshot is CodebaseSnapshotV2 {
+        return !!snapshot
+            && typeof snapshot.formatVersion === 'string'
+            && snapshot.formatVersion !== 'v1'
+            && !!snapshot.codebases
+            && typeof snapshot.codebases === 'object';
     }
 
     /**
@@ -153,7 +168,7 @@ export class SnapshotManager {
             const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
             const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
 
-            if (this.isV2Format(snapshot)) {
+            if (this.isV2OrLater(snapshot)) {
                 return Object.entries(snapshot.codebases)
                     .filter(([_, info]) => info.status === 'indexed')
                     .map(([path, _]) => path);
@@ -178,7 +193,7 @@ export class SnapshotManager {
             const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
             const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
 
-            if (this.isV2Format(snapshot)) {
+            if (this.isV2OrLater(snapshot)) {
                 return Object.entries(snapshot.codebases)
                     .filter(([_, info]) => info.status === 'indexing')
                     .map(([path, _]) => path);
@@ -218,7 +233,7 @@ export class SnapshotManager {
             const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
             const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
 
-            if (this.isV2Format(snapshot)) {
+            if (this.isV2OrLater(snapshot)) {
                 const info = snapshot.codebases[codebasePath];
                 if (info && info.status === 'indexing') {
                     return info.indexingPercentage || 0;
@@ -346,14 +361,11 @@ export class SnapshotManager {
      * minimal 'indexing' entry so the ledger is never dropped.
      */
     public setFileComplete(codebasePath: string, relativePath: string, info: FileCompleteness): void {
-        let entry = this.codebaseInfoMap.get(codebasePath);
-        if (!entry) {
-            entry = { status: 'indexing', indexingPercentage: 0, lastUpdated: new Date().toISOString() } as CodebaseInfoIndexing;
-            this.codebaseInfoMap.set(codebasePath, entry);
-        }
-        const e = entry as CodebaseInfoIndexing | CodebaseInfoIndexed;
-        if (!e.files) e.files = {};
-        e.files[relativePath] = info;
+        // Delegate to the per-model writer under the primary id (mirrors how
+        // getFileLedger delegates to getFileLedgerForModel). The primary branch of
+        // setFileCompleteForModel writes the legacy top-level `files` byte-for-byte
+        // identically, so this path is unchanged for all existing callers.
+        this.setFileCompleteForModel(codebasePath, DEFAULT_PRIMARY_MODEL_ID, relativePath, info);
     }
 
     /**
@@ -366,15 +378,26 @@ export class SnapshotManager {
         this.indexedCodebases = this.indexedCodebases.filter(path => path !== codebasePath);
         this.codebaseFileCount.delete(codebasePath);
 
-        // Update info map. Carry any prior completeness ledger forward — the 2s
-        // progress tick would otherwise clobber it on every save (Attack-3).
-        const prior = this.codebaseInfoMap.get(codebasePath);
-        const priorFiles = (prior && (prior as CodebaseInfoIndexing | CodebaseInfoIndexed).files) || undefined;
+        // EXHAUSTIVE carry-forward (M2/RG-5): spread ALL prior non-status fields
+        // (files, filesByModel, coverageByModel, and any future additive field) and
+        // recompute ONLY status/indexingPercentage/lastUpdated. Field-by-field
+        // enumeration silently drops new fields; the 2s progress tick would then
+        // clobber the secondary ledgers on every save (the Attack-3 class, now
+        // generalized to every model). We strip prior terminal-only fields
+        // (indexedFiles/totalChunks/indexStatus/errorMessage/lastAttemptedPercentage)
+        // because this entry is now 'indexing'.
+        const prior = this.codebaseInfoMap.get(codebasePath) as any;
+        const {
+            status: _s, indexingPercentage: _p, lastUpdated: _lu,
+            indexedFiles: _if, totalChunks: _tc, indexStatus: _is,
+            errorMessage: _em, lastAttemptedPercentage: _lap,
+            ...rest
+        } = (prior || {});
         const info: CodebaseInfoIndexing = {
+            ...rest,                                   // files, filesByModel, coverageByModel, future fields
             status: 'indexing',
             indexingPercentage: progress,
             lastUpdated: new Date().toISOString(),
-            ...(priorFiles ? { files: priorFiles } : {}),
         };
         this.codebaseInfoMap.set(codebasePath, info);
     }
@@ -394,20 +417,27 @@ export class SnapshotManager {
         // Remove from indexing state
         this.indexingCodebases.delete(codebasePath);
 
-        // Update file count and info
+        // Update file count
         this.codebaseFileCount.set(codebasePath, stats.indexedFiles);
 
-        // Carry the completeness ledger across the terminal indexing→indexed
-        // transition so a later resume can still consult per-file completeness.
-        const prior = this.codebaseInfoMap.get(codebasePath);
-        const priorFiles = (prior && (prior as CodebaseInfoIndexing | CodebaseInfoIndexed).files) || undefined;
+        // EXHAUSTIVE carry-forward (M2/RG-5) across the terminal indexing→indexed
+        // transition: spread ALL prior non-status fields (files, filesByModel,
+        // coverageByModel, future fields) and recompute ONLY the terminal stats.
+        // Strip prior indexing-only / failed-only fields.
+        const prior = this.codebaseInfoMap.get(codebasePath) as any;
+        const {
+            status: _s, indexingPercentage: _p, lastUpdated: _lu,
+            indexedFiles: _if, totalChunks: _tc, indexStatus: _is,
+            errorMessage: _em, lastAttemptedPercentage: _lap,
+            ...rest
+        } = (prior || {});
         const info: CodebaseInfoIndexed = {
+            ...rest,                                   // files, filesByModel, coverageByModel, future fields
             status: 'indexed',
             indexedFiles: stats.indexedFiles,
             totalChunks: stats.totalChunks,
             indexStatus: stats.status,
             lastUpdated: new Date().toISOString(),
-            ...(priorFiles ? { files: priorFiles } : {}),
         };
         this.codebaseInfoMap.set(codebasePath, info);
     }
@@ -425,7 +455,12 @@ export class SnapshotManager {
         this.indexingCodebases.delete(codebasePath);
         this.codebaseFileCount.delete(codebasePath);
 
-        // Update info map
+        // Update info map. DELIBERATE ASYMMETRY vs. setCodebaseIndexing/setCodebaseIndexed:
+        // those EXHAUSTIVELY carry forward the prior per-file/per-model ledgers (files,
+        // filesByModel, coverageByModel). A FAILED transition intentionally DROPS the
+        // in-memory ledger — a retry re-indexes the codebase from scratch, so a stale
+        // partial ledger must not survive to short-circuit the next run. (The on-disk
+        // entry is then replaced wholesale by this failed info on the next merge-save.)
         const info: CodebaseInfoIndexFailed = {
             status: 'indexfailed',
             errorMessage: errorMessage,
@@ -436,22 +471,45 @@ export class SnapshotManager {
     }
 
     /**
-     * Build the prior-run completeness ledger for a codebase (Commit 4/4 — the
-     * resume read). Reflects the snapshot loaded at MCP startup / the prior run.
-     * Core's resume skip consults this: a file may be skipped ONLY when its
-     * ledger entry says complete:true at the same hash Milvus holds.
-     *
-     * Returns a NEW Map (a COPY): the in-progress run mutates the LIVE
-     * codebaseInfoMap entry via setFileComplete, but the resume read must see the
-     * PRIOR state, so the copy is decoupled from later mutation. Empty Map if
-     * there is no entry or it carries no `files` ledger.
+     * Reject model ids that would pollute a plain-object map's prototype chain.
+     * `filesByModel` / `coverageByModel` are plain objects keyed by model id;
+     * '__proto__' / 'constructor' / 'prototype' must never be used as keys. Throwing
+     * here (rather than silently skipping) makes a bad id loud at the boundary and
+     * guarantees no write touches Object.prototype.
      */
-    public getFileLedger(codebasePath: string): Map<string, { complete: boolean; fileHash: string; chunkCount: number }> {
+    private assertSafeModelId(modelId: string): void {
+        if (modelId === '__proto__' || modelId === 'constructor' || modelId === 'prototype') {
+            throw new Error(`invalid model id: ${modelId}`);
+        }
+    }
+
+    /**
+     * Per-model resume ledger (M2). The PRIMARY (8B) id reads the legacy top-level
+     * `files` (so existing single-model snapshots keep working byte-for-byte);
+     * secondaries read `filesByModel[modelId]`. Returns a NEW Map (a COPY) — the
+     * in-progress run mutates the LIVE entry via setFileCompleteForModel, but the
+     * resume read must see the PRIOR state, so the copy is decoupled from later
+     * mutation (same contract getFileLedger has always honored). Empty Map when no
+     * entry / no ledger for that model.
+     */
+    public getFileLedgerForModel(
+        codebasePath: string,
+        modelId: string
+    ): Map<string, { complete: boolean; fileHash: string; chunkCount: number }> {
+        // Prototype-pollution guard (foundational code on a SHARED snapshot file):
+        // model ids index a plain-object map, so a id of '__proto__' / 'constructor'
+        // / 'prototype' would read/poison Object.prototype. Model ids are registry-
+        // controlled today, but reject the dangerous keys at the boundary anyway.
+        this.assertSafeModelId(modelId);
         const ledger = new Map<string, { complete: boolean; fileHash: string; chunkCount: number }>();
-        const entry = this.codebaseInfoMap.get(codebasePath);
-        const files = entry && (entry as CodebaseInfoIndexing | CodebaseInfoIndexed).files;
-        if (files) {
-            for (const [relativePath, fc] of Object.entries(files)) {
+        const entry = this.codebaseInfoMap.get(codebasePath) as
+            (CodebaseInfoIndexing | CodebaseInfoIndexed | undefined);
+        if (!entry) return ledger;
+        const source = (modelId === DEFAULT_PRIMARY_MODEL_ID)
+            ? entry.files
+            : (entry.filesByModel && entry.filesByModel[modelId]);
+        if (source) {
+            for (const [relativePath, fc] of Object.entries(source)) {
                 ledger.set(relativePath, {
                     complete: fc.complete,
                     fileHash: fc.fileHash,
@@ -460,6 +518,80 @@ export class SnapshotManager {
             }
         }
         return ledger;
+    }
+
+    /**
+     * Record per-file completeness for a SPECIFIC model (M2). The PRIMARY (8B) id
+     * writes the legacy top-level `files` (byte-identical to setFileComplete, so the
+     * single-model write path is unchanged); secondaries write
+     * filesByModel[modelId]. Seeds a minimal 'indexing' entry if the callback raced
+     * ahead of the first setCodebaseIndexing tick (mirrors setFileComplete).
+     */
+    public setFileCompleteForModel(
+        codebasePath: string,
+        modelId: string,
+        relativePath: string,
+        info: FileCompleteness
+    ): void {
+        // Prototype-pollution guard: modelId keys a plain-object map below. Reject
+        // '__proto__' / 'constructor' / 'prototype' so a malicious/buggy id cannot
+        // poison Object.prototype (see assertSafeModelId).
+        this.assertSafeModelId(modelId);
+        let entry = this.codebaseInfoMap.get(codebasePath);
+        if (!entry) {
+            entry = { status: 'indexing', indexingPercentage: 0, lastUpdated: new Date().toISOString() } as CodebaseInfoIndexing;
+            this.codebaseInfoMap.set(codebasePath, entry);
+        }
+        const e = entry as CodebaseInfoIndexing | CodebaseInfoIndexed;
+        if (modelId === DEFAULT_PRIMARY_MODEL_ID) {
+            if (!e.files) e.files = {};
+            e.files[relativePath] = info;                 // unchanged 8B path
+        } else {
+            if (!e.filesByModel) e.filesByModel = {};
+            if (!e.filesByModel[modelId]) e.filesByModel[modelId] = {};
+            e.filesByModel[modelId][relativePath] = info;
+        }
+    }
+
+    /**
+     * Build the prior-run completeness ledger for a codebase (Commit 4/4 — the
+     * resume read). Now delegates to the primary (8B) per-model accessor so all
+     * existing single-model callers (handlers.ts) are unchanged. Returns a NEW Map
+     * (a COPY) — see getFileLedgerForModel.
+     */
+    public getFileLedger(codebasePath: string): Map<string, { complete: boolean; fileHash: string; chunkCount: number }> {
+        return this.getFileLedgerForModel(codebasePath, DEFAULT_PRIMARY_MODEL_ID);
+    }
+
+    /**
+     * Persist the per-(codebase × model) coverage ratio (P4). Seeds a minimal
+     * 'indexing' entry if none exists (the backfill callback may race ahead of the
+     * first tick), mirroring setFileCompleteForModel's seed behavior. The
+     * coverageByModel field rides the exhaustive carry-forward (M2/RG-5) so it
+     * survives the 2s tick + terminal transition + merge.
+     */
+    public setCoverageRatioForModel(codebasePath: string, modelId: string, ratio: number): void {
+        // Prototype-pollution guard: modelId keys a plain-object map below.
+        this.assertSafeModelId(modelId);
+        let entry = this.codebaseInfoMap.get(codebasePath);
+        if (!entry) {
+            entry = { status: 'indexing', indexingPercentage: 0, lastUpdated: new Date().toISOString() } as CodebaseInfoIndexing;
+            this.codebaseInfoMap.set(codebasePath, entry);
+        }
+        const e = entry as CodebaseInfoIndexing | CodebaseInfoIndexed;
+        if (!e.coverageByModel) e.coverageByModel = {};
+        e.coverageByModel[modelId] = ratio;
+    }
+
+    /**
+     * Read the per-(codebase × model) coverage ratio (P4). Returns undefined when
+     * unknown — the search-side coverage gate treats undefined as DEGRADED for
+     * secondary models (never silently search a possibly-incomplete collection).
+     */
+    public getCoverageRatioForModel(codebasePath: string, modelId: string): number | undefined {
+        const entry = this.codebaseInfoMap.get(codebasePath);
+        const cov = entry && (entry as CodebaseInfoIndexing | CodebaseInfoIndexed).coverageByModel;
+        return cov ? cov[modelId] : undefined;
     }
 
     /**
@@ -517,7 +649,7 @@ export class SnapshotManager {
 
             console.log('[SNAPSHOT-DEBUG] Loaded snapshot:', snapshot);
 
-            if (this.isV2Format(snapshot)) {
+            if (this.isV2OrLater(snapshot)) {
                 this.loadV2Format(snapshot);
             } else {
                 this.loadV1Format(snapshot);
@@ -563,7 +695,11 @@ export class SnapshotManager {
         try {
             const existingData = fs.readFileSync(this.snapshotFilePath, 'utf8');
             const existingSnapshot = JSON.parse(existingData);
-            if (existingSnapshot && existingSnapshot.formatVersion === 'v2' && existingSnapshot.codebases) {
+            // M1: gate on the FORWARD-TOLERANT predicate, NOT a literal `=== 'v2'`.
+            // If a newer peer wrote a future-additive file, the literal check would be
+            // false here and the next save would discard every existing codebase from
+            // the SHARED snapshot. isV2OrLater accepts any { formatVersion, codebases }.
+            if (this.isV2OrLater(existingSnapshot)) {
                 existingCodebases = existingSnapshot.codebases;
                 console.log(`[SNAPSHOT-DEBUG] Loaded ${Object.keys(existingCodebases).length} existing codebases for merge`);
             }
@@ -575,19 +711,54 @@ export class SnapshotManager {
         const codebases: Record<string, CodebaseInfo> = { ...existingCodebases };
 
         // Apply all codebases from this session's info map (overwrites same paths, preserves others).
-        // The per-file completeness ledger (`files`) must be FIELD-MERGED with the
-        // existing on-disk entry, not whole-object-replaced: two sessions (or this
-        // session's 2s tick vs. an earlier write) each hold only the files they
-        // touched, so a plain replace would clobber the other session's ledger.
+        // Per-file completeness ledgers must be FIELD-MERGED with the existing on-disk
+        // entry, never whole-object-replaced: two sessions (or this session's 2s tick
+        // vs. an earlier write) each hold only the files they touched. This now covers
+        // BOTH the legacy top-level `files` (8B) AND every secondary `filesByModel[id]`
+        // sub-ledger (M2). `...info` is spread first-then-overridden-on-ledgers so any
+        // future additive field (e.g. coverageByModel) is carried verbatim (RG-5).
         for (const [codebasePath, info] of this.codebaseInfoMap) {
-            const existing = codebases[codebasePath];
-            const existingFiles = (existing && (existing as CodebaseInfoIndexing | CodebaseInfoIndexed).files) || undefined;
-            const infoFiles = (info as CodebaseInfoIndexing | CodebaseInfoIndexed).files;
-            if (existingFiles || infoFiles) {
-                codebases[codebasePath] = { ...info, files: { ...existingFiles, ...infoFiles } } as CodebaseInfo;
-            } else {
-                codebases[codebasePath] = info;
+            const existing = codebases[codebasePath] as
+                (CodebaseInfoIndexing | CodebaseInfoIndexed | undefined);
+            const incoming = info as (CodebaseInfoIndexing | CodebaseInfoIndexed);
+
+            // 1) merge legacy top-level `files`
+            const existingFiles = (existing && existing.files) || undefined;
+            const infoFiles = incoming.files;
+            const mergedFiles = (existingFiles || infoFiles)
+                ? { ...existingFiles, ...infoFiles }
+                : undefined;
+
+            // 2) merge every secondary model sub-ledger (union of model ids, per-id field-merge)
+            const existingByModel = (existing && existing.filesByModel) || undefined;
+            const infoByModel = incoming.filesByModel;
+            let mergedByModel: Record<string, Record<string, FileCompleteness>> | undefined;
+            if (existingByModel || infoByModel) {
+                mergedByModel = {};
+                const modelIds = new Set<string>([
+                    ...Object.keys(existingByModel || {}),
+                    ...Object.keys(infoByModel || {}),
+                ]);
+                for (const mid of modelIds) {
+                    mergedByModel[mid] = {
+                        ...((existingByModel && existingByModel[mid]) || {}),
+                        ...((infoByModel && infoByModel[mid]) || {}),
+                    };
+                }
             }
+
+            // 3) coverageByModel: shallow-merge (newer ratio wins per model id)
+            const mergedCoverage = (existing?.coverageByModel || incoming.coverageByModel)
+                ? { ...existing?.coverageByModel, ...incoming.coverageByModel }
+                : undefined;
+
+            // Spread incoming `info` to carry status/stats/lastUpdated AND any future
+            // additive field, then override only the deep-merged ledger fields.
+            const merged: any = { ...incoming };
+            if (mergedFiles) merged.files = mergedFiles; else delete merged.files;
+            if (mergedByModel) merged.filesByModel = mergedByModel; else delete merged.filesByModel;
+            if (mergedCoverage) merged.coverageByModel = mergedCoverage; else delete merged.coverageByModel;
+            codebases[codebasePath] = merged as CodebaseInfo;
         }
 
         // Remove codebases that this session explicitly removed
@@ -595,6 +766,9 @@ export class SnapshotManager {
             delete codebases[removedPath];
         }
 
+        // M1: KEEP emitting 'v2'. filesByModel/coverageByModel ride additively inside
+        // each codebase entry; the deployed dist reads them verbatim and round-trips
+        // them untouched. NEVER bump this string — see the Phase-1 supersession notice.
         const snapshot: CodebaseSnapshotV2 = {
             formatVersion: 'v2',
             codebases: codebases,

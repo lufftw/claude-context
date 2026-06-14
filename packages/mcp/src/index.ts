@@ -26,7 +26,7 @@ import { MilvusVectorDatabase } from "@zilliz/claude-context-core";
 
 // Import our modular components
 import { createMcpConfig, logConfigurationSummary, showHelpMessage, ContextMcpConfig } from "./config.js";
-import { createEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.js";
+import { createEmbeddingInstance, createSecondaryEmbeddingInstance, logEmbeddingProviderInfo, logActiveModels } from "./embedding.js";
 import { SnapshotManager } from "./snapshot.js";
 import { SyncManager } from "./sync.js";
 import { ToolHandlers } from "./handlers.js";
@@ -59,20 +59,40 @@ class ContextMcpServer {
         const embedding = createEmbeddingInstance(config);
         logEmbeddingProviderInfo(config, embedding);
 
+        // Dual-embedding (Option B / LD-2): construct the secondary 0.6B instance
+        // ONLY when configured (MILVUS_COLLECTION_PRIVATE_0P6B present + RabbitMQ).
+        // undefined ⇒ single-model byte-identical path.
+        const secondaryEmbedding = createSecondaryEmbeddingInstance(config);
+
         // Initialize vector database
         const vectorDatabase = new MilvusVectorDatabase({
             address: config.milvusAddress,
             ...(config.milvusToken && { token: config.milvusToken })
         });
 
-        // Initialize Claude Context
+        // Initialize managers BEFORE Context so the coverageReader closure can
+        // capture this.snapshotManager. The closure only DEREFERENCES it at search
+        // time (long after construction), so even the prior ordering was safe, but
+        // constructing the snapshot manager first keeps the closure unambiguous.
+        this.snapshotManager = new SnapshotManager();
+
+        // Initialize Claude Context (P4 coverageReader bridges the snapshot to the
+        // core coverage gate WITHOUT core importing the mcp SnapshotManager).
         this.context = new Context({
             embedding,
-            vectorDatabase
+            ...(secondaryEmbedding && { secondaryEmbedding }),
+            vectorDatabase,
+            coverageReader: (codebasePath, modelId) => this.snapshotManager.getCoverageRatioForModel(codebasePath, modelId),
         });
 
-        // Initialize managers
-        this.snapshotManager = new SnapshotManager();
+        // Log the active model configuration to stderr (never stdout — JSON-RPC sanctity).
+        logActiveModels(
+            config.rabbitmqQueue ?? 'embedding.qwen3-8b',
+            config.rabbitmqDimension ?? 4096,
+            secondaryEmbedding ? (config.rabbitmqSecondaryQueue ?? 'embedding.qwen3-0.6b') : undefined,
+            secondaryEmbedding ? (config.rabbitmqSecondaryDimension ?? 1024) : undefined,
+            config.searchEmbeddingModel,
+        );
         this.syncManager = new SyncManager(this.context, this.snapshotManager);
         this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager);
 
@@ -188,6 +208,12 @@ This tool is versatile and can be used before completing various tasks to retrie
                                     },
                                     description: "Optional: List of file extensions to filter results. (e.g., ['.ts','.py']).",
                                     default: []
+                                },
+                                embeddingModel: {
+                                    type: "string",
+                                    description: "Optional: which embedding model to search with. 'qwen3-embedding-8b' (default, 4096-dim, primary+shared) or 'qwen3-embedding-0.6b' (1024-dim, lightweight, private-only). Only set this if the secondary model has been indexed for this codebase; otherwise the search returns a clear 'not configured' notice.",
+                                    enum: ["qwen3-embedding-8b", "qwen3-embedding-0.6b"],
+                                    default: "qwen3-embedding-8b"
                                 }
                             },
                             required: ["path", "query"]

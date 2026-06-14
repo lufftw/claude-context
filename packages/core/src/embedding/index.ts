@@ -7,3 +7,6 @@ export * from './voyageai-embedding';
 export * from './ollama-embedding';
 export * from './gemini-embedding';
 export * from './rabbitmq-embedding';
+
+// Model identity SSOT (dual-embedding, Option B)
+export * from './model-registry';

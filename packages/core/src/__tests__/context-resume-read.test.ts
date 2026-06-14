@@ -149,14 +149,23 @@ function runFileList(opts: {
             process.env.EMBEDDING_BATCH_SIZE = String(opts.batchSize);
         }
         try {
+            // New per-model arity: priorLedger is wrapped into a per-model map keyed
+            // by the primary 8B id (single-model path), and onFileComplete fires
+            // (modelId, rp, info). Record only the primary completions so the
+            // existing single-model resume assertions stay valid.
+            const priorLedgersByModel = opts.priorLedger
+                ? new Map([['qwen3-embedding-8b', opts.priorLedger]])
+                : undefined;
             return await (ctx as any).processFileList(
                 opts.files,
                 '/repo',
                 undefined, // onFileProcessed
-                (rp: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => {
-                    completeCalls.push([rp, info]);
+                (modelId: string, rp: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => {
+                    if (modelId === 'qwen3-embedding-8b') {
+                        completeCalls.push([rp, info]);
+                    }
                 },
-                opts.priorLedger,
+                priorLedgersByModel,
             );
         } finally {
             (require('fs').promises as any).readFile = origRead;

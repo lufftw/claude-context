@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer } from "@zilliz/claude-context-core";
+import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, DEFAULT_PRIMARY_MODEL_ID } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
 
@@ -420,14 +420,23 @@ export class ToolHandlers {
             const embeddingProvider = this.context.getEmbedding();
             console.log(`[BACKGROUND-INDEX] 🧠 Using embedding provider: ${embeddingProvider.getProvider()} with dimension: ${embeddingProvider.getDimension()}`);
 
-            // Capture the prior-run completeness ledger BEFORE indexing mutates
-            // the live snapshot entry (Commit 4/4 — the resume read). This is the
-            // snapshot state loaded at MCP startup / the prior run; core's resume
-            // skip consults it to decide which files are verified-complete and may
-            // be skipped vs. partial and must be re-embedded. getFileLedger returns
-            // a COPY, so the in-run setFileComplete mutations below don't perturb
-            // what the resume read sees.
-            const priorLedger = this.snapshotManager.getFileLedger(absolutePath);
+            // Capture the per-MODEL prior-run completeness ledgers BEFORE indexing
+            // mutates the live snapshot entry (M8 — the resume read, per target).
+            // getFileLedgerForModel returns a COPY, so in-run setFileCompleteForModel
+            // mutations don't perturb what the resume read sees. Building the map for
+            // BOTH known models keeps the 0.6B target from re-embedding fully on every
+            // MCP restart (R2-HANDLER-PRIORLEDGER).
+            // Fix 3 (R-C4 single enumerator): consume the ONE definition of the
+            // active canonical model ids — contextForThisTask.getActiveModelIds() —
+            // instead of a hardcoded ['qwen3-embedding-8b','qwen3-embedding-0.6b'].
+            // It returns just the 8B primary when no secondary embedding is
+            // configured, and adds the 0.6B (or RABBITMQ_SECONDARY_MODEL) id only
+            // when one is. The synthetic '__writable_shared__' key is intentionally
+            // NOT in this list — it is not a queryable model and never reads a ledger.
+            const priorLedgersByModel = new Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>();
+            for (const modelId of contextForThisTask.getActiveModelIds()) {
+                priorLedgersByModel.set(modelId, this.snapshotManager.getFileLedgerForModel(absolutePath, modelId));
+            }
 
             // Start indexing with the appropriate context and progress tracking
             console.log(`[BACKGROUND-INDEX] 🚀 Beginning codebase indexing process...`);
@@ -444,12 +453,19 @@ export class ToolHandlers {
                 }
 
                 console.log(`[BACKGROUND-INDEX] Progress: ${progress.phase} - ${progress.percentage}% (${progress.current}/${progress.total})`);
-            }, (relativePath, info) => {
-                // Per-file completeness ledger (Commit 3/4). Mutates the in-memory
-                // snapshot entry in place; the 2s periodic save above (and the
-                // terminal setCodebaseIndexed) then persists it durably.
-                this.snapshotManager.setFileComplete(absolutePath, relativePath, info);
-            }, undefined /* forceReindex — keep default */, priorLedger);
+            }, (modelId, relativePath, info) => {
+                // Per-(file × model) completeness ledger (M8). Writes the 8B path
+                // into the legacy top-level `files` (byte-identical) and the 0.6B
+                // path into filesByModel[modelId] (snapshot v2-additive). The
+                // synthetic '__writable_shared__' key NEVER reaches here: the core
+                // gates it out at every onFileComplete fire site (Fix 1, the
+                // fireLedger closure in processFileList), so this callback only ever
+                // sees canonical, queryable model ids. (Note: assertSafeModelId in
+                // setFileCompleteForModel only blocks '__proto__'/'constructor'/
+                // 'prototype' — it would NOT have filtered '__writable_shared__';
+                // the suppression is the core's responsibility, done above.)
+                this.snapshotManager.setFileCompleteForModel(absolutePath, modelId, relativePath, info);
+            }, undefined /* forceReindex — keep default */, priorLedgersByModel);
             console.log(`[BACKGROUND-INDEX] ✅ Indexing completed successfully! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
 
             // Set codebase to indexed status with complete statistics
@@ -483,8 +499,17 @@ export class ToolHandlers {
     }
 
     public async handleSearchCode(args: any) {
-        const { path: codebasePath, query, limit = 10, extensionFilter } = args;
+        const { path: codebasePath, query, limit = 10, extensionFilter, embeddingModel } = args;
         const resultLimit = limit || 10;
+        // Resolution precedence (M4 / R-C5 single-site): pass the explicit arg or
+        // `undefined`. DO NOT read process.env here — the SINGLE authoritative
+        // resolution (explicit arg > project-`.env` SEARCH_EMBEDDING_MODEL > 8B) lives
+        // in Context._semanticSearchImpl, which runs inside runWithProject so the
+        // project `.env` wins (the fork's project-scope rule). A user-scope
+        // process.env read here would shadow the project value and silently break
+        // the per-session model trigger.
+        const resolvedModel: string | undefined =
+            (typeof embeddingModel === 'string' && embeddingModel.length > 0) ? embeddingModel : undefined;
 
         try {
             // Sync indexed codebases from cloud first
@@ -565,21 +590,56 @@ export class ToolHandlers {
                 filterExpr = `fileExtension in [${quoted}]`;
             }
 
-            // Search in the specified codebase
+            // Structured degraded short-circuit (C4 / D7): when a SECONDARY model is
+            // explicitly requested but it is not configured or not yet readable
+            // (collection missing / coverage below threshold), return a STRUCTURED
+            // JSON object — never a wrong-dim ANN call. The Phase-6 D7 gate parses
+            // this JSON (degraded/reason), never substring-matches.
+            if (resolvedModel && resolvedModel !== DEFAULT_PRIMARY_MODEL_ID) {
+                if (!this.context.hasEmbeddingForModel(resolvedModel)) {
+                    console.log(`[SEARCH] 🟡 Requested model '${resolvedModel}' is not configured — returning structured degraded notice (secondary-not-configured)`);
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({ degraded: true, reason: 'secondary-not-configured', results: [] })
+                        }]
+                    };
+                }
+                const readable = await this.context.isModelReadable(absolutePath, resolvedModel);
+                if (!readable) {
+                    console.log(`[SEARCH] 🟡 Requested model '${resolvedModel}' is configured but not yet readable — returning structured degraded notice (secondary-coverage-below-threshold)`);
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({ degraded: true, reason: 'secondary-coverage-below-threshold', results: [] })
+                        }]
+                    };
+                }
+            }
+
+            // Search in the specified codebase (route the query embedding + collection by model).
+            console.log(`[SEARCH] 🧭 Routing search via embedding model: ${resolvedModel ?? '(default/project-scope)'}`);
             const searchResults = await this.context.semanticSearch(
                 absolutePath,
                 query,
                 Math.min(resultLimit, 50),
                 0.3,
-                filterExpr
+                filterExpr,
+                resolvedModel
             );
 
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 
             if (searchResults.length === 0) {
-                // Check if collection was lost (indexed locally but missing in Milvus)
+                // Check if collection was lost (indexed locally but missing in Milvus).
+                // I1: probe the PER-MODEL collection for the SAME resolved model the
+                // search used — NOT the always-primary getCollectionName. For a 0.6B
+                // search this resolves the `_0p6b` collection, so a healthy 0.6B index
+                // is never wrongly reported as "lost" just because a secondary became
+                // readable-but-empty. `resolvedModel` is the exact value passed to
+                // semanticSearch above; default to the primary id when unset.
                 if (isIndexed && !isIndexing) {
-                    const collectionName = this.context.getCollectionName(absolutePath);
+                    const collectionName = this.context.getCollectionNameForModel(absolutePath, resolvedModel ?? DEFAULT_PRIMARY_MODEL_ID);
                     const hasCollection = await this.context.getVectorDatabase().hasCollection(collectionName);
                     if (!hasCollection) {
                         return {
@@ -814,11 +874,12 @@ export class ToolHandlers {
 
             switch (status) {
                 case 'indexed': {
-                    // Verify collection still exists in Milvus (may be lost after restart/cleanup)
-                    const collectionName = this.context.getCollectionName(absolutePath);
-                    const hasCollection = await this.context.getVectorDatabase().hasCollection(collectionName);
+                    // Verify the PRIMARY collection still exists in Milvus (may be lost after restart/cleanup).
+                    // isModelReadable for the primary == today's hasCollection check (coverage 1.0, configured true),
+                    // so status and search derive readability from the SAME predicate (P3 — they never disagree).
+                    const primaryReadable = await this.context.isModelReadable(absolutePath, 'qwen3-embedding-8b');
 
-                    if (!hasCollection) {
+                    if (!primaryReadable) {
                         statusMessage = `⚠️ Codebase '${absolutePath}' was indexed but the index data has been lost (collection not found in Milvus).`;
                         statusMessage += `\n🔄 Please re-index using index_codebase with force=true.`;
                         break;
@@ -832,6 +893,18 @@ export class ToolHandlers {
                         statusMessage += `\n🕐 Last updated: ${new Date(indexedInfo.lastUpdated).toLocaleString()}`;
                     } else {
                         statusMessage = `✅ Codebase '${absolutePath}' is fully indexed and ready for search.`;
+                    }
+
+                    // Per-model readability for SECONDARY models (only surfaced when configured).
+                    // Enumerate active models via the ONE enumerator (SEAM-2) and report each
+                    // non-primary model's readability through the shared isModelReadable
+                    // predicate, so status and search stay in lock-step (P3).
+                    for (const modelId of this.context.getActiveModelIds()) {
+                        if (modelId === DEFAULT_PRIMARY_MODEL_ID) continue;
+                        const secondaryReadable = await this.context.isModelReadable(absolutePath, modelId);
+                        statusMessage += secondaryReadable
+                            ? `\n🟢 Secondary model '${modelId}' is readable.`
+                            : `\n🟡 Secondary model '${modelId}' is configured but NOT yet readable (collection missing or coverage below threshold — searches with it return a degraded notice).`;
                     }
                     break;
                 }

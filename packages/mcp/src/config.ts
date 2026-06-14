@@ -1,4 +1,4 @@
-import { envManager } from "@zilliz/claude-context-core";
+import { envManager, DEFAULT_PRIMARY_MODEL_ID } from "@zilliz/claude-context-core";
 
 export interface ContextMcpConfig {
     name: string;
@@ -18,7 +18,7 @@ export interface ContextMcpConfig {
     ollamaModel?: string;
     ollamaHost?: string;
     ollamaDimension?: number;
-    // RabbitMQ inference-queue configuration
+    // RabbitMQ primary inference-queue configuration
     rabbitmqUrl?: string;
     rabbitmqQueue?: string;
     rabbitmqDimension?: number;
@@ -27,6 +27,15 @@ export interface ContextMcpConfig {
     rabbitmqPriority?: number;
     rabbitmqConcurrency?: number;
     rabbitmqSource?: string;
+    // RabbitMQ secondary (0.6B) configuration — all undefined = secondary disabled.
+    // Activation signal: milvusCollectionPrivate0p6b must be truthy to enable secondary.
+    rabbitmqSecondaryQueue?: string;       // RABBITMQ_SECONDARY_QUEUE; default from registry if activated
+    rabbitmqSecondaryDimension?: number;   // RABBITMQ_SECONDARY_DIMENSION; default 1024 if activated
+    rabbitmqSecondaryModel?: string;       // RABBITMQ_SECONDARY_MODEL; default 'qwen3-embedding-0.6b' if activated
+    // Dual-embedding Milvus configuration
+    milvusCollectionPrivate0p6b?: string; // MILVUS_COLLECTION_PRIVATE_0P6B — ACTIVATION SIGNAL; absent = secondary OFF
+    // Search configuration
+    searchEmbeddingModel: string;          // SEARCH_EMBEDDING_MODEL; default 'qwen3-embedding-8b'
     // Vector database configuration
     milvusAddress?: string; // Optional, can be auto-resolved from token
     milvusToken?: string;
@@ -60,7 +69,15 @@ interface CodebaseInfoBase {
 export interface CodebaseInfoIndexing extends CodebaseInfoBase {
     status: 'indexing';
     indexingPercentage: number;  // Current progress percentage
-    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4)
+    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4) — the literal 8B (primary) ledger.
+    // ADDITIVE (dual-embedding, rev1.1/M1): per-secondary-model ledgers keyed by CANONICAL model id
+    // (e.g. 'qwen3-embedding-0.6b'). The primary 8B model is NEVER stored here — it stays in `files`
+    // so the deployed dist (which knows only `files`) round-trips it untouched. Unknown keys are
+    // ignored by loadV2Format (snapshot.ts stores `info` verbatim), preserving forward-compat.
+    filesByModel?: Record<string, Record<string, FileCompleteness>>;
+    // ADDITIVE (P4 coverage gate): per-secondary-model distinct-PK overlap ratio vs the 8B source
+    // (0..1). Optional; absence ⇒ "unknown" (treated as below-threshold by the search degrade gate).
+    coverageByModel?: Record<string, number>;
 }
 
 // Indexed state - when indexing completed successfully
@@ -69,7 +86,10 @@ export interface CodebaseInfoIndexed extends CodebaseInfoBase {
     indexedFiles: number;        // Number of files indexed
     totalChunks: number;         // Total number of chunks generated
     indexStatus: 'completed' | 'limit_reached';  // Status from indexing result
-    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4)
+    files?: Record<string, FileCompleteness>;  // Per-file completeness ledger (Commit 3/4) — the literal 8B (primary) ledger.
+    // ADDITIVE (dual-embedding, rev1.1/M1) — see CodebaseInfoIndexing.
+    filesByModel?: Record<string, Record<string, FileCompleteness>>;
+    coverageByModel?: Record<string, number>;
 }
 
 // Index failed state - when indexing failed
@@ -117,14 +137,14 @@ export function getEmbeddingModelForProvider(provider: string): string {
         case 'Ollama':
             // For Ollama, prioritize OLLAMA_MODEL over EMBEDDING_MODEL for backward compatibility
             const ollamaModel = envManager.get('OLLAMA_MODEL') || envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
-            console.log(`[DEBUG] 🎯 Ollama model selection: OLLAMA_MODEL=${envManager.get('OLLAMA_MODEL') || 'NOT SET'}, EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${ollamaModel}`);
+            console.error(`[DEBUG] 🎯 Ollama model selection: OLLAMA_MODEL=${envManager.get('OLLAMA_MODEL') || 'NOT SET'}, EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${ollamaModel}`);
             return ollamaModel;
         case 'RabbitMQ':
             // RabbitMQ passes the logical model name in the task body. The worker on the
             // other side ignores this field for routing (routing is by queue name) but we
             // still include it so worker-side observability / metrics stay meaningful.
             const rmqModel = envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
-            console.log(`[DEBUG] 🎯 RabbitMQ model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${rmqModel}`);
+            console.error(`[DEBUG] 🎯 RabbitMQ model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${rmqModel}`);
             return rmqModel;
         case 'OpenAI':
         case 'VoyageAI':
@@ -133,7 +153,7 @@ export function getEmbeddingModelForProvider(provider: string): string {
         default:
             // For all other providers, use EMBEDDING_MODEL or default
             const selectedModel = envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
-            console.log(`[DEBUG] 🎯 ${provider} model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${selectedModel}`);
+            console.error(`[DEBUG] 🎯 ${provider} model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${selectedModel}`);
             return selectedModel;
     }
 }
@@ -155,21 +175,34 @@ function getPositiveIntegerFromEnv(name: string): number | undefined {
 
 export function createMcpConfig(): ContextMcpConfig {
     // Debug: Print all environment variables related to Context
-    console.log(`[DEBUG] 🔍 Environment Variables Debug:`);
-    console.log(`[DEBUG]   EMBEDDING_PROVIDER: ${envManager.get('EMBEDDING_PROVIDER') || 'NOT SET'}`);
-    console.log(`[DEBUG]   EMBEDDING_MODEL: ${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}`);
-    console.log(`[DEBUG]   EMBEDDING_DIMENSION: ${envManager.get('EMBEDDING_DIMENSION') || 'NOT SET'}`);
-    console.log(`[DEBUG]   OLLAMA_MODEL: ${envManager.get('OLLAMA_MODEL') || 'NOT SET'}`);
-    console.log(`[DEBUG]   GEMINI_API_KEY: ${envManager.get('GEMINI_API_KEY') ? 'SET (length: ' + envManager.get('GEMINI_API_KEY')!.length + ')' : 'NOT SET'}`);
-    console.log(`[DEBUG]   OPENAI_API_KEY: ${envManager.get('OPENAI_API_KEY') ? 'SET (length: ' + envManager.get('OPENAI_API_KEY')!.length + ')' : 'NOT SET'}`);
-    console.log(`[DEBUG]   MILVUS_ADDRESS: ${envManager.get('MILVUS_ADDRESS') || 'NOT SET'}`);
-    console.log(`[DEBUG]   NODE_ENV: ${envManager.get('NODE_ENV') || 'NOT SET'}`);
+    console.error(`[DEBUG] Environment Variables Debug:`);
+    console.error(`[DEBUG]   EMBEDDING_PROVIDER: ${envManager.get('EMBEDDING_PROVIDER') || 'NOT SET'}`);
+    console.error(`[DEBUG]   EMBEDDING_MODEL: ${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}`);
+    console.error(`[DEBUG]   EMBEDDING_DIMENSION: ${envManager.get('EMBEDDING_DIMENSION') || 'NOT SET'}`);
+    console.error(`[DEBUG]   OLLAMA_MODEL: ${envManager.get('OLLAMA_MODEL') || 'NOT SET'}`);
+    console.error(`[DEBUG]   GEMINI_API_KEY: ${envManager.get('GEMINI_API_KEY') ? 'SET (length: ' + envManager.get('GEMINI_API_KEY')!.length + ')' : 'NOT SET'}`);
+    console.error(`[DEBUG]   OPENAI_API_KEY: ${envManager.get('OPENAI_API_KEY') ? 'SET (length: ' + envManager.get('OPENAI_API_KEY')!.length + ')' : 'NOT SET'}`);
+    console.error(`[DEBUG]   MILVUS_ADDRESS: ${envManager.get('MILVUS_ADDRESS') || 'NOT SET'}`);
+    console.error(`[DEBUG]   NODE_ENV: ${envManager.get('NODE_ENV') || 'NOT SET'}`);
+    console.error(`[DEBUG]   MILVUS_COLLECTION_PRIVATE_0P6B: ${envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B') || 'NOT SET (secondary OFF)'}`);
+    console.error(`[DEBUG]   SEARCH_EMBEDDING_MODEL: ${envManager.get('SEARCH_EMBEDDING_MODEL') || 'NOT SET (default: qwen3-embedding-8b)'}`);
 
     const rabbitmqDim = envManager.get('RABBITMQ_EMBEDDING_DIMENSION');
     const rabbitmqTimeout = envManager.get('RABBITMQ_EMBEDDING_TIMEOUT_MS');
     const rabbitmqMaxRetries = envManager.get('RABBITMQ_EMBEDDING_MAX_RETRIES');
     const rabbitmqPriority = envManager.get('RABBITMQ_EMBEDDING_PRIORITY');
     const rabbitmqConcurrency = envManager.get('RABBITMQ_EMBEDDING_CONCURRENCY');
+
+    // Secondary RabbitMQ dimension — parse only if present
+    const rabbitmqSecDimRaw = envManager.get('RABBITMQ_SECONDARY_DIMENSION');
+    const rabbitmqSecondaryDimension = rabbitmqSecDimRaw
+        ? parseInt(rabbitmqSecDimRaw, 10)
+        : undefined;
+
+    // SEARCH_EMBEDDING_MODEL: default to the primary model id; registry validation
+    // is deferred to the Phase 4 factory.
+    const searchEmbeddingModelRaw = envManager.get('SEARCH_EMBEDDING_MODEL');
+    const searchEmbeddingModel = searchEmbeddingModelRaw || DEFAULT_PRIMARY_MODEL_ID;
 
     const config: ContextMcpConfig = {
         name: envManager.get('MCP_SERVER_NAME') || "Context MCP Server",
@@ -189,7 +222,7 @@ export function createMcpConfig(): ContextMcpConfig {
         ollamaModel: envManager.get('OLLAMA_MODEL'),
         ollamaHost: envManager.get('OLLAMA_HOST'),
         ollamaDimension: getPositiveIntegerFromEnv('EMBEDDING_DIMENSION'),
-        // RabbitMQ inference-queue configuration
+        // RabbitMQ primary configuration
         rabbitmqUrl: envManager.get('RABBITMQ_INFERENCE_URL'),
         rabbitmqQueue: envManager.get('RABBITMQ_EMBEDDING_QUEUE'),
         rabbitmqDimension: rabbitmqDim ? parseInt(rabbitmqDim, 10) : undefined,
@@ -198,6 +231,14 @@ export function createMcpConfig(): ContextMcpConfig {
         rabbitmqPriority: rabbitmqPriority ? parseInt(rabbitmqPriority, 10) : undefined,
         rabbitmqConcurrency: rabbitmqConcurrency ? parseInt(rabbitmqConcurrency, 10) : undefined,
         rabbitmqSource: envManager.get('RABBITMQ_EMBEDDING_SOURCE'),
+        // RabbitMQ secondary (0.6B) configuration — undefined when not activated
+        rabbitmqSecondaryQueue: envManager.get('RABBITMQ_SECONDARY_QUEUE'),
+        rabbitmqSecondaryDimension,
+        rabbitmqSecondaryModel: envManager.get('RABBITMQ_SECONDARY_MODEL'),
+        // Dual-embedding Milvus — milvusCollectionPrivate0p6b presence = activation signal
+        milvusCollectionPrivate0p6b: envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B'),
+        // Search configuration
+        searchEmbeddingModel,
         // Vector database configuration - address can be auto-resolved from token
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
         milvusToken: envManager.get('MILVUS_TOKEN')
@@ -207,53 +248,67 @@ export function createMcpConfig(): ContextMcpConfig {
 }
 
 export function logConfigurationSummary(config: ContextMcpConfig): void {
-    // Log configuration summary before starting server
-    console.log(`[MCP] 🚀 Starting Context MCP Server`);
-    console.log(`[MCP] Configuration Summary:`);
-    console.log(`[MCP]   Server: ${config.name} v${config.version}`);
-    console.log(`[MCP]   Embedding Provider: ${config.embeddingProvider}`);
-    console.log(`[MCP]   Embedding Model: ${config.embeddingModel}`);
-    console.log(`[MCP]   Milvus Address: ${config.milvusAddress || (config.milvusToken ? '[Auto-resolve from token]' : '[Not configured]')}`);
+    // Log configuration summary before starting server.
+    // Stdout is reserved for the JSON-RPC stream — diagnostics go to stderr
+    // (console.error), never stdout. (index.ts also redirects console.log to
+    // stderr, but logging directly to stderr here is unambiguous.)
+    console.error(`[MCP] 🚀 Starting Context MCP Server`);
+    console.error(`[MCP] Configuration Summary:`);
+    console.error(`[MCP]   Server: ${config.name} v${config.version}`);
+    console.error(`[MCP]   Embedding Provider: ${config.embeddingProvider}`);
+    console.error(`[MCP]   Embedding Model: ${config.embeddingModel}`);
+    console.error(`[MCP]   Milvus Address: ${config.milvusAddress || (config.milvusToken ? '[Auto-resolve from token]' : '[Not configured]')}`);
 
     // Log provider-specific configuration without exposing sensitive data
     switch (config.embeddingProvider) {
         case 'OpenAI':
-            console.log(`[MCP]   OpenAI API Key: ${config.openaiApiKey ? '✅ Configured' : '❌ Missing'}`);
+            console.error(`[MCP]   OpenAI API Key: ${config.openaiApiKey ? '✅ Configured' : '❌ Missing'}`);
             if (config.openaiBaseUrl) {
-                console.log(`[MCP]   OpenAI Base URL: ${config.openaiBaseUrl}`);
+                console.error(`[MCP]   OpenAI Base URL: ${config.openaiBaseUrl}`);
             }
             break;
         case 'VoyageAI':
-            console.log(`[MCP]   VoyageAI API Key: ${config.voyageaiApiKey ? '✅ Configured' : '❌ Missing'}`);
+            console.error(`[MCP]   VoyageAI API Key: ${config.voyageaiApiKey ? '✅ Configured' : '❌ Missing'}`);
             break;
         case 'Gemini':
-            console.log(`[MCP]   Gemini API Key: ${config.geminiApiKey ? '✅ Configured' : '❌ Missing'}`);
+            console.error(`[MCP]   Gemini API Key: ${config.geminiApiKey ? '✅ Configured' : '❌ Missing'}`);
             if (config.geminiBaseUrl) {
-                console.log(`[MCP]   Gemini Base URL: ${config.geminiBaseUrl}`);
+                console.error(`[MCP]   Gemini Base URL: ${config.geminiBaseUrl}`);
             }
             break;
         case 'OpenRouter':
-            console.log(`[MCP]   OpenRouter API Key: ${config.openrouterApiKey ? '✅ Configured' : '❌ Missing'}`);
+            console.error(`[MCP]   OpenRouter API Key: ${config.openrouterApiKey ? '✅ Configured' : '❌ Missing'}`);
             break;
         case 'Ollama':
-            console.log(`[MCP]   Ollama Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}`);
-            console.log(`[MCP]   Ollama Model: ${config.embeddingModel}`);
+            console.error(`[MCP]   Ollama Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}`);
+            console.error(`[MCP]   Ollama Model: ${config.embeddingModel}`);
             if (config.ollamaDimension) {
-                console.log(`[MCP]   Ollama Embedding Dimension: ${config.ollamaDimension}`);
+                console.error(`[MCP]   Ollama Embedding Dimension: ${config.ollamaDimension}`);
             }
             break;
         case 'RabbitMQ':
-            console.log(`[MCP]   RabbitMQ URL: ${config.rabbitmqUrl ? '✅ Configured' : '❌ Missing (RABBITMQ_INFERENCE_URL)'}`);
-            console.log(`[MCP]   RabbitMQ Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b (default)'}`);
-            console.log(`[MCP]   RabbitMQ Model: ${config.embeddingModel}`);
-            console.log(`[MCP]   RabbitMQ Dimension: ${config.rabbitmqDimension ?? 4096}`);
-            console.log(`[MCP]   RabbitMQ Priority: ${config.rabbitmqPriority ?? 5}`);
-            console.log(`[MCP]   RabbitMQ Concurrency: ${config.rabbitmqConcurrency ?? 10}`);
-            console.log(`[MCP]   RabbitMQ Timeout: ${config.rabbitmqTimeoutMs ?? 30000}ms`);
+            // TODO(dual-embedding follow-up): M4 — the default literals in this RabbitMQ
+            // summary block (4096, 5, 10, 1_700_000, 1024, 'embedding.qwen3-8b',
+            // 'embedding.qwen3-0.6b') duplicate the real defaults applied where the provider
+            // config is constructed. They can drift silently if those source-of-truth
+            // defaults change. A follow-up should source these from a single shared default
+            // table (or echo the resolved config values) so the log can never lie.
+            console.error(`[MCP]   RabbitMQ URL: ${config.rabbitmqUrl ? '✅ Configured' : '❌ Missing (RABBITMQ_INFERENCE_URL)'}`);
+            console.error(`[MCP]   RabbitMQ Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b (default)'}`);
+            console.error(`[MCP]   RabbitMQ Model: ${config.embeddingModel}`);
+            console.error(`[MCP]   RabbitMQ Dimension: ${config.rabbitmqDimension ?? 4096}`);
+            console.error(`[MCP]   RabbitMQ Priority: ${config.rabbitmqPriority ?? 5}`);
+            console.error(`[MCP]   RabbitMQ Concurrency: ${config.rabbitmqConcurrency ?? 10}`);
+            // Default mirrors RabbitMQEmbeddingConfig.timeoutMs (1_700_000 ≈ 28 min),
+            // not the stale 30000 that previously appeared here.
+            console.error(`[MCP]   RabbitMQ Timeout: ${config.rabbitmqTimeoutMs ?? 1_700_000}ms`);
+            // Secondary (0.6B) dual-embedding summary — only meaningful when activated.
+            console.error(`[MCP]   Secondary (0.6B): ${config.milvusCollectionPrivate0p6b ? `ON (collection=${config.milvusCollectionPrivate0p6b}, queue=${config.rabbitmqSecondaryQueue ?? 'embedding.qwen3-0.6b'}, dim=${config.rabbitmqSecondaryDimension ?? 1024})` : 'OFF'}`);
+            console.error(`[MCP]   Search default model: ${config.searchEmbeddingModel}`);
             break;
     }
 
-    console.log(`[MCP] 🔧 Initializing server components...`);
+    console.error(`[MCP] 🔧 Initializing server components...`);
 }
 
 export function showHelpMessage(): void {
