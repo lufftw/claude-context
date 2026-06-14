@@ -62,6 +62,11 @@ const EMBED_CONCURRENCY   = Math.min(Number(process.env.EMBED_CONCURRENCY || 4),
 const PER_ATTEMPT_TIMEOUT_MS = 180_000; // patient: ride out WAIT-class lag
 const MAX_RETRIES = 4;                   // 5 total attempts; 5*180s=900s << broker 2h consumer_timeout
 const UPSERT_BATCH = 50;                 // Milvus upsert batch size
+// queryAll default batchSize=10000 fetches 10k rows/gRPC page; on large collections
+// with big `content` that exceeds the 15s gRPC deadline (DEADLINE_EXCEEDED). Read source
+// in smaller pages so each page returns well under the deadline. (Follow-up: lower the
+// queryAll default in milvus-vectordb.ts — same hazard hits production loadExistingFileHashes.)
+const SOURCE_READ_BATCH = Math.min(Number(process.env.SOURCE_READ_BATCH || 500), 2000);
 
 const VALIDATE_SUBSET = 10;              // first N distinct PKs for the small validation
 
@@ -146,7 +151,7 @@ async function describeVector(client, collection) {
 // Read ALL distinct source rows, deduped client-side by PK (keep first seen).
 async function readDistinctSourceRows(milvus) {
     log(`reading source '${SOURCE_COLLECTION}' (output_fields=${SOURCE_FIELDS.join(',')})…`);
-    const rows = await milvus.queryAll(SOURCE_COLLECTION, SOURCE_FIELDS);
+    const rows = await milvus.queryAll(SOURCE_COLLECTION, SOURCE_FIELDS, undefined, SOURCE_READ_BATCH);
     const byId = new Map();
     for (const r of rows) {
         if (!byId.has(r.id)) byId.set(r.id, r);
@@ -329,7 +334,7 @@ async function main() {
 
         // ── Step 5: coverage measurement (G3) ──────────────────────────────────
         // Distinct PKs actually present in target vs distinct PKs in source.
-        const targetRows = await milvus.queryAll(TARGET_COLLECTION, ['id']);
+        const targetRows = await milvus.queryAll(TARGET_COLLECTION, ['id'], undefined, Math.max(SOURCE_READ_BATCH, 2000));
         const targetIds = new Set(targetRows.map((r) => r.id));
         const sourceIds = new Set(distinctRows.map((r) => r.id));
         let overlap = 0;
