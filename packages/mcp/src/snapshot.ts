@@ -564,6 +564,37 @@ export class SnapshotManager {
     }
 
     /**
+     * Persist the per-(codebase × model) coverage ratio (P4). Seeds a minimal
+     * 'indexing' entry if none exists (the backfill callback may race ahead of the
+     * first tick), mirroring setFileCompleteForModel's seed behavior. The
+     * coverageByModel field rides the exhaustive carry-forward (M2/RG-5) so it
+     * survives the 2s tick + terminal transition + merge.
+     */
+    public setCoverageRatioForModel(codebasePath: string, modelId: string, ratio: number): void {
+        // Prototype-pollution guard: modelId keys a plain-object map below.
+        this.assertSafeModelId(modelId);
+        let entry = this.codebaseInfoMap.get(codebasePath);
+        if (!entry) {
+            entry = { status: 'indexing', indexingPercentage: 0, lastUpdated: new Date().toISOString() } as CodebaseInfoIndexing;
+            this.codebaseInfoMap.set(codebasePath, entry);
+        }
+        const e = entry as CodebaseInfoIndexing | CodebaseInfoIndexed;
+        if (!e.coverageByModel) e.coverageByModel = {};
+        e.coverageByModel[modelId] = ratio;
+    }
+
+    /**
+     * Read the per-(codebase × model) coverage ratio (P4). Returns undefined when
+     * unknown — the search-side coverage gate treats undefined as DEGRADED for
+     * secondary models (never silently search a possibly-incomplete collection).
+     */
+    public getCoverageRatioForModel(codebasePath: string, modelId: string): number | undefined {
+        const entry = this.codebaseInfoMap.get(codebasePath);
+        const cov = entry && (entry as CodebaseInfoIndexing | CodebaseInfoIndexed).coverageByModel;
+        return cov ? cov[modelId] : undefined;
+    }
+
+    /**
      * Get codebase status
      */
     public getCodebaseStatus(codebasePath: string): 'indexed' | 'indexing' | 'indexfailed' | 'not_found' {

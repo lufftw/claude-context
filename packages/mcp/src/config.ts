@@ -248,53 +248,61 @@ export function createMcpConfig(): ContextMcpConfig {
 }
 
 export function logConfigurationSummary(config: ContextMcpConfig): void {
-    // Log configuration summary before starting server
-    console.log(`[MCP] 🚀 Starting Context MCP Server`);
-    console.log(`[MCP] Configuration Summary:`);
-    console.log(`[MCP]   Server: ${config.name} v${config.version}`);
-    console.log(`[MCP]   Embedding Provider: ${config.embeddingProvider}`);
-    console.log(`[MCP]   Embedding Model: ${config.embeddingModel}`);
-    console.log(`[MCP]   Milvus Address: ${config.milvusAddress || (config.milvusToken ? '[Auto-resolve from token]' : '[Not configured]')}`);
+    // Log configuration summary before starting server.
+    // Stdout is reserved for the JSON-RPC stream — diagnostics go to stderr
+    // (console.error), never stdout. (index.ts also redirects console.log to
+    // stderr, but logging directly to stderr here is unambiguous.)
+    console.error(`[MCP] 🚀 Starting Context MCP Server`);
+    console.error(`[MCP] Configuration Summary:`);
+    console.error(`[MCP]   Server: ${config.name} v${config.version}`);
+    console.error(`[MCP]   Embedding Provider: ${config.embeddingProvider}`);
+    console.error(`[MCP]   Embedding Model: ${config.embeddingModel}`);
+    console.error(`[MCP]   Milvus Address: ${config.milvusAddress || (config.milvusToken ? '[Auto-resolve from token]' : '[Not configured]')}`);
 
     // Log provider-specific configuration without exposing sensitive data
     switch (config.embeddingProvider) {
         case 'OpenAI':
-            console.log(`[MCP]   OpenAI API Key: ${config.openaiApiKey ? '✅ Configured' : '❌ Missing'}`);
+            console.error(`[MCP]   OpenAI API Key: ${config.openaiApiKey ? '✅ Configured' : '❌ Missing'}`);
             if (config.openaiBaseUrl) {
-                console.log(`[MCP]   OpenAI Base URL: ${config.openaiBaseUrl}`);
+                console.error(`[MCP]   OpenAI Base URL: ${config.openaiBaseUrl}`);
             }
             break;
         case 'VoyageAI':
-            console.log(`[MCP]   VoyageAI API Key: ${config.voyageaiApiKey ? '✅ Configured' : '❌ Missing'}`);
+            console.error(`[MCP]   VoyageAI API Key: ${config.voyageaiApiKey ? '✅ Configured' : '❌ Missing'}`);
             break;
         case 'Gemini':
-            console.log(`[MCP]   Gemini API Key: ${config.geminiApiKey ? '✅ Configured' : '❌ Missing'}`);
+            console.error(`[MCP]   Gemini API Key: ${config.geminiApiKey ? '✅ Configured' : '❌ Missing'}`);
             if (config.geminiBaseUrl) {
-                console.log(`[MCP]   Gemini Base URL: ${config.geminiBaseUrl}`);
+                console.error(`[MCP]   Gemini Base URL: ${config.geminiBaseUrl}`);
             }
             break;
         case 'OpenRouter':
-            console.log(`[MCP]   OpenRouter API Key: ${config.openrouterApiKey ? '✅ Configured' : '❌ Missing'}`);
+            console.error(`[MCP]   OpenRouter API Key: ${config.openrouterApiKey ? '✅ Configured' : '❌ Missing'}`);
             break;
         case 'Ollama':
-            console.log(`[MCP]   Ollama Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}`);
-            console.log(`[MCP]   Ollama Model: ${config.embeddingModel}`);
+            console.error(`[MCP]   Ollama Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}`);
+            console.error(`[MCP]   Ollama Model: ${config.embeddingModel}`);
             if (config.ollamaDimension) {
-                console.log(`[MCP]   Ollama Embedding Dimension: ${config.ollamaDimension}`);
+                console.error(`[MCP]   Ollama Embedding Dimension: ${config.ollamaDimension}`);
             }
             break;
         case 'RabbitMQ':
-            console.log(`[MCP]   RabbitMQ URL: ${config.rabbitmqUrl ? '✅ Configured' : '❌ Missing (RABBITMQ_INFERENCE_URL)'}`);
-            console.log(`[MCP]   RabbitMQ Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b (default)'}`);
-            console.log(`[MCP]   RabbitMQ Model: ${config.embeddingModel}`);
-            console.log(`[MCP]   RabbitMQ Dimension: ${config.rabbitmqDimension ?? 4096}`);
-            console.log(`[MCP]   RabbitMQ Priority: ${config.rabbitmqPriority ?? 5}`);
-            console.log(`[MCP]   RabbitMQ Concurrency: ${config.rabbitmqConcurrency ?? 10}`);
-            console.log(`[MCP]   RabbitMQ Timeout: ${config.rabbitmqTimeoutMs ?? 30000}ms`);
+            console.error(`[MCP]   RabbitMQ URL: ${config.rabbitmqUrl ? '✅ Configured' : '❌ Missing (RABBITMQ_INFERENCE_URL)'}`);
+            console.error(`[MCP]   RabbitMQ Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b (default)'}`);
+            console.error(`[MCP]   RabbitMQ Model: ${config.embeddingModel}`);
+            console.error(`[MCP]   RabbitMQ Dimension: ${config.rabbitmqDimension ?? 4096}`);
+            console.error(`[MCP]   RabbitMQ Priority: ${config.rabbitmqPriority ?? 5}`);
+            console.error(`[MCP]   RabbitMQ Concurrency: ${config.rabbitmqConcurrency ?? 10}`);
+            // Default mirrors RabbitMQEmbeddingConfig.timeoutMs (1_700_000 ≈ 28 min),
+            // not the stale 30000 that previously appeared here.
+            console.error(`[MCP]   RabbitMQ Timeout: ${config.rabbitmqTimeoutMs ?? 1_700_000}ms`);
+            // Secondary (0.6B) dual-embedding summary — only meaningful when activated.
+            console.error(`[MCP]   Secondary (0.6B): ${config.milvusCollectionPrivate0p6b ? `ON (collection=${config.milvusCollectionPrivate0p6b}, queue=${config.rabbitmqSecondaryQueue ?? 'embedding.qwen3-0.6b'}, dim=${config.rabbitmqSecondaryDimension ?? 1024})` : 'OFF'}`);
+            console.error(`[MCP]   Search default model: ${config.searchEmbeddingModel}`);
             break;
     }
 
-    console.log(`[MCP] 🔧 Initializing server components...`);
+    console.error(`[MCP] 🔧 Initializing server components...`);
 }
 
 export function showHelpMessage(): void {

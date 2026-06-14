@@ -1,4 +1,6 @@
 import { OpenAIEmbedding, VoyageAIEmbedding, GeminiEmbedding, OllamaEmbedding, RabbitMQEmbedding } from "@zilliz/claude-context-core";
+import type { RabbitMQEmbeddingConfig } from "@zilliz/claude-context-core";
+import { getModelSpec, isCanonicalModelId } from "@zilliz/claude-context-core";
 import { ContextMcpConfig } from "./config.js";
 
 // Helper function to create embedding instance based on provider
@@ -126,4 +128,104 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
             console.log(`[EMBEDDING] RabbitMQ configuration - Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b'}, URL: ${config.rabbitmqUrl ? '✅ Provided' : '❌ Missing'}`);
             break;
     }
+}
+
+/**
+ * Construct the secondary (0.6B) RabbitMQEmbedding instance ONLY when the config
+ * activates it (milvusCollectionPrivate0p6b is truthy). Returns undefined otherwise.
+ *
+ * The activation signal is the PRESENCE of MILVUS_COLLECTION_PRIVATE_0P6B — this ensures
+ * that adding only a queue override does nothing, and the user must explicitly name the
+ * collection they want to write into.
+ *
+ * Per LD-2: secondary uses a SEPARATE RabbitMQEmbedding instance from the primary because
+ * the per-instance dimension guard in rabbitmq-embedding.ts forbids reusing one instance
+ * across dimensions (dim guard rejects wrong-dim replies at the protocol level).
+ *
+ * All diagnostic output goes to stderr — never stdout (JSON-RPC sanctity).
+ */
+export function createSecondaryEmbeddingInstance(
+    config: ContextMcpConfig,
+): RabbitMQEmbedding | undefined {
+    // Activation check: MILVUS_COLLECTION_PRIVATE_0P6B must be set.
+    if (!config.milvusCollectionPrivate0p6b) {
+        console.error('[EMBEDDING] Secondary embedding: MILVUS_COLLECTION_PRIVATE_0P6B not set → secondary OFF (single-model mode)');
+        return undefined;
+    }
+
+    // Only RabbitMQ supports secondary instances in this fork (the other providers
+    // do not have the per-instance dimension guard needed for Option B).
+    if (config.embeddingProvider !== 'RabbitMQ') {
+        console.error(
+            `[EMBEDDING] Secondary embedding: provider=${config.embeddingProvider} does not support dual-model — secondary disabled. ` +
+            `Set EMBEDDING_PROVIDER=RabbitMQ to enable.`
+        );
+        return undefined;
+    }
+
+    if (!config.rabbitmqUrl) {
+        console.error('[EMBEDDING] Secondary embedding: RABBITMQ_INFERENCE_URL not set — secondary disabled');
+        return undefined;
+    }
+
+    // Resolve secondary spec from registry; allow env overrides for non-standard deployments.
+    const secondaryModelId = config.rabbitmqSecondaryModel ?? 'qwen3-embedding-0.6b';
+    if (!isCanonicalModelId(secondaryModelId)) {
+        console.error(
+            `[EMBEDDING] Secondary embedding: RABBITMQ_SECONDARY_MODEL='${secondaryModelId}' is not a canonical model id. ` +
+            `Secondary disabled.`
+        );
+        return undefined;
+    }
+    const spec = getModelSpec(secondaryModelId);
+
+    const secondaryQueue = config.rabbitmqSecondaryQueue ?? spec.queue;
+    const secondaryDimension = config.rabbitmqSecondaryDimension ?? spec.dimension;
+
+    const rmqCfg: RabbitMQEmbeddingConfig = {
+        url: config.rabbitmqUrl,
+        queue: secondaryQueue,
+        modelName: secondaryModelId,
+        dimension: secondaryDimension,
+        // Inherit timeout/retries from primary config — secondary runs at background priority,
+        // so being patient is correct. maxRetries stays the same (WAIT-tolerance).
+        timeoutMs: config.rabbitmqTimeoutMs,
+        maxRetries: config.rabbitmqMaxRetries,
+        // Secondary uses registry priorityDefault (=1) unless caller overrides at embed time.
+        // Do NOT inherit rabbitmqPriority from primary (that is the interactive 8B priority=10).
+        priority: spec.priorityDefault,
+        concurrency: config.rabbitmqConcurrency,
+        source: config.rabbitmqSource ?? 'claude-context',
+    };
+
+    const secondary = new RabbitMQEmbedding(rmqCfg);
+
+    // Startup stderr log — provider/queue/dim triplet for observability (never stdout).
+    console.error(
+        `[EMBEDDING] Secondary instance ACTIVE — provider=RabbitMQ queue=${secondaryQueue} dim=${secondaryDimension} model=${secondaryModelId} collection=${config.milvusCollectionPrivate0p6b}`
+    );
+
+    return secondary;
+}
+
+/**
+ * Log the active model configuration to stderr at MCP startup.
+ * Called AFTER both instances are constructed so the log is a complete picture.
+ * NEVER writes to stdout.
+ */
+export function logActiveModels(
+    primaryQueue: string,
+    primaryDim: number,
+    secondaryQueue: string | undefined,
+    secondaryDim: number | undefined,
+    searchDefault: string,
+): void {
+    console.error(`[EMBEDDING] Active models:`);
+    console.error(`[EMBEDDING]   primary:   queue=${primaryQueue} dim=${primaryDim}`);
+    if (secondaryQueue !== undefined) {
+        console.error(`[EMBEDDING]   secondary: queue=${secondaryQueue} dim=${secondaryDim}`);
+    } else {
+        console.error(`[EMBEDDING]   secondary: OFF`);
+    }
+    console.error(`[EMBEDDING]   searchDefault: ${searchDefault}`);
 }

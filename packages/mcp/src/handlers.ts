@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer } from "@zilliz/claude-context-core";
+import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, DEFAULT_PRIMARY_MODEL_ID } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
 
@@ -499,8 +499,17 @@ export class ToolHandlers {
     }
 
     public async handleSearchCode(args: any) {
-        const { path: codebasePath, query, limit = 10, extensionFilter } = args;
+        const { path: codebasePath, query, limit = 10, extensionFilter, embeddingModel } = args;
         const resultLimit = limit || 10;
+        // Resolution precedence (M4 / R-C5 single-site): pass the explicit arg or
+        // `undefined`. DO NOT read process.env here — the SINGLE authoritative
+        // resolution (explicit arg > project-`.env` SEARCH_EMBEDDING_MODEL > 8B) lives
+        // in Context._semanticSearchImpl, which runs inside runWithProject so the
+        // project `.env` wins (the fork's project-scope rule). A user-scope
+        // process.env read here would shadow the project value and silently break
+        // the per-session model trigger.
+        const resolvedModel: string | undefined =
+            (typeof embeddingModel === 'string' && embeddingModel.length > 0) ? embeddingModel : undefined;
 
         try {
             // Sync indexed codebases from cloud first
@@ -581,13 +590,42 @@ export class ToolHandlers {
                 filterExpr = `fileExtension in [${quoted}]`;
             }
 
-            // Search in the specified codebase
+            // Structured degraded short-circuit (C4 / D7): when a SECONDARY model is
+            // explicitly requested but it is not configured or not yet readable
+            // (collection missing / coverage below threshold), return a STRUCTURED
+            // JSON object — never a wrong-dim ANN call. The Phase-6 D7 gate parses
+            // this JSON (degraded/reason), never substring-matches.
+            if (resolvedModel && resolvedModel !== DEFAULT_PRIMARY_MODEL_ID) {
+                if (!this.context.hasEmbeddingForModel(resolvedModel)) {
+                    console.log(`[SEARCH] 🟡 Requested model '${resolvedModel}' is not configured — returning structured degraded notice (secondary-not-configured)`);
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({ degraded: true, reason: 'secondary-not-configured', results: [] })
+                        }]
+                    };
+                }
+                const readable = await this.context.isModelReadable(absolutePath, resolvedModel);
+                if (!readable) {
+                    console.log(`[SEARCH] 🟡 Requested model '${resolvedModel}' is configured but not yet readable — returning structured degraded notice (secondary-coverage-below-threshold)`);
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({ degraded: true, reason: 'secondary-coverage-below-threshold', results: [] })
+                        }]
+                    };
+                }
+            }
+
+            // Search in the specified codebase (route the query embedding + collection by model).
+            console.log(`[SEARCH] 🧭 Routing search via embedding model: ${resolvedModel ?? '(default/project-scope)'}`);
             const searchResults = await this.context.semanticSearch(
                 absolutePath,
                 query,
                 Math.min(resultLimit, 50),
                 0.3,
-                filterExpr
+                filterExpr,
+                resolvedModel
             );
 
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
@@ -830,11 +868,12 @@ export class ToolHandlers {
 
             switch (status) {
                 case 'indexed': {
-                    // Verify collection still exists in Milvus (may be lost after restart/cleanup)
-                    const collectionName = this.context.getCollectionName(absolutePath);
-                    const hasCollection = await this.context.getVectorDatabase().hasCollection(collectionName);
+                    // Verify the PRIMARY collection still exists in Milvus (may be lost after restart/cleanup).
+                    // isModelReadable for the primary == today's hasCollection check (coverage 1.0, configured true),
+                    // so status and search derive readability from the SAME predicate (P3 — they never disagree).
+                    const primaryReadable = await this.context.isModelReadable(absolutePath, 'qwen3-embedding-8b');
 
-                    if (!hasCollection) {
+                    if (!primaryReadable) {
                         statusMessage = `⚠️ Codebase '${absolutePath}' was indexed but the index data has been lost (collection not found in Milvus).`;
                         statusMessage += `\n🔄 Please re-index using index_codebase with force=true.`;
                         break;
@@ -848,6 +887,18 @@ export class ToolHandlers {
                         statusMessage += `\n🕐 Last updated: ${new Date(indexedInfo.lastUpdated).toLocaleString()}`;
                     } else {
                         statusMessage = `✅ Codebase '${absolutePath}' is fully indexed and ready for search.`;
+                    }
+
+                    // Per-model readability for SECONDARY models (only surfaced when configured).
+                    // Enumerate active models via the ONE enumerator (SEAM-2) and report each
+                    // non-primary model's readability through the shared isModelReadable
+                    // predicate, so status and search stay in lock-step (P3).
+                    for (const modelId of this.context.getActiveModelIds()) {
+                        if (modelId === DEFAULT_PRIMARY_MODEL_ID) continue;
+                        const secondaryReadable = await this.context.isModelReadable(absolutePath, modelId);
+                        statusMessage += secondaryReadable
+                            ? `\n🟢 Secondary model '${modelId}' is readable.`
+                            : `\n🟡 Secondary model '${modelId}' is configured but NOT yet readable (collection missing or coverage below threshold — searches with it return a degraded notice).`;
                     }
                     break;
                 }

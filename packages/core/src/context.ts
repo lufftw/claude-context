@@ -103,6 +103,14 @@ export interface ContextConfig {
      * absence ⇒ single-model byte-identical path.
      */
     secondaryEmbedding?: Embedding;
+    /**
+     * Optional per-(codebase × model) coverage-ratio reader (P4/LD-10).
+     * Supplied by the MCP layer from the snapshot. Returns the distinct-PK
+     * overlap ratio for a model's collection, or undefined when unknown. Core
+     * must not import the mcp SnapshotManager — this callback is the only bridge
+     * (mirrors how priorLedger crosses the boundary).
+     */
+    coverageReader?: (codebasePath: string, modelId: string) => number | undefined;
     vectorDatabase?: VectorDatabase;
     codeSplitter?: Splitter;
     supportedExtensions?: string[];
@@ -206,6 +214,7 @@ function isIndexAbort(e: unknown): e is IndexAbortError {
 export class Context {
     private embedding: Embedding;
     private secondaryEmbedding?: Embedding;
+    private coverageReader?: (codebasePath: string, modelId: string) => number | undefined;
     private vectorDatabase: VectorDatabase;
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
@@ -225,6 +234,11 @@ export class Context {
         // undefined when no secondary is configured ⇒ buildIndexTargets() returns a
         // single target ⇒ the index/delete path is byte-identical to single-model.
         this.secondaryEmbedding = config.secondaryEmbedding;
+
+        // P4 coverage-ratio bridge (LD-10). undefined ⇒ secondary models read as
+        // "unknown coverage" ⇒ degraded (never silently search a possibly-incomplete
+        // collection). The primary model never consults this reader.
+        this.coverageReader = config.coverageReader;
 
         if (!config.vectorDatabase) {
             throw new Error('VectorDatabase is required. Please provide a vectorDatabase instance in the config.');
@@ -276,6 +290,83 @@ export class Context {
      */
     getEmbedding(): Embedding {
         return this.embedding;
+    }
+
+    /**
+     * Resolve the configured Embedding instance for a canonical model id (M4).
+     *
+     * The PRIMARY id always maps to `this.embedding` (byte-identical default).
+     * A non-primary id maps to `this.secondaryEmbedding` IFF it was configured;
+     * if not configured we THROW a clear configuration error rather than fall
+     * back to the wrong-dimension primary instance (never a wrong-dim ANN call).
+     * Throws on an unknown model id (registry SSOT).
+     */
+    public getEmbeddingForModel(modelId: string): Embedding {
+        getModelSpec(modelId); // validates id; throws on unknown
+        if (modelId === DEFAULT_PRIMARY_MODEL_ID) {
+            return this.embedding;
+        }
+        if (!this.secondaryEmbedding) {
+            throw new Error(
+                `embedding model '${modelId}' not configured (no secondary embedding instance)`,
+            );
+        }
+        return this.secondaryEmbedding;
+    }
+
+    /**
+     * Whether an Embedding instance is configured for the given model id.
+     * Used by search routing to decide between routing vs. a clear notice
+     * WITHOUT ever issuing a mismatched-dimension query.
+     */
+    public hasEmbeddingForModel(modelId: string): boolean {
+        if (modelId === DEFAULT_PRIMARY_MODEL_ID) return true;
+        return this.secondaryEmbedding !== undefined;
+    }
+
+    /**
+     * P4 coverage gate (LD-10). The PRIMARY model is the source of truth and is
+     * always sufficient. For a SECONDARY model, the model's collection is readable
+     * only when its persisted distinct-PK overlap ratio meets the threshold
+     * (COVERAGE_READABLE_THRESHOLD, default 0.85). Unknown ratio (no reader, or
+     * reader returns undefined) ⇒ DEGRADED — never silently search a possibly
+     * incomplete backfill.
+     *
+     * Synchronous (reads the in-memory snapshot via the injected reader) so both
+     * the search hot-path and isModelReadable can call it without an extra await.
+     */
+    public isCoverageSufficientForModel(codebasePath: string, modelId: string): boolean {
+        if (modelId === DEFAULT_PRIMARY_MODEL_ID) return true;
+        const thresholdRaw = envManager.get('COVERAGE_READABLE_THRESHOLD');
+        const threshold = thresholdRaw !== undefined && thresholdRaw !== null && thresholdRaw !== ''
+            ? parseFloat(thresholdRaw)
+            : 0.85;
+        const ratio = this.coverageReader?.(codebasePath, modelId);
+        if (ratio === undefined || Number.isNaN(ratio)) return false;
+        return ratio >= threshold;
+    }
+
+    /**
+     * Single readability predicate shared by get_indexing_status AND search (P3,
+     * RG-6/RG-7) so the two can never disagree about a model.
+     *
+     * A model is readable for a codebase when:
+     *   (1) its embedding instance is configured (hasEmbeddingForModel), AND
+     *   (2) its per-model collection exists in the vector DB, AND
+     *   (3) its coverage ratio meets the readable threshold
+     *       (always true for the primary; the P4 gate for secondaries).
+     *
+     * The primary model stays byte-identical to today's status check: configured
+     * (true), collection-exists (the same hasCollection call status already runs),
+     * coverage 1.0 (true).
+     */
+    public async isModelReadable(codebasePath: string, modelId: string): Promise<boolean> {
+        getModelSpec(modelId); // validate id
+        if (!this.hasEmbeddingForModel(modelId)) return false;
+        const collectionName = this.getCollectionNameForModel(codebasePath, modelId);
+        const exists = await this.vectorDatabase.hasCollection(collectionName);
+        if (!exists) return false;
+        return this.isCoverageSufficientForModel(codebasePath, modelId);
     }
 
     /**
@@ -379,6 +470,30 @@ export class Context {
     }
 
     /**
+     * Model-aware shared-collection resolver (M5).
+     *
+     * The shared collection (`MILVUS_COLLECTION_SHARED`) is a fixed-dimension
+     * space created at the PRIMARY model's dimension (4096 for qwen3-8b). A
+     * secondary-model (1024-dim) query vector ANN-searched against that 4096-dim
+     * space is a guaranteed dimension mismatch on the FIRST secondary search of
+     * any hybrid/shared project — including the MVP target (claude-context,
+     * strategy=hybrid, shared=dev_infra_shared).
+     *
+     * Therefore the shared arm is appended ONLY for the primary model. Any model
+     * that lacks a same-dimension shared collection returns undefined; the caller
+     * (_semanticSearchImpl) then searches the model's private collection only.
+     * Throws on an unknown model id (registry SSOT — fail fast, never wrong-dim).
+     */
+    public getSharedCollectionNameForModel(modelId: string): string | undefined {
+        getModelSpec(modelId); // validates the id; throws on unknown
+        if (modelId !== DEFAULT_PRIMARY_MODEL_ID) {
+            // No same-dim shared collection exists for non-primary models in the MVP.
+            return undefined;
+        }
+        return this.getSharedCollectionName();
+    }
+
+    /**
      * Get the writable shared collection name from environment, if configured.
      * When set, indexing will dual-write to both private and shared collections
      * using a single embedding computation (no additional API cost).
@@ -424,6 +539,32 @@ export class Context {
             return override;
         }
         return this.getCollectionName(codebasePath) + spec.collectionSuffix;
+    }
+
+    /**
+     * Enumerate the set of collection names that are ACTIVE for a codebase under
+     * the current model configuration (P3 shared sweep). Used by clear (and any
+     * other per-model sweep) so it can never miss a model's collection.
+     *
+     * Model ids come from the ONE enumerator getActiveModelIds() (SEAM-2 / R-C4) —
+     * never re-derived inline. For each active model: its per-model collection. The
+     * PRIMARY additionally contributes its writable-shared sibling when configured
+     * (M5: only the primary has a same-dim shared space; the secondary has none).
+     *
+     * De-duplicated; safe when only the primary is configured (returns the single
+     * primary collection — byte-identical to today's clear).
+     */
+    private getActiveModelCollectionNames(codebasePath: string): string[] {
+        const names = new Set<string>();
+        for (const modelId of this.getActiveModelIds()) {
+            names.add(this.getCollectionNameForModel(codebasePath, modelId));
+            // Writable-shared sibling only for the primary (M5: 0.6B has none).
+            if (modelId === DEFAULT_PRIMARY_MODEL_ID) {
+                const ws = this.getWritableSharedCollectionName();
+                if (ws) names.add(ws);
+            }
+        }
+        return [...names];
     }
 
     /**
@@ -708,18 +849,47 @@ export class Context {
      * @param topK Number of results to return
      * @param threshold Similarity threshold
      */
-    async semanticSearch(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string): Promise<SemanticSearchResult[]> {
+    async semanticSearch(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, embeddingModel?: string): Promise<SemanticSearchResult[]> {
         // Scope project-`.env` reads to this call (parallel-safe via AsyncLocalStorage)
-        return envManager.runWithProject(codebasePath, () => this._semanticSearchImpl(codebasePath, query, topK, threshold, filterExpr));
+        return envManager.runWithProject(codebasePath, () => this._semanticSearchImpl(codebasePath, query, topK, threshold, filterExpr, embeddingModel));
     }
 
-    private async _semanticSearchImpl(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string): Promise<SemanticSearchResult[]> {
+    private async _semanticSearchImpl(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, embeddingModel?: string): Promise<SemanticSearchResult[]> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
-        console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
 
-        const collectionName = this.getCollectionName(codebasePath);
-        const sharedCollectionName = this.getSharedCollectionName();
+        // ── Model resolution (M4 / R-C5): explicit param > SEARCH_EMBEDDING_MODEL env > primary 8B.
+        // This is the SINGLE authoritative resolution site. It runs inside
+        // runWithProject (see semanticSearch), so envManager.get() reads the project
+        // `.env` value — project scope WINS over user scope (fork rule). The handler
+        // passes either the explicit arg or `undefined`; it never reads process.env
+        // itself, so a project `.env` SEARCH_EMBEDDING_MODEL is honored here.
+        const requestedModel = embeddingModel
+            ?? envManager.get('SEARCH_EMBEDDING_MODEL')
+            ?? DEFAULT_PRIMARY_MODEL_ID;
+        getModelSpec(requestedModel); // validate id; throws on unknown
+        console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath} [model=${requestedModel}]`);
+
+        // Requested-but-unconfigured model → clear notice, NEVER a wrong-dim ANN call (M4/LD-8/D7).
+        if (!this.hasEmbeddingForModel(requestedModel)) {
+            console.log(`[Context] ⚠️  Embedding model '${requestedModel}' is not configured — returning no results (configure the secondary model to search it).`);
+            return [];
+        }
+
+        // Resolve the query-embedding instance and the model's collection (Phase 2 resolver).
+        const queryEmbedder = this.getEmbeddingForModel(requestedModel);
+        const collectionName = this.getCollectionNameForModel(codebasePath, requestedModel);
+
+        // P4 coverage gate (secondary models only): if the model's collection
+        // coverage is below threshold (or unknown), return the degraded notice
+        // WITHOUT issuing the ANN call. Primary model is always sufficient.
+        if (!this.isCoverageSufficientForModel(codebasePath, requestedModel)) {
+            console.log(`[Context] ⚠️  Coverage for model '${requestedModel}' on ${codebasePath} is below the readable threshold — returning no results (degraded; backfill incomplete).`);
+            return [];
+        }
+
+        // ── Shared arm is model-aware (M5): only the primary model has a same-dim shared space.
+        const sharedCollectionName = this.getSharedCollectionNameForModel(requestedModel);
         const collectionsToSearch: string[] = [collectionName];
 
         if (sharedCollectionName && sharedCollectionName !== collectionName) {
@@ -749,9 +919,9 @@ export class Context {
                 console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
             }
 
-            // 1. Generate query vector (once, reused for all collections)
+            // 1. Generate query vector (once, reused for all collections) via the RESOLVED model instance.
             console.log(`[Context] 🔍 Generating embeddings for query: "${query}"`);
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+            const queryEmbedding: EmbeddingVector = await queryEmbedder.embed(query);
             console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
 
             // 2. Search all collections and merge results
@@ -818,7 +988,7 @@ export class Context {
             return allResults;
         } else {
             // Regular semantic search — also supports multi-collection
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+            const queryEmbedding: EmbeddingVector = await queryEmbedder.embed(query);
             let allResults: SemanticSearchResult[] = [];
 
             for (const collection of collectionsToSearch) {
@@ -886,19 +1056,37 @@ export class Context {
 
         progressCallback?.({ phase: 'Checking existing index...', current: 0, total: 100, percentage: 0 });
 
-        const collectionName = this.getCollectionName(codebasePath);
-        const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
+        // Drop EVERY active model collection (primary + secondary + writable-shared
+        // sibling) via the one shared enumerator (P3). A single-model config yields
+        // exactly the primary collection — byte-identical to the prior behavior.
+        const collectionNames = this.getActiveModelCollectionNames(codebasePath);
 
         progressCallback?.({ phase: 'Removing index data...', current: 50, total: 100, percentage: 50 });
 
-        if (collectionExists) {
-            await this.vectorDatabase.dropCollection(collectionName);
+        const dropFailures: string[] = [];
+        for (const collectionName of collectionNames) {
+            try {
+                const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
+                if (collectionExists) {
+                    await this.vectorDatabase.dropCollection(collectionName);
+                    console.log(`[Context] 🗑️  Dropped collection ${collectionName}`);
+                }
+            } catch (dropErr) {
+                // Pair the abort with recovery: record and keep sweeping the other
+                // collections, then re-throw an aggregate so the caller never
+                // believes a partial clear fully succeeded.
+                console.error(`[Context] ❌ Failed to drop collection ${collectionName}: ${dropErr}`);
+                dropFailures.push(collectionName);
+            }
         }
 
         // Delete snapshot file
         await FileSynchronizer.deleteSnapshot(codebasePath);
 
         progressCallback?.({ phase: 'Index cleared', current: 100, total: 100, percentage: 100 });
+        if (dropFailures.length > 0) {
+            throw new Error(`clearIndex partially failed: could not drop ${dropFailures.join(', ')} (re-run clear_index to retry; snapshot was still cleared).`);
+        }
         console.log('[Context] ✅ Index data cleaned');
     }
 
