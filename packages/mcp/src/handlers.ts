@@ -420,14 +420,16 @@ export class ToolHandlers {
             const embeddingProvider = this.context.getEmbedding();
             console.log(`[BACKGROUND-INDEX] 🧠 Using embedding provider: ${embeddingProvider.getProvider()} with dimension: ${embeddingProvider.getDimension()}`);
 
-            // Capture the prior-run completeness ledger BEFORE indexing mutates
-            // the live snapshot entry (Commit 4/4 — the resume read). This is the
-            // snapshot state loaded at MCP startup / the prior run; core's resume
-            // skip consults it to decide which files are verified-complete and may
-            // be skipped vs. partial and must be re-embedded. getFileLedger returns
-            // a COPY, so the in-run setFileComplete mutations below don't perturb
-            // what the resume read sees.
-            const priorLedger = this.snapshotManager.getFileLedger(absolutePath);
+            // Capture the per-MODEL prior-run completeness ledgers BEFORE indexing
+            // mutates the live snapshot entry (M8 — the resume read, per target).
+            // getFileLedgerForModel returns a COPY, so in-run setFileCompleteForModel
+            // mutations don't perturb what the resume read sees. Building the map for
+            // BOTH known models keeps the 0.6B target from re-embedding fully on every
+            // MCP restart (R2-HANDLER-PRIORLEDGER).
+            const priorLedgersByModel = new Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>();
+            for (const modelId of ['qwen3-embedding-8b', 'qwen3-embedding-0.6b']) {
+                priorLedgersByModel.set(modelId, this.snapshotManager.getFileLedgerForModel(absolutePath, modelId));
+            }
 
             // Start indexing with the appropriate context and progress tracking
             console.log(`[BACKGROUND-INDEX] 🚀 Beginning codebase indexing process...`);
@@ -444,12 +446,16 @@ export class ToolHandlers {
                 }
 
                 console.log(`[BACKGROUND-INDEX] Progress: ${progress.phase} - ${progress.percentage}% (${progress.current}/${progress.total})`);
-            }, (relativePath, info) => {
-                // Per-file completeness ledger (Commit 3/4). Mutates the in-memory
-                // snapshot entry in place; the 2s periodic save above (and the
-                // terminal setCodebaseIndexed) then persists it durably.
-                this.snapshotManager.setFileComplete(absolutePath, relativePath, info);
-            }, undefined /* forceReindex — keep default */, priorLedger);
+            }, (modelId, relativePath, info) => {
+                // Per-(file × model) completeness ledger (M8). Writes the 8B path
+                // into the legacy top-level `files` (byte-identical) and the 0.6B
+                // path into filesByModel[modelId] (snapshot v2-additive). The
+                // synthetic '__writable_shared__' target is filtered out by the
+                // assertSafeModelId guard upstream — it never reaches here because
+                // canonical onFileComplete is only fired for queryable models, but
+                // route defensively through setFileCompleteForModel regardless.
+                this.snapshotManager.setFileCompleteForModel(absolutePath, modelId, relativePath, info);
+            }, undefined /* forceReindex — keep default */, priorLedgersByModel);
             console.log(`[BACKGROUND-INDEX] ✅ Indexing completed successfully! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
 
             // Set codebase to indexed status with complete statistics
