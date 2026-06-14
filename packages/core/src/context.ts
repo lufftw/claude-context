@@ -215,6 +215,9 @@ export class Context {
     private embedding: Embedding;
     private secondaryEmbedding?: Embedding;
     private coverageReader?: (codebasePath: string, modelId: string) => number | undefined;
+    // M2: latches true after the first non-finite COVERAGE_READABLE_THRESHOLD warning
+    // so the bad-value notice is emitted exactly once per process, not per search.
+    private coverageThresholdWarned = false;
     private vectorDatabase: VectorDatabase;
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
@@ -337,10 +340,23 @@ export class Context {
      */
     public isCoverageSufficientForModel(codebasePath: string, modelId: string): boolean {
         if (modelId === DEFAULT_PRIMARY_MODEL_ID) return true;
+        // M2: NaN-guard the threshold. A garbage env value (e.g. 'abc') makes
+        // parseFloat return NaN, and `ratio >= NaN` is ALWAYS false — which would
+        // silently degrade EVERY secondary forever. Fall back to the 0.85 default
+        // on any non-finite parse, and warn ONCE (console.warn, not console.log —
+        // stdout is reserved for the JSON-RPC stream) when a present value was bad.
         const thresholdRaw = envManager.get('COVERAGE_READABLE_THRESHOLD');
-        const threshold = thresholdRaw !== undefined && thresholdRaw !== null && thresholdRaw !== ''
-            ? parseFloat(thresholdRaw)
-            : 0.85;
+        const thresholdPresent = thresholdRaw !== undefined && thresholdRaw !== null && thresholdRaw !== '';
+        let threshold = 0.85;
+        if (thresholdPresent) {
+            const parsed = parseFloat(thresholdRaw);
+            if (Number.isFinite(parsed)) {
+                threshold = parsed;
+            } else if (!this.coverageThresholdWarned) {
+                this.coverageThresholdWarned = true;
+                console.warn(`[Context] ⚠️  COVERAGE_READABLE_THRESHOLD='${thresholdRaw}' is not a finite number — falling back to default 0.85.`);
+            }
+        }
         const ratio = this.coverageReader?.(codebasePath, modelId);
         if (ratio === undefined || Number.isNaN(ratio)) return false;
         return ratio >= threshold;
@@ -905,6 +921,10 @@ export class Context {
         }
 
         // Check if primary collection exists
+        // TODO(dual-embedding follow-up): M3 — for a SECONDARY model this hasCollection
+        // call is redundant with isModelReadable() (which the search handler already ran
+        // and which itself calls hasCollection on the same per-model collection). A future
+        // perf pass could thread the readability result through to skip this second round-trip.
         const hasCollection = await this.vectorDatabase.hasCollection(collectionName);
         if (!hasCollection) {
             console.log(`[Context] ⚠️  Collection '${collectionName}' does not exist. Please index the codebase first.`);

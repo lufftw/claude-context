@@ -287,6 +287,12 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
             }
             break;
         case 'RabbitMQ':
+            // TODO(dual-embedding follow-up): M4 — the default literals in this RabbitMQ
+            // summary block (4096, 5, 10, 1_700_000, 1024, 'embedding.qwen3-8b',
+            // 'embedding.qwen3-0.6b') duplicate the real defaults applied where the provider
+            // config is constructed. They can drift silently if those source-of-truth
+            // defaults change. A follow-up should source these from a single shared default
+            // table (or echo the resolved config values) so the log can never lie.
             console.error(`[MCP]   RabbitMQ URL: ${config.rabbitmqUrl ? '✅ Configured' : '❌ Missing (RABBITMQ_INFERENCE_URL)'}`);
             console.error(`[MCP]   RabbitMQ Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b (default)'}`);
             console.error(`[MCP]   RabbitMQ Model: ${config.embeddingModel}`);

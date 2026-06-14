@@ -631,9 +631,15 @@ export class ToolHandlers {
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 
             if (searchResults.length === 0) {
-                // Check if collection was lost (indexed locally but missing in Milvus)
+                // Check if collection was lost (indexed locally but missing in Milvus).
+                // I1: probe the PER-MODEL collection for the SAME resolved model the
+                // search used — NOT the always-primary getCollectionName. For a 0.6B
+                // search this resolves the `_0p6b` collection, so a healthy 0.6B index
+                // is never wrongly reported as "lost" just because a secondary became
+                // readable-but-empty. `resolvedModel` is the exact value passed to
+                // semanticSearch above; default to the primary id when unset.
                 if (isIndexed && !isIndexing) {
-                    const collectionName = this.context.getCollectionName(absolutePath);
+                    const collectionName = this.context.getCollectionNameForModel(absolutePath, resolvedModel ?? DEFAULT_PRIMARY_MODEL_ID);
                     const hasCollection = await this.context.getVectorDatabase().hasCollection(collectionName);
                     if (!hasCollection) {
                         return {
