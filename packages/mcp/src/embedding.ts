@@ -131,12 +131,16 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
 }
 
 /**
- * Construct the secondary (0.6B) RabbitMQEmbedding instance ONLY when the config
- * activates it (milvusCollectionPrivate0p6b is truthy). Returns undefined otherwise.
+ * Construct the secondary (0.6B) RabbitMQEmbedding instance when the config activates it.
+ * Returns undefined otherwise.
  *
- * The activation signal is the PRESENCE of MILVUS_COLLECTION_PRIVATE_0P6B — this ensures
- * that adding only a queue override does nothing, and the user must explicitly name the
- * collection they want to write into.
+ * Activation (decision B): the secondary model id appears in SECONDARY_EMBEDDING_MODELS
+ * (config.secondaryEmbeddingModels). This is ONE list var that does not grow per model —
+ * a future model is added by listing its id, never by inventing a new per-model env var.
+ * The collection name auto-derives from the registry suffix (getCollectionNameForModel),
+ * so activation no longer requires naming the collection. For BACKWARD COMPATIBILITY a
+ * set MILVUS_COLLECTION_PRIVATE_0P6B still activates on its own; it is otherwise a pure
+ * name override.
  *
  * Per LD-2: secondary uses a SEPARATE RabbitMQEmbedding instance from the primary because
  * the per-instance dimension guard in rabbitmq-embedding.ts forbids reusing one instance
@@ -147,10 +151,33 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
 export function createSecondaryEmbeddingInstance(
     config: ContextMcpConfig,
 ): RabbitMQEmbedding | undefined {
-    // Activation check: MILVUS_COLLECTION_PRIVATE_0P6B must be set.
-    if (!config.milvusCollectionPrivate0p6b) {
-        console.error('[EMBEDDING] Secondary embedding: MILVUS_COLLECTION_PRIVATE_0P6B not set → secondary OFF (single-model mode)');
+    // Resolve the secondary model id (single-instance MVP: one secondary). This is the id
+    // both the activation list and core's getActiveModelIds() key on.
+    const secondaryModelId = config.rabbitmqSecondaryModel ?? 'qwen3-embedding-0.6b';
+    if (!isCanonicalModelId(secondaryModelId)) {
+        console.error(
+            `[EMBEDDING] Secondary embedding: RABBITMQ_SECONDARY_MODEL='${secondaryModelId}' is not a canonical model id. ` +
+            `Secondary disabled.`
+        );
         return undefined;
+    }
+
+    // Activation: listed in SECONDARY_EMBEDDING_MODELS, OR legacy MILVUS_COLLECTION_PRIVATE_0P6B set.
+    const listed = Array.isArray(config.secondaryEmbeddingModels)
+        && config.secondaryEmbeddingModels.includes(secondaryModelId);
+    const legacyActivation = !!config.milvusCollectionPrivate0p6b;
+    if (!listed && !legacyActivation) {
+        console.error(
+            `[EMBEDDING] Secondary embedding: not activated → secondary OFF (single-model mode). ` +
+            `Set SECONDARY_EMBEDDING_MODELS=${secondaryModelId} to enable.`
+        );
+        return undefined;
+    }
+    if (legacyActivation && !listed) {
+        console.error(
+            `[EMBEDDING] Secondary embedding: activated via legacy MILVUS_COLLECTION_PRIVATE_0P6B; ` +
+            `prefer SECONDARY_EMBEDDING_MODELS=${secondaryModelId} (the collection name auto-derives).`
+        );
     }
 
     // Only RabbitMQ supports secondary instances in this fork (the other providers
@@ -169,14 +196,6 @@ export function createSecondaryEmbeddingInstance(
     }
 
     // Resolve secondary spec from registry; allow env overrides for non-standard deployments.
-    const secondaryModelId = config.rabbitmqSecondaryModel ?? 'qwen3-embedding-0.6b';
-    if (!isCanonicalModelId(secondaryModelId)) {
-        console.error(
-            `[EMBEDDING] Secondary embedding: RABBITMQ_SECONDARY_MODEL='${secondaryModelId}' is not a canonical model id. ` +
-            `Secondary disabled.`
-        );
-        return undefined;
-    }
     const spec = getModelSpec(secondaryModelId);
 
     const secondaryQueue = config.rabbitmqSecondaryQueue ?? spec.queue;
@@ -201,8 +220,13 @@ export function createSecondaryEmbeddingInstance(
     const secondary = new RabbitMQEmbedding(rmqCfg);
 
     // Startup stderr log — provider/queue/dim triplet for observability (never stdout).
+    // The collection name is resolved per-codebase in core (getCollectionNameForModel):
+    // the override when MILVUS_COLLECTION_PRIVATE_0P6B is set, else auto-derived from suffix.
+    const collectionNote = config.milvusCollectionPrivate0p6b
+        ? `collection-override=${config.milvusCollectionPrivate0p6b}`
+        : 'collection=auto-derived (<base>' + getModelSpec(secondaryModelId).collectionSuffix + ')';
     console.error(
-        `[EMBEDDING] Secondary instance ACTIVE — provider=RabbitMQ queue=${secondaryQueue} dim=${secondaryDimension} model=${secondaryModelId} collection=${config.milvusCollectionPrivate0p6b}`
+        `[EMBEDDING] Secondary instance ACTIVE — provider=RabbitMQ queue=${secondaryQueue} dim=${secondaryDimension} model=${secondaryModelId} ${collectionNote}`
     );
 
     return secondary;

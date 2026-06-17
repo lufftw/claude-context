@@ -16,6 +16,7 @@
         "test:ledger": "pnpm build && node scripts/snapshot-ledger.test.mjs",
         "test:snapshot-additive": "pnpm build && node scripts/snapshot-additive-roundtrip.test.mjs",
         "test:dual-config": "pnpm build && node scripts/dual-config-smoke.mjs",
+        "test:secondary-activation": "pnpm build && node scripts/secondary-activation.test.mjs",
         "test:coverage-snap": "pnpm build && node scripts/snapshot-coverage.test.mjs",
         "test:search-routing": "pnpm build && node scripts/search-model-routing.test.mjs",
         "test:degraded-callgate": "pnpm build && node scripts/search-degraded-callgate.test.mjs",
