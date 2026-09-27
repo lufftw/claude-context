@@ -9,6 +9,7 @@ import {
     HybridSearchResult,
 } from './types';
 import { ClusterManager } from './zilliz-utils';
+import { isAutoLoadDenied, autoLoadDenyMessage } from './autoload-policy';
 
 export interface MilvusConfig {
     address?: string;
@@ -93,6 +94,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
             });
 
             if (result.state !== LoadState.LoadStateLoaded) {
+                // A release must be able to hold. Without this, an operator who releases a large
+                // collection has it reloaded by the very next search, and the memory is never reclaimed.
+                if (isAutoLoadDenied(collectionName)) {
+                    throw new Error(autoLoadDenyMessage(collectionName));
+                }
                 console.log(`[MilvusDB] 🔄 Loading collection '${collectionName}' to memory...`);
                 await this.client.loadCollection({
                     collection_name: collectionName,
