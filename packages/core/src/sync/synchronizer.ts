@@ -4,8 +4,23 @@ import * as crypto from 'crypto';
 import { MerkleDAG } from './merkle';
 import * as os from 'os';
 
+// A file's size and modification time at the moment it was last hashed. When both are unchanged on the
+// next scan, the stored hash is reused instead of reading the file again: re-reading and hashing every
+// file of every indexed codebase on each periodic sync kept the MCP at ~0.7 CPU cores continuously on
+// a 20-codebase / ~23k-file index (2026-10-04).
+interface FileStat {
+    mtimeMs: number;
+    size: number;
+}
+
+// Racy-timestamp guard (as in git): a file modified this close to the scan may be written again within
+// the same timestamp tick without its size changing, so its stat cannot vouch for its content.
+const RACY_WINDOW_MS = 2000;
+
 export class FileSynchronizer {
     private fileHashes: Map<string, string>;
+    private fileStats: Map<string, FileStat>;
+    private globRegexCache: Map<string, RegExp> = new Map();
     private merkleDAG: MerkleDAG;
     private rootDir: string;
     private snapshotPath: string;
@@ -17,6 +32,7 @@ export class FileSynchronizer {
         this.rootDir = rootDir;
         this.snapshotPath = this.getSnapshotPath(rootDir);
         this.fileHashes = new Map();
+        this.fileStats = new Map();
         this.merkleDAG = new MerkleDAG();
         this.ignorePatterns = ignorePatterns;
         // Normalize: ensure entries start with '.' and have no trailing slashes
@@ -44,7 +60,12 @@ export class FileSynchronizer {
         return crypto.createHash('sha256').update(content).digest('hex');
     }
 
-    private async generateFileHashes(dir: string): Promise<Map<string, string>> {
+    /**
+     * Hash every supported file under `dir`. When `stats` is given, it is filled with each file's size and
+     * mtime, and a file whose size and mtime match `this.fileStats` (and which is outside the racy window)
+     * reuses its hash from `this.fileHashes` instead of being read again.
+     */
+    private async generateFileHashes(dir: string, stats?: Map<string, FileStat>, scanStartMs: number = Date.now()): Promise<Map<string, string>> {
         const fileHashes = new Map<string, string>();
 
         let entries;
@@ -76,7 +97,7 @@ export class FileSynchronizer {
             if (stat.isDirectory()) {
                 // Verify it's really a directory and not ignored
                 if (!this.shouldIgnore(relativePath, true)) {
-                    const subHashes = await this.generateFileHashes(fullPath);
+                    const subHashes = await this.generateFileHashes(fullPath, stats, scanStartMs);
                     const entries = Array.from(subHashes.entries());
                     for (let i = 0; i < entries.length; i++) {
                         const [p, h] = entries[i];
@@ -91,8 +112,15 @@ export class FileSynchronizer {
                         continue;
                     }
                     try {
-                        const hash = await this.hashFile(fullPath);
+                        const current: FileStat = { mtimeMs: stat.mtimeMs, size: stat.size };
+                        const known = this.fileStats.get(relativePath);
+                        const knownHash = this.fileHashes.get(relativePath);
+                        const unchanged = known !== undefined && knownHash !== undefined
+                            && known.mtimeMs === current.mtimeMs && known.size === current.size
+                            && scanStartMs - current.mtimeMs > RACY_WINDOW_MS;
+                        const hash = unchanged ? knownHash! : await this.hashFile(fullPath);
                         fileHashes.set(relativePath, hash);
+                        stats?.set(relativePath, current);
                     } catch (error: any) {
                         console.warn(`[Synchronizer] Cannot hash file ${fullPath}: ${error.message}`);
                         continue;
@@ -198,12 +226,16 @@ export class FileSynchronizer {
     private simpleGlobMatch(text: string, pattern: string): boolean {
         if (!text || !pattern) return false;
 
-        // Convert glob pattern to regex
-        const regexPattern = pattern
-            .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex special chars except *
-            .replace(/\*/g, '.*'); // Convert * to .*
-
-        const regex = new RegExp(`^${regexPattern}$`);
+        // Compiled once per pattern. Building a new RegExp on every call (patterns x path components x
+        // files, on every sync) was 55% of an unchanged re-check's CPU on a 10k-file codebase (2026-10-04).
+        let regex = this.globRegexCache.get(pattern);
+        if (!regex) {
+            const regexPattern = pattern
+                .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex special chars except *
+                .replace(/\*/g, '.*'); // Convert * to .*
+            regex = new RegExp(`^${regexPattern}$`);
+            this.globRegexCache.set(pattern, regex);
+        }
         return regex.test(text);
     }
 
@@ -239,8 +271,10 @@ export class FileSynchronizer {
     public async checkForChanges(): Promise<{ added: string[], removed: string[], modified: string[] }> {
         console.log('[Synchronizer] Checking for file changes...');
 
-        const newFileHashes = await this.generateFileHashes(this.rootDir);
+        const newFileStats = new Map<string, FileStat>();
+        const newFileHashes = await this.generateFileHashes(this.rootDir, newFileStats);
         const newMerkleDAG = this.buildMerkleDAG(newFileHashes);
+        const statsChanged = !FileSynchronizer.sameStats(this.fileStats, newFileStats);
 
         // Compare the DAGs
         const changes = MerkleDAG.compare(this.merkleDAG, newMerkleDAG);
@@ -251,6 +285,7 @@ export class FileSynchronizer {
             const fileChanges = this.compareStates(this.fileHashes, newFileHashes);
 
             this.fileHashes = newFileHashes;
+            this.fileStats = newFileStats;
             this.merkleDAG = newMerkleDAG;
             await this.saveSnapshot();
 
@@ -258,8 +293,28 @@ export class FileSynchronizer {
             return fileChanges;
         }
 
+        // Content is unchanged, but sizes or timestamps may have moved (a touched file, or a snapshot written
+        // before stats were stored). Persist them so the next scan, and the next process, can skip the read.
+        if (statsChanged) {
+            this.fileStats = newFileStats;
+            await this.saveSnapshot();
+        }
+
         console.log('[Synchronizer] No changes detected based on Merkle DAG comparison.');
         return { added: [], removed: [], modified: [] };
+    }
+
+    private static sameStats(a: Map<string, FileStat>, b: Map<string, FileStat>): boolean {
+        if (a.size !== b.size) {
+            return false;
+        }
+        for (const [file, s] of Array.from(b.entries())) {
+            const o = a.get(file);
+            if (!o || o.mtimeMs !== s.mtimeMs || o.size !== s.size) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private compareStates(oldHashes: Map<string, string>, newHashes: Map<string, string>): { added: string[], removed: string[], modified: string[] } {
@@ -303,8 +358,14 @@ export class FileSynchronizer {
             fileHashesArray.push([key, this.fileHashes.get(key)!]);
         });
 
+        const fileStatsArray: [string, number, number][] = [];
+        Array.from(this.fileStats.entries()).forEach(([key, s]) => {
+            fileStatsArray.push([key, s.mtimeMs, s.size]);
+        });
+
         const data = JSON.stringify({
             fileHashes: fileHashesArray,
+            fileStats: fileStatsArray,
             merkleDAG: this.merkleDAG.serialize()
         });
         await fs.writeFile(this.snapshotPath, data, 'utf-8');
@@ -322,6 +383,14 @@ export class FileSynchronizer {
                 this.fileHashes.set(key, value);
             }
 
+            // Absent in snapshots written before stats were stored: those files are re-read once.
+            this.fileStats = new Map();
+            if (Array.isArray(obj.fileStats)) {
+                for (const [key, mtimeMs, size] of obj.fileStats) {
+                    this.fileStats.set(key, { mtimeMs, size });
+                }
+            }
+
             if (obj.merkleDAG) {
                 this.merkleDAG = MerkleDAG.deserialize(obj.merkleDAG);
             }
@@ -329,7 +398,9 @@ export class FileSynchronizer {
         } catch (error: any) {
             if (error.code === 'ENOENT') {
                 console.log(`Snapshot file not found at ${this.snapshotPath}. Generating new one.`);
-                this.fileHashes = await this.generateFileHashes(this.rootDir);
+                const stats = new Map<string, FileStat>();
+                this.fileHashes = await this.generateFileHashes(this.rootDir, stats);
+                this.fileStats = stats;
                 this.merkleDAG = this.buildMerkleDAG(this.fileHashes);
                 await this.saveSnapshot();
             } else {
