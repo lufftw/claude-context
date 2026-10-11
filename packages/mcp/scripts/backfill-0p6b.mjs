@@ -47,9 +47,16 @@ const toFileUrl = (p) => (p.startsWith('file:') ? p : pathToFileURL(p).href);
 
 // ── Configuration (overridable via env; defaults pinned for this box) ────────
 const MILVUS_ADDRESS = process.env.MILVUS_ADDRESS || '127.0.0.1:19530';
-const MILVUS_TOKEN   = process.env.MILVUS_TOKEN   || 'root:zzrNgGZ4xwLMHkQN368b';
-const RABBITMQ_URL   = process.env.RABBITMQ_INFERENCE_URL
-    || 'amqp://crawler:4MizIwuQ1wbSOL5vXh3WMBKU@127.0.0.1:5672/inference';
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) {
+    console.error(`${name} is required in the environment (credentials are never written into this repository)`);
+    process.exit(2);
+  }
+  return v;
+}
+const MILVUS_TOKEN   = requireEnv('MILVUS_TOKEN');
+const RABBITMQ_URL   = requireEnv('RABBITMQ_INFERENCE_URL');
 
 const SOURCE_COLLECTION = process.env.SOURCE_COLLECTION || 'claude_context_own';
 const TARGET_COLLECTION = process.env.TARGET_COLLECTION || 'claude_context_own_0p6b';
