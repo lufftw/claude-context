@@ -9,7 +9,11 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const TOKEN = process.env.MILVUS_TOKEN || 'root:zzrNgGZ4xwLMHkQN368b';
+const TOKEN = process.env.MILVUS_TOKEN;
+if (!TOKEN) {
+  console.error('MILVUS_TOKEN is required in the environment (credentials are never written into this repository)');
+  process.exit(2);
+}
 const HOST = process.env.MILVUS_HOST || '127.0.0.1';
 const PORT = parseInt(process.env.MILVUS_PORT || '19530', 10);
 
