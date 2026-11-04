@@ -9,6 +9,7 @@ Welcome to the Claude Context documentation! Claude Context is a powerful tool t
 - [🛠️ Prerequisites](getting-started/prerequisites.md) - What you need before starting
 - [🔍 Environment Variables](getting-started/environment-variables.md) - How to configure environment variables for MCP
 - [⚡ Quick Start Guide](getting-started/quick-start.md) - Get up and running in 1 minutes
+- [💻 Platform Support](getting-started/platform-support.md) - Windows 11 and Ubuntu 24.04 setup, and how to verify an installation
 
 
 ### Components
@@ -19,10 +20,13 @@ Welcome to the Claude Context documentation! Claude Context is a powerful tool t
 ### Dive Deep
 - [File Inclusion & Exclusion Rules](dive-deep/file-inclusion-rules.md) - Detailed explanation of file inclusion and exclusion rules
 - [Asynchronous Indexing Workflow](dive-deep/asynchronous-indexing-workflow.md) - Detailed explanation of asynchronous indexing workflow
+- [Testing Guide](dive-deep/testing.md) - Test suites, the live end-to-end test and what CI runs
 
 ### lufftw Fork
 - [Fork Overview](lufftw/README.md) - Features this fork adds (RabbitMQ provider, dual embedding, shared collections) and how to update from upstream
 - [Credentials and Secret Scanning](lufftw/security-credentials.md) - Where credentials belong and the pre-commit secret scan
+- [Changelog](lufftw/CHANGELOG.md) - Changes in each fork release
+- [Security Policy](../SECURITY.md) - How to report a vulnerability
 
 ### Troubleshooting
 - [❓ FAQ](troubleshooting/faq.md) - Frequently asked questions

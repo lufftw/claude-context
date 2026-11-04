@@ -2,6 +2,13 @@
 
 Before setting up Claude Context, ensure you have the following requirements met.
 
+## System Requirements
+
+- **Operating system**: Windows 11 or Ubuntu 24.04 LTS (x64). Other platforms are expected to work but are not tested.
+- **Node.js**: 20.x, 22.x or 24.x.
+
+See [Platform Support](platform-support.md) for platform-specific setup and how to verify an installation.
+
 ## Required Services
 
 ### Embedding Provider (Choose One)
@@ -27,6 +34,11 @@ Before setting up Claude Context, ensure you have the following requirements met
 - **Models**: Pull embedding models like `nomic-embed-text`
 - **Hardware**: Sufficient RAM for model loading (varies by model)
 
+#### Option 5: RabbitMQ Inference Workers (lufftw fork, self-hosted)
+- **Broker**: RabbitMQ 3.13 or later, reachable through an AMQP URL (`RABBITMQ_INFERENCE_URL`)
+- **Workers**: Embedding workers consuming the configured queue (default `embedding.qwen3-8b`, 4096 dimensions)
+- **Details**: [RabbitMQ Embedding Provider](../lufftw/rabbitmq-embedding-provider.md)
+
 ### Vector Database
 
 #### Zilliz Cloud (Recommended)
@@ -35,6 +47,7 @@ Before setting up Claude Context, ensure you have the following requirements met
 - **Convenience**: Fully managed Milvus vector database service without the need to install and manage it.
 
 #### Local Milvus (Advanced)
+- **Version**: Milvus 2.5 or later
 - **Docker**: Install Milvus by following [this guide](https://milvus.io/docs/install_standalone-docker-compose.md)
 - **Resources**: More complex configuration required
 

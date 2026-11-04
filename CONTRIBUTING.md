@@ -100,6 +100,15 @@ For detailed development instructions for each package, see:
 
 ## 📝 Making Changes
 
+### Testing
+
+Run the unit tests before opening a pull request. The [Testing Guide](docs/dive-deep/testing.md) lists every suite, including the live end-to-end test against Milvus.
+
+```bash
+pnpm --filter @zilliz/claude-context-core test
+pnpm --filter @zilliz/claude-context-mcp test
+```
+
 ### Credentials
 
 Never commit credentials, not even as a fallback default in a script. Enable the secret-scanning pre-commit hook once per clone and run the scan before opening a pull request (CI runs it too):
