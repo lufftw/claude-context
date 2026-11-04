@@ -26,6 +26,9 @@ export interface ContextMcpConfig {
     rabbitmqTimeoutMs?: number;
     rabbitmqMaxRetries?: number;
     rabbitmqPriority?: number;
+    rabbitmqIndexPriority?: number;      // RABBITMQ_EMBEDDING_INDEX_PRIORITY; default 4
+    rabbitmqQueryTimeoutMs?: number;     // RABBITMQ_EMBEDDING_QUERY_TIMEOUT_MS; default min(timeout, 30000)
+    rabbitmqIndexDepthLimit?: number;    // RABBITMQ_EMBEDDING_INDEX_DEPTH_LIMIT; default 1000, 0 = off
     rabbitmqConcurrency?: number;
     rabbitmqSource?: string;
     // RabbitMQ secondary (0.6B) configuration — all undefined = secondary disabled.
@@ -220,6 +223,9 @@ export function createMcpConfig(): ContextMcpConfig {
     const rabbitmqMaxRetries = envManager.get('RABBITMQ_EMBEDDING_MAX_RETRIES');
     const rabbitmqPriority = envManager.get('RABBITMQ_EMBEDDING_PRIORITY');
     const rabbitmqConcurrency = envManager.get('RABBITMQ_EMBEDDING_CONCURRENCY');
+    const rabbitmqIndexPriority = envManager.get('RABBITMQ_EMBEDDING_INDEX_PRIORITY');
+    const rabbitmqQueryTimeout = envManager.get('RABBITMQ_EMBEDDING_QUERY_TIMEOUT_MS');
+    const rabbitmqIndexDepthLimit = envManager.get('RABBITMQ_EMBEDDING_INDEX_DEPTH_LIMIT');
 
     // Secondary RabbitMQ dimension — parse only if present
     const rabbitmqSecDimRaw = envManager.get('RABBITMQ_SECONDARY_DIMENSION');
@@ -258,6 +264,9 @@ export function createMcpConfig(): ContextMcpConfig {
         rabbitmqMaxRetries: rabbitmqMaxRetries ? parseInt(rabbitmqMaxRetries, 10) : undefined,
         rabbitmqPriority: rabbitmqPriority ? parseInt(rabbitmqPriority, 10) : undefined,
         rabbitmqConcurrency: rabbitmqConcurrency ? parseInt(rabbitmqConcurrency, 10) : undefined,
+        rabbitmqIndexPriority: rabbitmqIndexPriority ? parseInt(rabbitmqIndexPriority, 10) : undefined,
+        rabbitmqQueryTimeoutMs: rabbitmqQueryTimeout ? parseInt(rabbitmqQueryTimeout, 10) : undefined,
+        rabbitmqIndexDepthLimit: rabbitmqIndexDepthLimit ? parseInt(rabbitmqIndexDepthLimit, 10) : undefined,
         rabbitmqSource: envManager.get('RABBITMQ_EMBEDDING_SOURCE'),
         // RabbitMQ secondary (0.6B) configuration — undefined when not activated
         rabbitmqSecondaryQueue: envManager.get('RABBITMQ_SECONDARY_QUEUE'),
@@ -329,11 +338,12 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
             console.error(`[MCP]   RabbitMQ Queue: ${config.rabbitmqQueue || 'embedding.qwen3-8b (default)'}`);
             console.error(`[MCP]   RabbitMQ Model: ${config.embeddingModel}`);
             console.error(`[MCP]   RabbitMQ Dimension: ${config.rabbitmqDimension ?? 4096}`);
-            console.error(`[MCP]   RabbitMQ Priority: ${config.rabbitmqPriority ?? 5}`);
+            console.error(`[MCP]   RabbitMQ Priority: query ${config.rabbitmqPriority ?? 5}, indexing ${config.rabbitmqIndexPriority ?? 4}`);
             console.error(`[MCP]   RabbitMQ Concurrency: ${config.rabbitmqConcurrency ?? 10}`);
             // Default mirrors RabbitMQEmbeddingConfig.timeoutMs (1_700_000 ≈ 28 min),
             // not the stale 30000 that previously appeared here.
-            console.error(`[MCP]   RabbitMQ Timeout: ${config.rabbitmqTimeoutMs ?? 1_700_000}ms`);
+            console.error(`[MCP]   RabbitMQ Timeout: indexing ${config.rabbitmqTimeoutMs ?? 1_700_000}ms, query ${config.rabbitmqQueryTimeoutMs ?? Math.min(config.rabbitmqTimeoutMs ?? 1_700_000, 30_000)}ms; each message expires at its timeout`);
+            console.error(`[MCP]   RabbitMQ indexing depth gate: ${(config.rabbitmqIndexDepthLimit ?? 1000) > 0 ? `publish below ${config.rabbitmqIndexDepthLimit ?? 1000} ready messages` : 'off'}`);
             // Secondary (0.6B) dual-embedding summary — only meaningful when activated.
             console.error(`[MCP]   Secondary (0.6B): ${config.milvusCollectionPrivate0p6b ? `ON (collection=${config.milvusCollectionPrivate0p6b}, queue=${config.rabbitmqSecondaryQueue ?? 'embedding.qwen3-0.6b'}, dim=${config.rabbitmqSecondaryDimension ?? 1024})` : 'OFF'}`);
             console.error(`[MCP]   Search default model: ${config.searchEmbeddingModel}`);

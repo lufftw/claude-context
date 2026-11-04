@@ -58,16 +58,40 @@ export interface RabbitMQEmbeddingConfig {
     modelName: string;
     /** Vector dimension produced by the worker (Qwen3-8b = 4096) */
     dimension: number;
-    /** Per-request liveness timeout in ms (default 1_700_000 ≈ 28 min — patient backstop) */
+    /**
+     * Per-request liveness timeout in ms for indexing (`embedBatch`, `embedBatchPartial`)
+     * (default 1_700_000 ≈ 28 min — patient backstop). Each indexing message also
+     * expires at this age, so an abandoned request never waits in the queue for a worker.
+     */
     timeoutMs?: number;
     /**
-     * Max retry-via-republish attempts for WAIT-class faults (default 3).
+     * Max retry-via-republish attempts for WAIT-class faults, both lanes (default 3).
      * Invariant: timeoutMs * (maxRetries + 1) must stay under the broker
      * consumer_timeout (2h = 7_200_000ms) so a slow worker never exceeds it.
      */
     maxRetries?: number;
-    /** RabbitMQ priority (0-10). Indexing = higher if you want to jump enrichment. */
+    /**
+     * Per-request timeout in ms for a search query's embedding (`embed()`).
+     * Default: the smaller of timeoutMs and 30_000, so a search waits seconds, never the
+     * indexing backstop. Each query message also expires at this age.
+     */
+    queryTimeoutMs?: number;
+    /** RabbitMQ priority (0-10) for a search query's embedding (`embed()`). Default 5. */
     priority?: number;
+    /**
+     * RabbitMQ priority (0-10) for indexing (`embedBatch`, `embedBatchPartial`). Default 4:
+     * below the events outbox's 5 on the shared queue, so an index run never jumps the
+     * events' own embeddings.
+     */
+    indexPriority?: number;
+    /**
+     * Depth gate for indexing: publish only while the target queue holds fewer ready
+     * messages than this (default 1000; 0 disables). Queries are never gated. A slot that
+     * cannot publish within its timeout fails as WAIT-class 'timeout' and is retried.
+     */
+    indexDepthLimit?: number;
+    /** While the depth gate holds, re-read the queue depth this often, in ms (default 15_000). */
+    depthPollMs?: number;
     /** Parallel in-flight requests for embedBatch (default 10) */
     concurrency?: number;
     /** AMQP heartbeat seconds (default 60) */
@@ -77,6 +101,12 @@ export interface RabbitMQEmbeddingConfig {
     /** Injectable factory for tests */
     connectFn?: typeof amqplib.connect;
 }
+
+/** Which caller a request serves: a search query (`embed`) or indexing (`embedBatch*`). */
+export type EmbedLane = 'query' | 'index';
+
+/** A depth reading is reused for at most this long, so concurrent slots share one broker round-trip. */
+const DEPTH_CACHE_MS = 2_000;
 
 interface PendingRequest {
     resolve: (vector: number[]) => void;
@@ -94,6 +124,12 @@ export class RabbitMQEmbedding extends Embedding {
     private pending: Map<string, PendingRequest> = new Map();
     private initPromise: Promise<void> | null = null;
     private isInitialized: boolean = false;
+    // Depth gate: a dedicated channel, so a failed checkQueue (it closes its channel)
+    // never takes the publish or reply channel with it.
+    private depthCh: Channel | null = null;
+    private depthCache: { at: number; depth: number } | null = null;
+    private depthRead: Promise<number | null> | null = null;
+    private depthWarned: boolean = false;
 
     constructor(config: RabbitMQEmbeddingConfig) {
         super();
@@ -110,7 +146,11 @@ export class RabbitMQEmbedding extends Embedding {
             dimension: config.dimension,
             timeoutMs: config.timeoutMs ?? 1_700_000,
             maxRetries: config.maxRetries ?? 3,
+            queryTimeoutMs: config.queryTimeoutMs ?? Math.min(config.timeoutMs ?? 1_700_000, 30_000),
             priority: config.priority ?? 5,
+            indexPriority: config.indexPriority ?? 4,
+            indexDepthLimit: config.indexDepthLimit ?? 1000,
+            depthPollMs: config.depthPollMs ?? 15_000,
             concurrency: config.concurrency ?? 10,
             heartbeat: config.heartbeat ?? 60,
             source: config.source ?? 'claude-context',
@@ -277,11 +317,14 @@ export class RabbitMQEmbedding extends Embedding {
         // Null out refs — amqplib will emit close events which are fine to ignore
         this.replyCh = null;
         this.publishCh = null;
+        this.depthCh = null;
+        this.depthCache = null;
         this.conn = null;
     }
 
     /** Graceful shutdown — closes channels and connection. */
     async close(): Promise<void> {
+        try { if (this.depthCh) await this.depthCh.close(); } catch { /* ignore */ }
         try { if (this.replyCh) await this.replyCh.close(); } catch { /* ignore */ }
         try { if (this.publishCh) await this.publishCh.close(); } catch { /* ignore */ }
         try { if (this.conn) await this.conn.close(); } catch { /* ignore */ }
@@ -293,7 +336,7 @@ export class RabbitMQEmbedding extends Embedding {
     async embed(text: string): Promise<EmbeddingVector> {
         await this.initialize();
         const processed = this.preprocessText(text);
-        const vector = await this.sendOneWithRetry(processed);
+        const vector = await this.sendOneWithRetry(processed, 'query');
         return { vector, dimension: this.config.dimension };
     }
 
@@ -310,7 +353,7 @@ export class RabbitMQEmbedding extends Embedding {
             while (true) {
                 const idx = cursor++;
                 if (idx >= processed.length) return;
-                const vector = await this.sendOne(processed[idx]);
+                const vector = await this.sendOne(processed[idx], 0, 'index');
                 out[idx] = { vector, dimension: this.config.dimension };
             }
         };
@@ -340,7 +383,7 @@ export class RabbitMQEmbedding extends Embedding {
                 const idx = cursor++;
                 if (idx >= processed.length) return;
                 try {
-                    const vector = await this.sendOneWithRetry(processed[idx]);
+                    const vector = await this.sendOneWithRetry(processed[idx], 'index');
                     // Defense-in-depth: re-check dimension at the boundary.
                     if (vector.length !== this.config.dimension) {
                         out[idx] = { ok: false, index: idx, reason: 'bad-dimension' };
@@ -382,23 +425,100 @@ export class RabbitMQEmbedding extends Embedding {
      * pending entry, or the channel closed) and reuse the configured priority
      * (never escalate).
      */
-    private async sendOneWithRetry(text: string): Promise<number[]> {
+    private async sendOneWithRetry(text: string, lane: EmbedLane = 'index'): Promise<number[]> {
         let lastErr: any;
         for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
             try {
-                return await this.sendOne(text, attempt);
+                return await this.sendOne(text, attempt, lane);
             } catch (err) {
                 lastErr = err;
                 const reason = (err as { embedReason?: EmbedReason }).embedReason;
                 if (!reason || !WAIT_REASONS.has(reason)) throw err; // REAL or 'shutdown' → no retry
                 // WAIT-class: re-publish a fresh taskId on the next loop iteration.
-                console.error(`[RabbitMQEmbedding] retry ${attempt + 1}/${this.config.maxRetries} after ${reason}`);
+                console.error(`[RabbitMQEmbedding] retry ${attempt + 1}/${this.config.maxRetries} after ${reason} (${lane})`);
             }
         }
         throw lastErr;
     }
 
-    private async sendOne(text: string, attempt: number = 0): Promise<number[]> {
+    /** The priority and timeout a lane publishes with. Each message expires at its timeout. */
+    private laneSettings(lane: EmbedLane): { priority: number; timeoutMs: number } {
+        return lane === 'query'
+            ? { priority: this.config.priority, timeoutMs: this.config.queryTimeoutMs }
+            : { priority: this.config.indexPriority, timeoutMs: this.config.timeoutMs };
+    }
+
+    /**
+     * Ready messages on the target queue, or null when they cannot be read (the gate then
+     * stays open: an unreadable depth must not stop indexing). One read is shared by every
+     * concurrent caller and reused for up to DEPTH_CACHE_MS.
+     */
+    private async readQueueDepth(): Promise<number | null> {
+        const cacheMs = Math.min(DEPTH_CACHE_MS, this.config.depthPollMs);
+        if (this.depthCache && Date.now() - this.depthCache.at < cacheMs) return this.depthCache.depth;
+        if (!this.depthRead) {
+            this.depthRead = this.fetchQueueDepth().finally(() => { this.depthRead = null; });
+        }
+        return this.depthRead;
+    }
+
+    private async fetchQueueDepth(): Promise<number | null> {
+        try {
+            await this.initialize();
+            if (!this.depthCh) {
+                if (!this.conn) return null;
+                const ch = await this.conn.createChannel();
+                ch.on('error', (err: Error) => {
+                    console.error(`[RabbitMQEmbedding] depth channel error: ${err.message}`);
+                });
+                ch.on('close', () => { if (this.depthCh === ch) this.depthCh = null; });
+                this.depthCh = ch;
+            }
+            const ch = this.depthCh as unknown as { checkQueue?: (queue: string) => Promise<{ messageCount: number }> };
+            if (typeof ch.checkQueue !== 'function') throw new Error('channel has no checkQueue');
+            const ok = await ch.checkQueue(this.config.queue);
+            this.depthCache = { at: Date.now(), depth: ok.messageCount };
+            return ok.messageCount;
+        } catch (err) {
+            this.depthCh = null;
+            if (!this.depthWarned) {
+                this.depthWarned = true;
+                console.error(`[RabbitMQEmbedding] depth gate cannot read ${this.config.queue}: ${(err as Error).message}; indexing publishes without it`);
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Hold an indexing publish while the queue holds indexDepthLimit or more ready messages.
+     * Bounded by the lane timeout: past it the slot fails as WAIT-class 'timeout' with nothing
+     * published, so the retry loop and the broker-ceiling invariant still hold.
+     */
+    private async waitForIndexDepth(maxWaitMs: number): Promise<void> {
+        const limit = this.config.indexDepthLimit;
+        if (!(limit > 0)) return;
+        const started = Date.now();
+        let announced = false;
+        while (true) {
+            const depth = await this.readQueueDepth();
+            if (depth === null || depth < limit) return;
+            const waited = Date.now() - started;
+            if (waited >= maxWaitMs) {
+                throw Object.assign(
+                    new Error(`Embedding depth gate: ${this.config.queue} held ${depth} ready messages (limit ${limit}) for ${waited}ms`),
+                    { embedReason: 'timeout' as EmbedReason });
+            }
+            if (!announced) {
+                announced = true;
+                console.error(`[RabbitMQEmbedding] depth gate: ${this.config.queue} holds ${depth} ready (limit ${limit}); indexing waits`);
+            }
+            await new Promise<void>((r) => setTimeout(r, Math.min(this.config.depthPollMs, maxWaitMs - waited)));
+        }
+    }
+
+    private async sendOne(text: string, attempt: number = 0, lane: EmbedLane = 'index'): Promise<number[]> {
+        const { priority, timeoutMs } = this.laneSettings(lane);
+        if (lane === 'index') await this.waitForIndexDepth(timeoutMs);
         // Re-establish after a resetState (idempotent + mutex-guarded) so WAIT-class
         // retries can recover from a transient connection/channel drop. Because each
         // retry calls sendOne afresh, it reads the NEW this.replyQueue at publish time.
@@ -418,7 +538,7 @@ export class RabbitMQEmbedding extends Embedding {
             createdAt: now,
             traceId: `${this.config.source}-${now}-${taskId.slice(0, 8)}`,
             source: this.config.source,
-            priority: this.config.priority,
+            priority,
             replyTo: this.replyQueue,
             correlationId: taskId,
             prompt: text,
@@ -442,10 +562,10 @@ export class RabbitMQEmbedding extends Embedding {
             const timer = setTimeout(() => {
                 if (this.pending.delete(taskId)) {
                     reject(Object.assign(
-                        new Error(`Embedding timeout after ${this.config.timeoutMs}ms (queue=${this.config.queue})`),
+                        new Error(`Embedding timeout after ${timeoutMs}ms (queue=${this.config.queue}, ${lane})`),
                         { embedReason: 'timeout' as EmbedReason }));
                 }
-            }, this.config.timeoutMs);
+            }, timeoutMs);
 
             this.pending.set(taskId, { resolve, reject, timer });
 
@@ -460,7 +580,12 @@ export class RabbitMQEmbedding extends Embedding {
                     correlationId: taskId,
                     replyTo: replyQueue,
                     messageId: taskId,
-                    priority: this.config.priority,
+                    priority,
+                    // The request is abandoned at its timeout (a retry republishes under a fresh
+                    // taskId), so the message expires then too: no worker spends time on it. The
+                    // queue's dead-letter exchange receives it with x-death reason 'expired'.
+                    expiration: String(timeoutMs),
+                    timestamp: Math.floor(now / 1000),
                 },
                 (err) => {
                     if (err) {
