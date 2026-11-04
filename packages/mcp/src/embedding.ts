@@ -91,6 +91,9 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
                 timeoutMs: config.rabbitmqTimeoutMs,
                 maxRetries: config.rabbitmqMaxRetries,
                 priority: config.rabbitmqPriority,
+                indexPriority: config.rabbitmqIndexPriority,
+                queryTimeoutMs: config.rabbitmqQueryTimeoutMs,
+                indexDepthLimit: config.rabbitmqIndexDepthLimit,
                 concurrency: config.rabbitmqConcurrency,
                 source: config.rabbitmqSource || 'claude-context',
             });
@@ -194,6 +197,11 @@ export function createSecondaryEmbeddingInstance(
         // Secondary uses registry priorityDefault (=1) unless caller overrides at embed time.
         // Do NOT inherit rabbitmqPriority from primary (that is the interactive 8B priority=10).
         priority: spec.priorityDefault,
+        // Indexing on the secondary keeps the same background priority (the client's
+        // indexing default of 4 would raise it).
+        indexPriority: spec.priorityDefault,
+        queryTimeoutMs: config.rabbitmqQueryTimeoutMs,
+        indexDepthLimit: config.rabbitmqIndexDepthLimit,
         concurrency: config.rabbitmqConcurrency,
         source: config.rabbitmqSource ?? 'claude-context',
     };

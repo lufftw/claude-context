@@ -131,8 +131,11 @@ Default `concurrency = 10`. This caps how many RPCs are in flight at once. Raisi
 | `RABBITMQ_EMBEDDING_QUEUE` | `queue` | `embedding.qwen3-8b` | Target work queue |
 | `EMBEDDING_MODEL` | `modelName` | `qwen3-embedding-8b` | Logical name in task body |
 | `RABBITMQ_EMBEDDING_DIMENSION` | `dimension` | `4096` | Fixed by model |
-| `RABBITMQ_EMBEDDING_TIMEOUT_MS` | `timeoutMs` | `30000` | Per-RPC timeout |
-| `RABBITMQ_EMBEDDING_PRIORITY` | `priority` | `5` | 0-10 |
+| `RABBITMQ_EMBEDDING_TIMEOUT_MS` | `timeoutMs` | `1700000` | Indexing per-RPC timeout; each indexing message expires at this age |
+| `RABBITMQ_EMBEDDING_QUERY_TIMEOUT_MS` | `queryTimeoutMs` | min(timeout, `30000`) | Search-query (`embed()`) per-RPC timeout; each query message expires at this age |
+| `RABBITMQ_EMBEDDING_PRIORITY` | `priority` | `5` | 0-10, search queries |
+| `RABBITMQ_EMBEDDING_INDEX_PRIORITY` | `indexPriority` | `4` | 0-10, indexing; below the events outbox's 5 |
+| `RABBITMQ_EMBEDDING_INDEX_DEPTH_LIMIT` | `indexDepthLimit` | `1000` | Indexing publishes only below this many ready messages; `0` = off; queries are never gated |
 | `RABBITMQ_EMBEDDING_CONCURRENCY` | `concurrency` | `10` | `embedBatch` parallelism |
 | `RABBITMQ_EMBEDDING_SOURCE` | `source` | `claude-context` | Task `source` field |
 
