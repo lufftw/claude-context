@@ -1,5 +1,10 @@
 # Upstream Cherry-Pick Log — Phase B (2026-05-06 / executed 2026-05-07)
 
+> **Superseded (2026-11-04).** The fork moved from cherry-picking to a real `git merge` of
+> `upstream/master` ([upstream-merge-2026-11-04.md](./upstream-merge-2026-11-04.md)). This log is kept
+> as the record of the May 2026 Phase B cherry-picks. The current process is in
+> [upstream-sync.md](../maintenance/upstream-sync.md).
+
 > One row per attempted commit (applied / deferred / skip-cascade / aborted). ALREADY-IN-HISTORY entries are excluded since they are never attempted. Final row count must equal manifest's commit-attempt total at the Plan Completion Audit.
 
 ## Columns

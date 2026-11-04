@@ -115,7 +115,13 @@ clones. Treat any pushed credential as compromised.
 in diagnostic scripts committed between 2026-05-06 and 2026-06-14 (commits `2586462`, `ca5d881`,
 `36a65bd`). Both were removed from the tree on 2026-10-12 (`716e194`), but they remain in history.
 Unless they have already been changed, **rotate both credentials** and then decide whether to
-purge history as described above. One further match, in a since-deleted
+purge history as described above.
+
+**Status (2026-11-04):** rotation and history purge are deferred by the repository owner. The same
+two credentials were also present in `lufftw/mcp-doc-search` (removed from its tree in `4a75235`).
+Until they are rotated, treat the Milvus `root` user and the RabbitMQ `crawler` user as known to
+anyone with read access to either repository's history. Keep both services off untrusted networks,
+and give new consumers dedicated least-privilege users. One further match, in a since-deleted
 `docs/lufftw/security-credentials.md`, is a documentation example of the forbidden pattern, not a
 credential.
 

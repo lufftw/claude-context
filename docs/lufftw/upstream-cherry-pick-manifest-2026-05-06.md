@@ -1,5 +1,9 @@
 # Upstream Cherry-Pick Manifest — Phase B (2026-05-06 / executed 2026-05-07)
 
+> **Superseded (2026-11-04).** Historical manifest of the May 2026 cherry-pick plan. The fork now
+> merges upstream with `git merge` ([upstream-merge-2026-11-04.md](./upstream-merge-2026-11-04.md),
+> [upstream-sync.md](../maintenance/upstream-sync.md)).
+
 > Source of truth for SHAs, file lists, conflict maps, and per-hunk resolutions.
 > The plan body's predictions are advisory; this manifest is what the executor follows.
 

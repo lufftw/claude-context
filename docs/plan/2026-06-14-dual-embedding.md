@@ -1,5 +1,9 @@
 # Dual-Embedding (Per-Model Collection) — Implementation Plan
 
+> **Historical record (2026-06-14).** Planning or review document, kept as written for traceability. It
+> may not match the current code. Implemented designs are in [`docs/lufftw/`](../lufftw/); the
+> current state is summarised in [fork-overview.md](../architecture/fork-overview.md).
+
 > **For Claude / agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let claude-context index and search a codebase with **two embedding models side by side** — the existing Qwen3-Embedding-8B (4096-dim) and a new Qwen3-Embedding-0.6B (1024-dim) — by storing each model in its **own Milvus collection** and selecting the model **explicitly per request**, so the lightweight 0.6B path stays usable when the GPU-heavy 8B path is unavailable (LLM owns the GPU).

@@ -8,7 +8,11 @@ Claude Context is an MCP plugin that adds semantic code search to AI coding agen
 
 ## Monorepo Layout
 
-pnpm workspace (`packages/*`, `examples/*`). Requires Node >=20 <24 and pnpm >=10.
+pnpm workspace (`packages/*`, `examples/*`). Requires Node >=20 and pnpm >=10.
+
+> **Fork note:** upstream's guide said `>=20 <24`, but `package.json` `engines` is `node >=20.0.0`,
+> and the fork's CI builds on Node 20, 22 and 24 (Ubuntu and Windows). This file is upstream's
+> `CLAUDE.md`, kept for reference. Fork-specific guidance is indexed in [docs/README.md](README.md).
 
 - `packages/core` (`@zilliz/claude-context-core`) — the indexing engine. All real logic lives here; the other packages are thin frontends over it.
 - `packages/mcp` (`@zilliz/claude-context-mcp`) — stdio MCP server, the primary product. ESM (`"type": "module"`).

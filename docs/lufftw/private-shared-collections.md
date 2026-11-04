@@ -1,5 +1,11 @@
 # Private + Shared Collection Support
 
+> **Status:** feature reference, reviewed 2026-11-04 against `0.1.15-lufftw.2`. Since the original
+> version: `CODE_CHUNKS_COLLECTION_NAME_OVERRIDE` (upstream 0.1.15) applies only when
+> `MILVUS_COLLECTION_PRIVATE` is unset; secondary-model collections (`<private>_0p6b`) exist;
+> `MILVUS_AUTOLOAD_DENY` can block implicit loads. All variables are listed in
+> [fork configuration](../reference/fork-configuration.md).
+
 **Version**: v0.1.3-lufftw.1 (updated v0.1.4-lufftw.2)
 **Based on**: upstream v0.1.3 (zilliztech/claude-context)
 **Date**: 2026-03-08 (updated 2026-03-14)
@@ -61,7 +67,16 @@ MILVUS_STRATEGY=hybrid
 → shared results prefixed with [shared] in relativePath
 ```
 
-With `MILVUS_STRATEGY=private` (or unset), searches only private (same as upstream).
+With `MILVUS_STRATEGY=private`, searches only the private collection (same as upstream).
+
+**Unset or any other value:** the shared collection is still searched whenever
+`MILVUS_COLLECTION_SHARED` is set. `Context.getSharedCollectionName()` returns `undefined` only for
+`private`. To keep a project private, set `MILVUS_STRATEGY=private` explicitly, or leave
+`MILVUS_COLLECTION_SHARED` unset.
+
+Search with the secondary embedding model (`embeddingModel=qwen3-embedding-0.6b`) never merges
+the shared collection, because it is built at the primary model's dimension. See
+[design-2026-06-14-dual-embedding.md](./design-2026-06-14-dual-embedding.md).
 
 ### Snapshot (`CLAUDE_CONTEXT_HOME`)
 
@@ -122,14 +137,15 @@ bash E:\Developer\lufftw\repo\claude-control-center\scripts\check-claude-context
 
 Merge upstream:
 ```bash
-cd E:\Developer\lufftw\repo\claude-context
-git fetch upstream --tags
-git merge upstream/master
-# resolve conflicts in packages/core/src/context.ts, packages/mcp/src/snapshot.ts
-pnpm build
-git tag v<new_version>-lufftw.1
-git push origin master --tags
+git fetch upstream master
+git checkout -b sync/upstream-<date> origin/main
+git merge --no-ff upstream/master
+# resolve conflicts (context.ts, snapshot.ts, handlers.ts, sync.ts), then build and test
 ```
+
+The full procedure is in [upstream-sync.md](../maintenance/upstream-sync.md). Merge through a pull
+request into `main` (the fork has no `master` branch). **Do not push `v*` tags:**
+`.github/workflows/release.yml` would try to publish to the `@zilliz` npm scope.
 
 ---
 

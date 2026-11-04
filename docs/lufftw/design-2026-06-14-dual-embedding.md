@@ -1,5 +1,10 @@
 # Design — Dual-Embedding (Per-Model Collection, Option B)
 
+> **Design record (2026-06-14).** Implemented. Settings are listed in
+> [fork configuration](../reference/fork-configuration.md#embedding-dual-model-secondary-collection).
+> Unlike the sibling mcp-doc-search (which activates by collection existence), this fork
+> activates the secondary model through `MILVUS_COLLECTION_PRIVATE_0P6B` with the RabbitMQ provider.
+
 **Date:** 2026-06-14
 **Status:** Approved (rev1.2 — council → 3-round adversarial review → R4 confirmation → GO)
 **Scope:** MVP — prove end-to-end on `claude_context_own` only; larger backfills + live dual-write are Phase 2.
