@@ -11,8 +11,11 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # Supported platforms: Ubuntu 24.04 LTS and Windows 11. GitHub has no Windows 11
+        # runner; windows-2025 (Windows Server 2025) is built from the same 24H2 code base.
+        os: [ubuntu-24.04, windows-2025]
         node-version: [20.x, 22.x, 24.x]
 
     steps:
@@ -31,11 +34,10 @@ jobs:
           cache: "pnpm"
 
       - name: Scan for committed secrets
-        if: matrix.os == 'ubuntu-latest'
         run: node scripts/check-secrets.mjs
 
       - name: Configure Windows line endings
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
 
       - name: Install dependencies
@@ -47,20 +49,119 @@ jobs:
       - name: Build packages
         run: pnpm build
 
+      - name: Core unit tests
+        run: pnpm --filter @zilliz/claude-context-core test
+
+      - name: MCP unit tests
+        run: pnpm --filter @zilliz/claude-context-mcp test
+
+      - name: MCP integration checks (offline)
+        shell: bash
+        working-directory: packages/mcp
+        run: |
+          set -e
+          for t in snapshot-ledger.test.mjs snapshot-additive-roundtrip.test.mjs dual-config-smoke.mjs \
+                   snapshot-coverage.test.mjs search-model-routing.test.mjs search-degraded-callgate.test.mjs \
+                   sync-lock-e2e.mjs; do
+            echo "::group::$t"
+            node "scripts/$t"
+            echo "::endgroup::"
+          done
+
+      - name: MCP server stdio smoke (starts dist/index.js, checks initialize + tools/list)
+        shell: bash
+        working-directory: packages/mcp
+        env:
+          OPENAI_API_KEY: sk-dummy-ci-smoke
+          MILVUS_ADDRESS: 127.0.0.1:1
+          CLAUDE_CONTEXT_BACKGROUND_SYNC: "false"
+        run: |
+          export CLAUDE_CONTEXT_HOME="$RUNNER_TEMP/cc-home"
+          node scripts/jsonrpc-smoke.mjs
+
       - name: Test clean command (Windows validation)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: |
           pnpm clean
           echo "Clean command executed successfully on Windows"
 
       - name: Verify build outputs (Unix)
-        if: matrix.os != 'windows-latest'
+        if: runner.os != 'Windows'
         run: |
           ls -la packages/core/dist || echo "packages/core/dist not found"
           ls -la packages/mcp/dist || echo "packages/mcp/dist not found"
 
       - name: Verify build outputs (Windows)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: |
           Get-ChildItem packages/core/dist -ErrorAction SilentlyContinue | Format-Table -AutoSize || Write-Host "packages/core/dist not found"
           Get-ChildItem packages/mcp/dist -ErrorAction SilentlyContinue | Format-Table -AutoSize || Write-Host "packages/mcp/dist not found"
+
+  e2e_live:
+    # Real Milvus + RabbitMQ. Linux only: GitHub's Windows runners cannot run Linux containers.
+    # Run packages/mcp/scripts/e2e-live.mjs locally on Windows 11 (see docs/getting-started/platform-support.md).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build core and MCP
+        run: pnpm build:core && pnpm build:mcp
+
+      - name: Start Milvus (standalone, embedded etcd) and RabbitMQ
+        run: |
+          mkdir -p "$RUNNER_TEMP/milvus/volumes"
+          printf '%s\n' 'listen-client-urls: http://0.0.0.0:2379' 'advertise-client-urls: http://0.0.0.0:2379' \
+            'quota-backend-bytes: 4294967296' 'auto-compaction-mode: revision' "auto-compaction-retention: '1000'" \
+            > "$RUNNER_TEMP/milvus/embedEtcd.yaml"
+          touch "$RUNNER_TEMP/milvus/user.yaml"
+          docker run -d --name milvus --security-opt seccomp:unconfined -p 19530:19530 -p 9091:9091 \
+            -e ETCD_USE_EMBED=true -e ETCD_DATA_DIR=/var/lib/milvus/etcd \
+            -e ETCD_CONFIG_PATH=/milvus/configs/embedEtcd.yaml -e COMMON_STORAGETYPE=local \
+            -v "$RUNNER_TEMP/milvus/volumes:/var/lib/milvus" \
+            -v "$RUNNER_TEMP/milvus/embedEtcd.yaml:/milvus/configs/embedEtcd.yaml" \
+            -v "$RUNNER_TEMP/milvus/user.yaml:/milvus/configs/user.yaml" \
+            milvusdb/milvus:v2.5.10 milvus run standalone
+          docker run -d --name rabbitmq -p 5672:5672 rabbitmq:3.13-alpine
+          for i in $(seq 1 90); do curl -sf http://127.0.0.1:9091/healthz >/dev/null && break; sleep 2; done
+          curl -sf http://127.0.0.1:9091/healthz
+          for i in $(seq 1 60); do docker exec rabbitmq rabbitmq-diagnostics -q check_port_connectivity && break; sleep 2; done
+
+      - name: Core integration tests against live Milvus
+        env:
+          MILVUS_LIVE: "1"
+          MILVUS_ADDRESS: 127.0.0.1:19530
+        run: pnpm --filter @zilliz/claude-context-core test:int
+
+      - name: End-to-end (OpenAI-compatible embeddings)
+        env:
+          MILVUS_ADDRESS: 127.0.0.1:19530
+        run: node packages/mcp/scripts/e2e-live.mjs
+
+      - name: End-to-end (RabbitMQ embedding provider)
+        env:
+          MILVUS_ADDRESS: 127.0.0.1:19530
+          RABBITMQ_INFERENCE_URL: amqp://guest:guest@127.0.0.1:5672
+        run: node packages/mcp/scripts/e2e-live.mjs
+
+      - name: Service logs on failure
+        if: failure()
+        run: |
+          docker logs --tail 200 milvus || true
+          docker logs --tail 100 rabbitmq || true
+

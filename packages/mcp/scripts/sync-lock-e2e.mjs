@@ -114,6 +114,7 @@ async function runConcurrentMain(workerCount = 2) {
 
   const sharedEnv = {
     HOME: tempHome,
+    USERPROFILE: tempHome, // os.homedir() on Windows
     E2E_LOG_FILE: logFile,
     E2E_CODEBASE_PATH: codebasePath,
     CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS: "60000"
@@ -168,6 +169,7 @@ async function runStaleLockMain() {
 
   const worker = spawnWorker("stale", {
     HOME: tempHome,
+    USERPROFILE: tempHome, // os.homedir() on Windows
     E2E_LOG_FILE: logFile,
     E2E_CODEBASE_PATH: codebasePath,
     CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS: "1000"
@@ -205,6 +207,7 @@ async function runHeldLockMain() {
 
   const worker = spawnWorker("held", {
     HOME: tempHome,
+    USERPROFILE: tempHome, // os.homedir() on Windows
     E2E_LOG_FILE: logFile,
     E2E_CODEBASE_PATH: codebasePath,
     CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS: "60000"
@@ -243,6 +246,7 @@ async function runEmptySnapshotMain() {
 
   const worker = spawnWorker("empty", {
     HOME: tempHome,
+    USERPROFILE: tempHome, // os.homedir() on Windows
     E2E_LOG_FILE: logFile,
     E2E_CODEBASE_PATH: codebasePath
   });

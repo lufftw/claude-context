@@ -1,0 +1,21 @@
+# Normalize line endings: LF in the repository and in working trees on every OS.
+# Without this, a Windows checkout with core.autocrlf=true can commit CRLF files,
+# which turns every later merge of those files into a whole-file conflict.
+* text=auto eol=lf
+
+# Windows-native scripts keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.vsix binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

@@ -78,6 +78,8 @@ const createVectorDatabase = (): jest.Mocked<VectorDatabase> => ({
 describe('Context indexCodebase AbortSignal support', () => {
     let tempRoot: string;
     let originalHome: string | undefined;
+    // os.homedir() reads USERPROFILE on Windows and HOME elsewhere; redirect both.
+    let originalUserProfile: string | undefined;
     let originalHybridMode: string | undefined;
 
     beforeEach(async () => {
@@ -85,8 +87,10 @@ describe('Context indexCodebase AbortSignal support', () => {
         const homeDir = path.join(tempRoot, 'home');
         await fs.mkdir(homeDir, { recursive: true });
         originalHome = process.env.HOME;
+        originalUserProfile = process.env.USERPROFILE;
         originalHybridMode = process.env.HYBRID_MODE;
         process.env.HOME = homeDir;
+        process.env.USERPROFILE = homeDir;
         process.env.HYBRID_MODE = 'false';
     });
 
@@ -95,6 +99,11 @@ describe('Context indexCodebase AbortSignal support', () => {
             delete process.env.HOME;
         } else {
             process.env.HOME = originalHome;
+        }
+        if (originalUserProfile === undefined) {
+            delete process.env.USERPROFILE;
+        } else {
+            process.env.USERPROFILE = originalUserProfile;
         }
         if (originalHybridMode === undefined) {
             delete process.env.HYBRID_MODE;
