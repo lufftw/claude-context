@@ -16,6 +16,7 @@
         "lint": "pnpm -r lint",
         "lint:fix": "pnpm -r run lint:fix",
         "typecheck": "pnpm -r run typecheck",
+        "check:secrets": "node scripts/check-secrets.mjs",
         "release:core": "pnpm --filter @zilliz/claude-context-core... run build && pnpm --filter @zilliz/claude-context-core publish --access public --no-git-checks",
         "release:mcp": "pnpm --filter @zilliz/claude-context-mcp... run build && pnpm --filter @zilliz/claude-context-mcp publish --access public --no-git-checks",
         "release:vscode": "pnpm --filter @zilliz/claude-context-core build && pnpm --filter semanticcodesearch run webpack && pnpm --filter semanticcodesearch release",

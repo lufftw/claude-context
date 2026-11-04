@@ -1,0 +1,4 @@
+#!/bin/sh
+# Blocks commits that add credentials. Enable once per clone:
+#   git config core.hooksPath .githooks
+exec node scripts/check-secrets.mjs --staged

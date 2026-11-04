@@ -79,3 +79,12 @@ evaluation/retrieval_results*
 /tmp-*.mjs
 /tmp-*.js
 /tmp-*.ts
+
+# Credentials — never commit (see scripts/check-secrets.mjs; enable the hook: git config core.hooksPath .githooks)
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
