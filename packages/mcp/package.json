@@ -1,6 +1,6 @@
 {
     "name": "@zilliz/claude-context-mcp",
-    "version": "0.1.15-lufftw.1",
+    "version": "0.1.15-lufftw.2",
     "description": "Model Context Protocol integration for Claude Context (lufftw fork: private+shared collections, CLAUDE_CONTEXT_HOME, dual-write)",
     "type": "module",
     "main": "dist/index.js",
@@ -25,15 +25,15 @@
         "prepublishOnly": "pnpm build"
     },
     "dependencies": {
-        "@modelcontextprotocol/sdk": "^1.12.1",
+        "@modelcontextprotocol/sdk": "^1.32.2",
         "@zilliz/claude-context-core": "workspace:*",
         "proper-lockfile": "^4.1.2",
-        "zod": "^3.25.55"
+        "zod": "^3.25.76"
     },
     "devDependencies": {
         "@types/node": "^20.0.0",
         "@types/proper-lockfile": "^4.1.4",
-        "tsx": "^4.19.4",
+        "tsx": "^4.23.15",
         "typescript": "^5.0.0"
     },
     "files": [

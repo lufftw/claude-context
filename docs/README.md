@@ -25,6 +25,7 @@ Welcome to the Claude Context documentation! Claude Context is a powerful tool t
 - [Fork Configuration Reference](reference/fork-configuration.md): fork-only environment variables and how they resolve
 - [Credential Handling](security/credential-handling.md): secret policy, automated scanning, incident response
 - [Upstream Synchronisation Runbook](maintenance/upstream-sync.md): how to merge new `zilliztech/claude-context` releases
+- [Dependency Policy and Version Matrix](maintenance/dependency-policy.md): which library versions the fork uses, and why
 - [Design records and bug-fix reports](lufftw/): dated, detailed history of fork changes
 
 ### Troubleshooting

@@ -11,7 +11,7 @@ behaviour or leaking credentials.
 | Upstream branch tracked | `master` |
 | Last merged upstream commit | `6fc318b` — *fix(mcp): derive default version from package metadata* (upstream 0.1.15) |
 | Fork merge commit | `3efdbfc` (merged to `main` via `bd48994`, 2026-11-04) |
-| Fork package version | `0.1.15-lufftw.1` (`core`, `mcp`) |
+| Fork package version | `0.1.15-lufftw.2` (`core`, `mcp`); dependency refresh in [dependency-policy.md](dependency-policy.md) |
 | Detailed record | [upstream-merge-2026-11-04.md](../lufftw/upstream-merge-2026-11-04.md) |
 
 As of 2026-11-04, `git ls-remote upstream refs/heads/master` still returns `6fc318b`, so the fork is

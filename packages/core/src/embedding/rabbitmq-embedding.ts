@@ -1,4 +1,22 @@
 import amqplib, { type ChannelModel, type Channel, type ConfirmChannel } from 'amqplib';
+
+/**
+ * Return `url` with `heartbeat=<seconds>` in its query, unless the URL already sets one
+ * (an explicit `?heartbeat=` in RABBITMQ_INFERENCE_URL wins). Credentials and vhost are
+ * preserved. Non-parseable URLs are returned unchanged so amqplib reports the real error.
+ */
+export function withHeartbeat(url: string, seconds: number | undefined): string {
+    if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return url;
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return url;
+    }
+    if (parsed.searchParams.has('heartbeat')) return url;
+    parsed.searchParams.set('heartbeat', String(Math.floor(seconds)));
+    return parsed.toString();
+}
 import { randomUUID } from 'node:crypto';
 import { Embedding, EmbeddingVector, EmbedItemResult, EmbedReason, WAIT_REASONS } from './base-embedding';
 
@@ -120,8 +138,9 @@ export class RabbitMQEmbedding extends Embedding {
 
     private async _doInitialize(): Promise<void> {
         const connect = this.config.connectFn ?? amqplib.connect;
-        const conn = await connect(this.config.url, {
-            heartbeat: this.config.heartbeat,
+        // amqplib reads `heartbeat` only from the URL query (or a Connect object), never from
+        // socket options; passing it there was silently ignored (1.x then disabled heartbeats).
+        const conn = await connect(withHeartbeat(this.config.url, this.config.heartbeat), {
             clientProperties: {
                 product: 'claude-context',
                 information: 'RabbitMQEmbedding publisher',
