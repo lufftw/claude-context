@@ -124,10 +124,13 @@ Default `concurrency = 10`. This caps how many RPCs are in flight at once. Raisi
 | `RABBITMQ_EMBEDDING_QUEUE` | `queue` | `embedding.qwen3-8b` | Target work queue |
 | `EMBEDDING_MODEL` | `modelName` | `qwen3-embedding-8b` | Logical name in task body |
 | `RABBITMQ_EMBEDDING_DIMENSION` | `dimension` | `4096` | Fixed by model |
-| `RABBITMQ_EMBEDDING_TIMEOUT_MS` | `timeoutMs` | `30000` | Per-RPC timeout |
+| `RABBITMQ_EMBEDDING_TIMEOUT_MS` | `timeoutMs` | `1700000` (≈28 min) | Per-request liveness timeout (raised from the original `30000` by the CPU-tolerant design) |
+| `RABBITMQ_EMBEDDING_MAX_RETRIES` | `maxRetries` | `3` | Re-publish attempts for WAIT-class faults; keep `timeout × (retries + 1)` below the broker `consumer_timeout` |
 | `RABBITMQ_EMBEDDING_PRIORITY` | `priority` | `5` | 0-10 |
 | `RABBITMQ_EMBEDDING_CONCURRENCY` | `concurrency` | `10` | `embedBatch` parallelism |
 | `RABBITMQ_EMBEDDING_SOURCE` | `source` | `claude-context` | Task `source` field |
+
+Secondary-model variables: see [Environment Variables](../getting-started/environment-variables.md#dual-embedding-secondary-model). Keep `RABBITMQ_INFERENCE_URL` out of git; see [security-credentials.md](security-credentials.md).
 
 ## Not included (and why)
 

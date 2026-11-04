@@ -23,8 +23,8 @@ Adds multi-collection search to claude-context, enabling projects to maintain is
 | `MILVUS_COLLECTION_PRIVATE` | auto-generated hash | Custom private collection name (e.g., `event_crawler_own`) |
 | `MILVUS_COLLECTION_SHARED` | — | Shared collection to query alongside private |
 | `MILVUS_WRITABLE_SHARED` | — | When set, indexing dual-writes to both private AND this collection (one embedding cost) |
-| `MILVUS_STRATEGY` | — | `hybrid`: query private + shared. `private`: query private only |
-| `CLAUDE_CONTEXT_HOME` | `~/.context` | Snapshot directory override for multi-user sharing |
+| `MILVUS_STRATEGY` | — | `hybrid`: query private + shared. `private`: query private only. Unset: shared is queried if `MILVUS_COLLECTION_SHARED` is set |
+| `CLAUDE_CONTEXT_HOME` | `~/.context` | Snapshot directory override for multi-user sharing (read from the process environment only, not from `.env` files) |
 
 ---
 
@@ -61,7 +61,7 @@ MILVUS_STRATEGY=hybrid
 → shared results prefixed with [shared] in relativePath
 ```
 
-With `MILVUS_STRATEGY=private` (or unset), searches only private (same as upstream).
+With `MILVUS_STRATEGY=private`, searches only private (same as upstream). If `MILVUS_STRATEGY` is unset, the shared collection is still searched whenever `MILVUS_COLLECTION_SHARED` is set; only `private` turns it off.
 
 ### Snapshot (`CLAUDE_CONTEXT_HOME`)
 

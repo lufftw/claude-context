@@ -20,6 +20,10 @@ Welcome to the Claude Context documentation! Claude Context is a powerful tool t
 - [File Inclusion & Exclusion Rules](dive-deep/file-inclusion-rules.md) - Detailed explanation of file inclusion and exclusion rules
 - [Asynchronous Indexing Workflow](dive-deep/asynchronous-indexing-workflow.md) - Detailed explanation of asynchronous indexing workflow
 
+### lufftw Fork
+- [Fork Overview](lufftw/README.md) - Features this fork adds (RabbitMQ provider, dual embedding, shared collections) and how to update from upstream
+- [Credentials and Secret Scanning](lufftw/security-credentials.md) - Where credentials belong and the pre-commit secret scan
+
 ### Troubleshooting
 - [❓ FAQ](troubleshooting/faq.md) - Frequently asked questions
 - [🐛 Troubleshooting Guide](troubleshooting/troubleshooting-guide.md) - Troubleshooting guide

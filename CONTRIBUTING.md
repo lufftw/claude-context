@@ -100,6 +100,17 @@ For detailed development instructions for each package, see:
 
 ## 📝 Making Changes
 
+### Credentials
+
+Never commit credentials, not even as a fallback default in a script. Enable the secret-scanning pre-commit hook once per clone and run the scan before opening a pull request (CI runs it too):
+
+```bash
+git config core.hooksPath .githooks
+pnpm check:secrets
+```
+
+See [Credentials and Secret Scanning](docs/lufftw/security-credentials.md).
+
 ### Commit Guidelines
 
 We follow conventional commit format:

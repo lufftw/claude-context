@@ -100,3 +100,32 @@ Any file in codebase root matching pattern `.xxxignore`:
 
 ### 6. Global .contextignore
 User-wide patterns in `~/.context/.contextignore`.
+
+## Pattern Syntax
+
+All ignore patterns, from every source above, are evaluated with [gitignore semantics](https://git-scm.com/docs/gitignore) (via the `ignore` package), the same way for the initial index and for incremental sync:
+
+- **Negation**: `!pattern` re-includes a path excluded by an earlier pattern, e.g.
+  ```gitignore
+  wp-content/plugins/*
+  !wp-content/plugins/app/
+  ```
+- **Root anchoring**: a leading `/` matches only at the codebase root. `/Library/` ignores `Library/` at the root but not `src/Library/`.
+- **Directory patterns**: a trailing `/` matches directories only.
+- Blank lines and lines starting with `#` are ignored.
+
+## Hidden Files and Directories
+
+Any path containing a segment that starts with `.` (for example `.github/`, `.env`, `.vscode/settings.json`) is skipped, regardless of extension. This keeps the initial index and the incremental sync aligned and keeps secrets such as `.env` files out of the vector database.
+
+### Including dot-directories: `.contextinclude` (lufftw fork)
+
+To index a specific hidden directory, list it in a `.contextinclude` file in the codebase root, one directory name per line:
+
+```text
+# .contextinclude
+.github
+.opencode
+```
+
+A path is indexed only if **every** dot-prefixed segment in it is listed, so `.github/workflows/ci.yml` is included above while `.github/.secret/x` is not. Ignore patterns still apply inside included directories. Do not list directories that hold credentials (e.g. `.aws`, `.ssh`); their contents would be embedded and stored in Milvus.

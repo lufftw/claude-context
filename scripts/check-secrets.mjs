@@ -15,7 +15,7 @@ import { readFileSync } from 'node:fs';
 
 const staged = process.argv.includes('--staged');
 
-const PLACEHOLDER = /^(your[-_]|<|\$\{|\$[A-Z_]|%[A-Z_]|x{3,}|\*{3,})|xxx|fake|dummy|example|placeholder|changeme|change-me|redacted|do-not-use|noop|smoke|sample|mock|^test|^guest$|^password$|^secret$|^token$/i;
+const PLACEHOLDER = /^(\$\{|\$[A-Z_]|%[A-Z_]|x{3,}|\*{3,})|your[-_]|<[^>]*>|xxx|fake|dummy|example|placeholder|changeme|change-me|redacted|do-not-use|noop|smoke|sample|mock|^test|^guest$|^password$|^secret$|^token$/i;
 const isPlaceholder = (v) => v.length < 6 || PLACEHOLDER.test(v);
 
 const RULES = [
