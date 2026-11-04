@@ -34,9 +34,15 @@ const repoRoot = path.resolve(here, '../../..'); // -> worktree root
 const toFileUrl = (p) => (p.startsWith('file:') ? p : pathToFileURL(p).href);
 
 // --- Credentials (this Windows box) -----------------------------------------
-const URL =
-  process.env.RABBITMQ_INFERENCE_URL ||
-  'amqp://crawler:4MizIwuQ1wbSOL5vXh3WMBKU@127.0.0.1:5672/inference';
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) {
+    console.error(`${name} is required in the environment (credentials are never written into this repository)`);
+    process.exit(2);
+  }
+  return v;
+}
+const URL = requireEnv('RABBITMQ_INFERENCE_URL');
 
 if (URL.includes('127.0.0.1:1)') || URL.includes('noop')) {
   console.error('[G1] REFUSING noop/placeholder URL');

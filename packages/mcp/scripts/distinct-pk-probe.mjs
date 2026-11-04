@@ -28,7 +28,15 @@ const toFileUrl = (p) => (p.startsWith('file:') ? p : pathToFileURL(p).href);
 
 // --- Credentials (this Windows box) -----------------------------------------
 const ADDRESS = process.env.MILVUS_ADDRESS || '127.0.0.1:19530';
-const TOKEN = process.env.MILVUS_TOKEN || 'root:zzrNgGZ4xwLMHkQN368b';
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) {
+    console.error(`${name} is required in the environment (credentials are never written into this repository)`);
+    process.exit(2);
+  }
+  return v;
+}
+const TOKEN = requireEnv('MILVUS_TOKEN');
 const COLLECTION = process.env.E3_COLLECTION || 'claude_context_own';
 const PK_FIELD = process.env.E3_PK_FIELD || 'id';
 const BATCH_SIZE = 16_384; // iterator page size

@@ -93,7 +93,7 @@ wait_for_drain() {
     local stable=0
     while true; do
         local r=$(curl -sS "http://127.0.0.1:15672/api/queues/inference/embedding.qwen3-8b" \
-            -H "Authorization: Basic $(echo -n 'crawler:4MizIwuQ1wbSOL5vXh3WMBKU' | base64)" \
+            -H "Authorization: Basic $(printf '%s' "${RABBITMQ_MGMT_USER:?RABBITMQ_MGMT_USER is required}:${RABBITMQ_MGMT_PASS:?RABBITMQ_MGMT_PASS is required}" | base64)" \
             --max-time 3 2>/dev/null | \
             node -e 'try{const j=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(j.messages_ready+"/"+j.messages_unacknowledged)}catch(e){process.stdout.write("-/-")}')
         echo "$(date '+%H:%M:%S') q=$r"

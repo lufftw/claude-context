@@ -100,7 +100,7 @@ Google's Gemini provides competitive embeddings with good multilingual support.
 # Required: Your Gemini API key
 GEMINI_API_KEY=your-gemini-api-key
 
-# Optional: Specify embedding model (default: gemini-embedding-001)
+# Optional: Specify embedding model (default: gemini-embedding-001; supports gemini-embedding-2)
 EMBEDDING_MODEL=gemini-embedding-001
 
 # Optional: Custom API base URL (for custom endpoints)
@@ -137,7 +137,7 @@ EMBEDDING_DIMENSION=768
 
 **Setup Instructions:**
 
-1. Install Ollama from [ollama.ai](https://ollama.ai/)
+1. Install Ollama from [ollama.com](https://ollama.com/)
 2. Pull the embedding model:
 
    ```bash
@@ -188,6 +188,60 @@ CUSTOM_IGNORE_PATTERNS=temp/**,*.backup,private/**,uploads/**
 ```
 
 These settings work in combination with tool parameters - patterns from both sources will be merged together.
+
+#### Custom Collection Name (Optional)
+
+Use this when you want a human-readable prefix on collection names in Milvus/Zilliz instead of the bare hash:
+
+```bash
+# Creates code_chunks_my_project_<pathHash> or hybrid_code_chunks_my_project_<pathHash>
+CODE_CHUNKS_COLLECTION_NAME_OVERRIDE=my_project
+```
+
+The per-codebase `<pathHash>` suffix is preserved even when the override is set, so the same MCP server can still index multiple repos without collapsing them onto one collection. The override value is sanitized to letters, numbers, and underscores, and truncated to keep the full name within Milvus's 255-char limit. If you unset the variable later, Claude Context switches back to the plain `code_chunks_<pathHash>` naming.
+
+#### Trigger File Watcher (Optional)
+
+In addition to the periodic background sync, the MCP server watches a sentinel file at `~/.context/.sync-trigger` and starts an immediate re-index whenever the file is modified. This lets external tools (Claude Code `PostToolUse` hooks, editor save hooks, CI scripts, etc.) request a sync on demand instead of waiting for the next polling tick.
+
+```bash
+# Default: watcher enabled. Set to false to disable filesystem watching entirely
+# (useful on read-only filesystems or sandboxed environments).
+CLAUDE_CONTEXT_TRIGGER_WATCHER=true
+```
+
+Example — Claude Code hook that re-indexes after every Edit/Write:
+
+```json
+"hooks": {
+  "PostToolUse": [
+    { "matcher": "Edit|Write", "hooks": [
+      { "type": "command", "command": "touch ~/.context/.sync-trigger" }
+    ]}
+  ]
+}
+```
+
+Notes:
+- The trigger fires a debounced re-index (2 s window) so rapid touches collapse to a single sync.
+- Triggered syncs go through the same global cross-process lock as background sync, so when multiple MCP processes share `$HOME` only one process performs the work per trigger.
+- The trigger file's *contents* are ignored — only the modification event matters.
+
+#### Background Sync Configuration (Optional)
+
+By default, the MCP server runs startup + periodic background sync for compatibility with existing installations. The global cross-process sync lock ensures only one local MCP process performs a sync cycle at a time.
+
+You can tune or disable periodic polling with environment variables:
+
+```bash
+# Default: true. Set to false to disable startup + periodic polling.
+CLAUDE_CONTEXT_BACKGROUND_SYNC=false
+
+# Optional: control how often sync runs (default: 300000 = 5 minutes)
+CLAUDE_CONTEXT_SYNC_INTERVAL_MS=60000
+```
+
+For multi-instance local stdio setups, set `CLAUDE_CONTEXT_BACKGROUND_SYNC=false` and keep the trigger watcher enabled. That avoids idle polling while still allowing external tools to request immediate re-indexing by touching `~/.context/.sync-trigger`.
 
 ## Usage with MCP Clients
 
@@ -284,7 +338,7 @@ Create or edit the `~/.qwen/settings.json` file and add the following configurat
 
 Go to: `Settings` -> `Cursor Settings` -> `MCP` -> `Add new global MCP server`
 
-Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file is the recommended approach. You may also install in a specific project by creating `.cursor/mcp.json` in your project folder. See [Cursor MCP docs](https://docs.cursor.com/context/model-context-protocol) for more info.
+Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file is the recommended approach. You may also install in a specific project by creating `.cursor/mcp.json` in your project folder. See [Cursor MCP docs](https://cursor.com/docs/context/mcp) for more info.
 
 **OpenAI Configuration (Default):**
 
@@ -464,7 +518,7 @@ Cherry Studio allows for visual MCP server configuration through its settings in
    - **Name**: `claude-context`
    - **Type**: `STDIO`
    - **Command**: `npx`
-   - **Arguments**: `["@zilliz/claude-context-mcp@latest"]`
+   - **Arguments**: `["-y", "@zilliz/claude-context-mcp@latest"]`
    - **Environment Variables**:
      - `OPENAI_API_KEY`: `your-openai-api-key`
      - `MILVUS_TOKEN`: `your-zilliz-cloud-api-key`
@@ -674,6 +728,16 @@ Get the current indexing status of a codebase. Shows progress percentage for act
 **Parameters:**
 
 - `path` (required): Absolute path to the codebase directory to check status for
+
+**What the status output means:**
+
+- Progress is **phase-based**, not a direct file-count ratio. The MCP server reports coarse milestones for collection preparation, file scanning, and file processing / embedding work.
+- Because indexing runs in the background and progress is persisted periodically, percentages can jump quickly on large repositories or appear unchanged for a while during long embedding batches.
+- File and chunk statistics are written when an indexing run finishes successfully. During active indexing, `get_indexing_status` intentionally reports progress rather than live file/chunk totals.
+- Codebases are keyed by their **absolute path**. Indexing `/repo`, a symlinked path to the same repo, and a second clone will create separate tracked entries.
+- If a completed entry shows `0 files, 0 chunks`, that usually means the local snapshot metadata is stale rather than the vector database being queried live. Re-indexing, or clearing and re-indexing that exact absolute path, refreshes the stored stats.
+
+For a deeper explanation, see the [asynchronous indexing workflow guide](../../docs/dive-deep/asynchronous-indexing-workflow.md) and the [troubleshooting FAQ](../../docs/troubleshooting/faq.md).
 
 ## Contributing
 

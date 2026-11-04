@@ -113,6 +113,20 @@ export abstract class Embedding {
      */
     async embedBatchPartial(texts: string[]): Promise<EmbedItemResult[]> {
         const vics = await this.embedBatch(texts);
+        // An all-or-nothing provider returning the wrong number of vectors (or empty
+        // ones) cannot be paired back to its inputs safely — fail the WHOLE batch rather
+        // than mis-assign vectors to chunks (upstream validateEmbeddings semantics).
+        if (!Array.isArray(vics)) {
+            throw new Error('Embedding API returned invalid embedding batch response');
+        }
+        if (vics.length !== texts.length) {
+            throw new Error(`Embedding API returned ${vics.length} embeddings for ${texts.length} chunks`);
+        }
+        vics.forEach((v, index) => {
+            if (!v || !Array.isArray(v.vector) || v.vector.length === 0) {
+                throw new Error(`Embedding API returned empty embedding vector at index ${index}`);
+            }
+        });
         return vics.map((v, index) => ({ ok: true as const, index, vector: v.vector, dimension: v.dimension }));
     }
 

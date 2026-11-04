@@ -7,6 +7,7 @@ import {
     CodebaseSnapshotV1,
     CodebaseSnapshotV2,
     CodebaseInfo,
+    CodebaseIndexOptions,
     CodebaseInfoIndexing,
     CodebaseInfoIndexed,
     CodebaseInfoIndexFailed,
@@ -86,6 +87,7 @@ export class SnapshotManager {
                 // Don't add to validIndexingCodebases - treat as not indexed
             } else {
                 console.warn(`[SNAPSHOT-DEBUG] Interrupted indexing codebase no longer exists: ${codebasePath}`);
+                this.removedCodebases.add(codebasePath);
             }
         }
 
@@ -139,11 +141,14 @@ export class SnapshotManager {
                 }
                 console.log(`[SNAPSHOT-DEBUG] Validated indexed codebase: ${codebasePath} (${info.indexedFiles || 'unknown'} files, ${info.totalChunks || 'unknown'} chunks)`);
             } else if (info.status === 'indexing') {
+                // FORK: keep the 'indexing' entry verbatim (do NOT rewrite it to indexfailed as
+                // upstream does): it carries the per-file resume ledger (files/filesByModel), and in
+                // a shared CLAUDE_CONTEXT_HOME snapshot it may belong to a peer process that is
+                // still indexing — rewriting it would clobber that peer's live state on merge-save.
                 if ('indexingPercentage' in info) {
                     validIndexingCodebases.set(codebasePath, info.indexingPercentage);
                 }
                 console.warn(`[SNAPSHOT-DEBUG] Found interrupted indexing codebase: ${codebasePath} (${info.indexingPercentage || 0}%). Treating as not indexed.`);
-                // Don't add to indexed - treat interrupted indexing as not indexed
             } else if (info.status === 'indexfailed') {
                 console.warn(`[SNAPSHOT-DEBUG] Found failed indexing codebase: ${codebasePath}. Error: ${info.errorMessage}`);
                 // Failed indexing codebases are not added to indexed or indexing lists
@@ -214,6 +219,59 @@ export class SnapshotManager {
             // Fallback to memory if file reading fails
             return Array.from(this.indexingCodebases.keys());
         }
+    }
+
+    private isSameOrDescendantPath(candidatePath: string, codebasePath: string): boolean {
+        const relativePath = path.relative(path.resolve(codebasePath), path.resolve(candidatePath));
+        return relativePath === ''
+            || (!!relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+    }
+
+    private findBestMatchingCodebasePath(codebasePath: string, candidates: string[]): string | undefined {
+        let bestMatch: string | undefined;
+        let bestMatchLength = -1;
+
+        for (const candidate of candidates) {
+            const resolvedCandidate = path.resolve(candidate);
+            if (!this.isSameOrDescendantPath(codebasePath, resolvedCandidate)) continue;
+
+            if (resolvedCandidate.length > bestMatchLength) {
+                bestMatch = candidate;
+                bestMatchLength = resolvedCandidate.length;
+            }
+        }
+
+        return bestMatch;
+    }
+
+    private getIndexOptions(options?: CodebaseIndexOptions): CodebaseIndexOptions {
+        const indexOptions: CodebaseIndexOptions = {};
+        if (options?.requestSplitter === 'ast' || options?.requestSplitter === 'langchain') {
+            indexOptions.requestSplitter = options.requestSplitter;
+        }
+        if (options?.requestCustomExtensions?.length) {
+            indexOptions.requestCustomExtensions = options.requestCustomExtensions;
+        }
+        if (options?.requestIgnorePatterns?.length) {
+            indexOptions.requestIgnorePatterns = options.requestIgnorePatterns;
+        }
+        return indexOptions;
+    }
+
+    private resolveIndexOptions(codebasePath: string, options?: CodebaseIndexOptions): CodebaseIndexOptions {
+        return this.getIndexOptions(options ?? this.codebaseInfoMap.get(codebasePath));
+    }
+
+    public findIndexedCodebasePath(codebasePath: string): string | undefined {
+        return this.findBestMatchingCodebasePath(codebasePath, this.getIndexedCodebases());
+    }
+
+    public findIndexingCodebasePath(codebasePath: string): string | undefined {
+        return this.findBestMatchingCodebasePath(codebasePath, this.getIndexingCodebases());
+    }
+
+    public findTrackedCodebasePath(codebasePath: string): string | undefined {
+        return this.findBestMatchingCodebasePath(codebasePath, Array.from(this.codebaseInfoMap.keys()));
     }
 
     /**
@@ -371,7 +429,7 @@ export class SnapshotManager {
     /**
      * Set codebase to indexing status
      */
-    public setCodebaseIndexing(codebasePath: string, progress: number = 0): void {
+    public setCodebaseIndexing(codebasePath: string, progress: number = 0, indexOptions?: CodebaseIndexOptions): void {
         this.indexingCodebases.set(codebasePath, progress);
 
         // Remove from other states
@@ -391,12 +449,19 @@ export class SnapshotManager {
             status: _s, indexingPercentage: _p, lastUpdated: _lu,
             indexedFiles: _if, totalChunks: _tc, indexStatus: _is,
             errorMessage: _em, lastAttemptedPercentage: _lap,
+            // request-level options are re-derived below (resolveIndexOptions) so an
+            // explicit empty set can clear them — never carry them forward via `rest`.
+            requestSplitter: _rs, requestCustomExtensions: _rce, requestIgnorePatterns: _rip,
             ...rest
         } = (prior || {});
+        const resolvedIndexOptions = this.resolveIndexOptions(codebasePath, indexOptions);
+
+        // Update info map
         const info: CodebaseInfoIndexing = {
             ...rest,                                   // files, filesByModel, coverageByModel, future fields
             status: 'indexing',
             indexingPercentage: progress,
+            ...resolvedIndexOptions,
             lastUpdated: new Date().toISOString(),
         };
         this.codebaseInfoMap.set(codebasePath, info);
@@ -407,8 +472,19 @@ export class SnapshotManager {
      */
     public setCodebaseIndexed(
         codebasePath: string,
-        stats: { indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }
+        stats: { indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' },
+        indexOptions?: CodebaseIndexOptions
     ): void {
+        // Defensive guard: 0/0 + completed is a known-bad state that causes an
+        // infinite force-reindex loop — the client reads it as "not indexed",
+        // triggers force=true, deletes real data, and rewrites 0/0. Refuse to
+        // persist this combination regardless of who called us. See Issue #295.
+        if (stats.indexedFiles === 0 && stats.totalChunks === 0 && stats.status === 'completed') {
+            console.error(`[SNAPSHOT] Refusing to write 0/0+completed for '${codebasePath}' — invalid state. Stack trace:`);
+            console.trace();
+            return;
+        }
+
         // Add to indexed list if not already there
         if (!this.indexedCodebases.includes(codebasePath)) {
             this.indexedCodebases.push(codebasePath);
@@ -429,14 +505,20 @@ export class SnapshotManager {
             status: _s, indexingPercentage: _p, lastUpdated: _lu,
             indexedFiles: _if, totalChunks: _tc, indexStatus: _is,
             errorMessage: _em, lastAttemptedPercentage: _lap,
+            // request-level options are re-derived below (resolveIndexOptions) so an
+            // explicit empty set can clear them — never carry them forward via `rest`.
+            requestSplitter: _rs, requestCustomExtensions: _rce, requestIgnorePatterns: _rip,
             ...rest
         } = (prior || {});
+        const resolvedIndexOptions = this.resolveIndexOptions(codebasePath, indexOptions);
+
         const info: CodebaseInfoIndexed = {
             ...rest,                                   // files, filesByModel, coverageByModel, future fields
             status: 'indexed',
             indexedFiles: stats.indexedFiles,
             totalChunks: stats.totalChunks,
             indexStatus: stats.status,
+            ...resolvedIndexOptions,
             lastUpdated: new Date().toISOString(),
         };
         this.codebaseInfoMap.set(codebasePath, info);
@@ -448,7 +530,8 @@ export class SnapshotManager {
     public setCodebaseIndexFailed(
         codebasePath: string,
         errorMessage: string,
-        lastAttemptedPercentage?: number
+        lastAttemptedPercentage?: number,
+        indexOptions?: CodebaseIndexOptions
     ): void {
         // Remove from other states
         this.indexedCodebases = this.indexedCodebases.filter(path => path !== codebasePath);
@@ -461,10 +544,14 @@ export class SnapshotManager {
         // in-memory ledger — a retry re-indexes the codebase from scratch, so a stale
         // partial ledger must not survive to short-circuit the next run. (The on-disk
         // entry is then replaced wholesale by this failed info on the next merge-save.)
+        const resolvedIndexOptions = this.resolveIndexOptions(codebasePath, indexOptions);
+
+        // Update info map
         const info: CodebaseInfoIndexFailed = {
             status: 'indexfailed',
             errorMessage: errorMessage,
             lastAttemptedPercentage: lastAttemptedPercentage,
+            ...resolvedIndexOptions,
             lastUpdated: new Date().toISOString()
         };
         this.codebaseInfoMap.set(codebasePath, info);
@@ -858,4 +945,4 @@ export class SnapshotManager {
             }
         }
     }
-} 
+}

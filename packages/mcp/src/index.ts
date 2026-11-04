@@ -83,6 +83,7 @@ class ContextMcpServer {
             ...(secondaryEmbedding && { secondaryEmbedding }),
             vectorDatabase,
             coverageReader: (codebasePath, modelId) => this.snapshotManager.getCoverageRatioForModel(codebasePath, modelId),
+            collectionNameOverride: config.collectionNameOverride
         });
 
         // Log the active model configuration to stderr (never stdout — JSON-RPC sanctity).
@@ -274,6 +275,11 @@ This tool is versatile and can be used before completing various tasks to retrie
     async start() {
         console.log('[SYNC-DEBUG] MCP server start() method called');
         console.log('Starting Context MCP server...');
+
+        // One-shot startup healing for legacy 0/0+completed snapshot entries
+        // left over from pre-fix MCP versions. Runs before the transport accepts
+        // requests so clients never observe the poisoning state. See Issue #295.
+        await this.toolHandlers.validateLegacyZeroEntries();
 
         const transport = new StdioServerTransport();
         console.log('[SYNC-DEBUG] StdioServerTransport created, attempting server connection...');

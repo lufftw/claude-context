@@ -1,6 +1,6 @@
 {
     "name": "@zilliz/claude-context-mcp",
-    "version": "0.1.4-lufftw.3",
+    "version": "0.1.15-lufftw.1",
     "description": "Model Context Protocol integration for Claude Context (lufftw fork: private+shared collections, CLAUDE_CONTEXT_HOME, dual-write)",
     "type": "module",
     "main": "dist/index.js",
@@ -19,6 +19,7 @@
         "test:coverage-snap": "pnpm build && node scripts/snapshot-coverage.test.mjs",
         "test:search-routing": "pnpm build && node scripts/search-model-routing.test.mjs",
         "test:degraded-callgate": "pnpm build && node scripts/search-degraded-callgate.test.mjs",
+        "test": "node --import tsx --test \"src/**/*.test.ts\"",
         "start": "tsx src/index.ts",
         "start:with-env": "OPENAI_API_KEY=${OPENAI_API_KEY:your-api-key-here} MILVUS_ADDRESS=${MILVUS_ADDRESS:localhost:19530} tsx src/index.ts",
         "prepublishOnly": "pnpm build"

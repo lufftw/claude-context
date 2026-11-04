@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { envManager, DEFAULT_PRIMARY_MODEL_ID } from "@zilliz/claude-context-core";
 
 export interface ContextMcpConfig {
@@ -39,6 +40,7 @@ export interface ContextMcpConfig {
     // Vector database configuration
     milvusAddress?: string; // Optional, can be auto-resolved from token
     milvusToken?: string;
+    collectionNameOverride?: string;
 }
 
 // Legacy format (v1) - for backward compatibility
@@ -60,8 +62,17 @@ export interface FileCompleteness {
     complete: boolean;   // true ⇔ every produced chunk for the file was inserted
 }
 
+export type RequestSplitterType = 'ast' | 'langchain';
+
+// Request-level indexing options stored with a codebase's snapshot entry.
+export interface CodebaseIndexOptions {
+    requestSplitter?: RequestSplitterType;
+    requestCustomExtensions?: string[];
+    requestIgnorePatterns?: string[];
+}
+
 // Base interface for common fields
-interface CodebaseInfoBase {
+interface CodebaseInfoBase extends CodebaseIndexOptions {
     lastUpdated: string;
 }
 
@@ -158,6 +169,22 @@ export function getEmbeddingModelForProvider(provider: string): string {
     }
 }
 
+function readMcpPackageVersion(): string {
+    try {
+        const packageJsonUrl = new URL("../package.json", import.meta.url);
+        const packageJson = JSON.parse(readFileSync(packageJsonUrl, "utf8")) as { version?: unknown };
+        if (typeof packageJson.version === "string" && packageJson.version.trim()) {
+            return packageJson.version;
+        }
+    } catch (error) {
+        console.warn(`[DEBUG] ⚠️  Unable to read MCP package version: ${error}`);
+    }
+
+    return "1.0.0";
+}
+
+const defaultMcpServerVersion = readMcpPackageVersion();
+
 function getPositiveIntegerFromEnv(name: string): number | undefined {
     const rawValue = envManager.get(name);
     if (!rawValue) {
@@ -183,6 +210,7 @@ export function createMcpConfig(): ContextMcpConfig {
     console.error(`[DEBUG]   GEMINI_API_KEY: ${envManager.get('GEMINI_API_KEY') ? 'SET (length: ' + envManager.get('GEMINI_API_KEY')!.length + ')' : 'NOT SET'}`);
     console.error(`[DEBUG]   OPENAI_API_KEY: ${envManager.get('OPENAI_API_KEY') ? 'SET (length: ' + envManager.get('OPENAI_API_KEY')!.length + ')' : 'NOT SET'}`);
     console.error(`[DEBUG]   MILVUS_ADDRESS: ${envManager.get('MILVUS_ADDRESS') || 'NOT SET'}`);
+    console.error(`[DEBUG]   CODE_CHUNKS_COLLECTION_NAME_OVERRIDE: ${envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE') || 'NOT SET'}`);
     console.error(`[DEBUG]   NODE_ENV: ${envManager.get('NODE_ENV') || 'NOT SET'}`);
     console.error(`[DEBUG]   MILVUS_COLLECTION_PRIVATE_0P6B: ${envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B') || 'NOT SET (secondary OFF)'}`);
     console.error(`[DEBUG]   SEARCH_EMBEDDING_MODEL: ${envManager.get('SEARCH_EMBEDDING_MODEL') || 'NOT SET (default: qwen3-embedding-8b)'}`);
@@ -206,7 +234,7 @@ export function createMcpConfig(): ContextMcpConfig {
 
     const config: ContextMcpConfig = {
         name: envManager.get('MCP_SERVER_NAME') || "Context MCP Server",
-        version: envManager.get('MCP_SERVER_VERSION') || "1.0.0",
+        version: envManager.get('MCP_SERVER_VERSION') || defaultMcpServerVersion,
         // Embedding provider configuration
         embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'OpenRouter' | 'RabbitMQ') || 'OpenAI',
         embeddingModel: getEmbeddingModelForProvider(envManager.get('EMBEDDING_PROVIDER') || 'OpenAI'),
@@ -241,7 +269,8 @@ export function createMcpConfig(): ContextMcpConfig {
         searchEmbeddingModel,
         // Vector database configuration - address can be auto-resolved from token
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
-        milvusToken: envManager.get('MILVUS_TOKEN')
+        milvusToken: envManager.get('MILVUS_TOKEN'),
+        collectionNameOverride: envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE')
     };
 
     return config;
@@ -258,6 +287,9 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
     console.error(`[MCP]   Embedding Provider: ${config.embeddingProvider}`);
     console.error(`[MCP]   Embedding Model: ${config.embeddingModel}`);
     console.error(`[MCP]   Milvus Address: ${config.milvusAddress || (config.milvusToken ? '[Auto-resolve from token]' : '[Not configured]')}`);
+    if (config.collectionNameOverride) {
+        console.error(`[MCP]   Collection Name Override: ✅ Configured`);
+    }
 
     // Log provider-specific configuration without exposing sensitive data
     switch (config.embeddingProvider) {
@@ -344,6 +376,31 @@ Environment Variables:
   Vector Database Configuration:
   MILVUS_ADDRESS          Milvus address (optional, can be auto-resolved from token)
   MILVUS_TOKEN            Milvus token (optional, used for authentication and address resolution)
+  CODE_CHUNKS_COLLECTION_NAME_OVERRIDE
+                          Optional readable prefix for collection names.
+                          Uses code_chunks_<override>_<pathHash> (or hybrid_...)
+                          after sanitization (letters/digits/underscore, 255 chars max).
+                          The per-codebase pathHash is preserved so multiple
+                          codebases stay distinct under the same override.
+
+  MCP Sync Configuration:
+  CLAUDE_CONTEXT_BACKGROUND_SYNC
+                          Enable/disable startup + periodic background sync
+                          for indexed codebases (default: true). Set to false
+                          to disable polling while keeping trigger-based sync.
+  CLAUDE_CONTEXT_SYNC_INTERVAL_MS
+                          Background sync interval in milliseconds when enabled
+                          (default: 300000).
+
+  Sync Trigger Watcher:
+  CLAUDE_CONTEXT_TRIGGER_WATCHER
+                          Enable/disable the ~/.context/.sync-trigger filesystem
+                          watcher (default: true). When enabled, touching the
+                          trigger file kicks off an immediate, debounced re-index.
+                          Triggered syncs share the same global cross-process
+                          lock as background sync, so multi-instance setups stay
+                          coordinated. Set to false to disable filesystem
+                          watching entirely (read-only / sandboxed environments).
 
 Examples:
   # Start MCP server with OpenAI (default) and explicit Milvus address
@@ -363,5 +420,11 @@ Examples:
   
   # Start MCP server with Ollama and specific model (using EMBEDDING_MODEL)
   EMBEDDING_PROVIDER=Ollama EMBEDDING_MODEL=nomic-embed-text MILVUS_TOKEN=your-token npx @zilliz/claude-context-mcp@latest
+
+  # Start MCP server with a human-readable collection name override
+  OPENAI_API_KEY=sk-xxx MILVUS_TOKEN=your-token CODE_CHUNKS_COLLECTION_NAME_OVERRIDE=my_project npx @zilliz/claude-context-mcp@latest
+
+  # Start MCP server with background sync enabled every minute
+  OPENAI_API_KEY=sk-xxx MILVUS_TOKEN=your-token CLAUDE_CONTEXT_BACKGROUND_SYNC=true CLAUDE_CONTEXT_SYNC_INTERVAL_MS=60000 npx @zilliz/claude-context-mcp@latest
         `);
-} 
+}
