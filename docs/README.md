@@ -20,6 +20,13 @@ Welcome to the Claude Context documentation! Claude Context is a powerful tool t
 - [File Inclusion & Exclusion Rules](dive-deep/file-inclusion-rules.md) - Detailed explanation of file inclusion and exclusion rules
 - [Asynchronous Indexing Workflow](dive-deep/asynchronous-indexing-workflow.md) - Detailed explanation of asynchronous indexing workflow
 
+### Fork (lufftw) Documentation
+- [Fork Architecture Overview](architecture/fork-overview.md): what this fork adds to upstream, and the invariants it keeps
+- [Fork Configuration Reference](reference/fork-configuration.md): fork-only environment variables and how they resolve
+- [Credential Handling](security/credential-handling.md): secret policy, automated scanning, incident response
+- [Upstream Synchronisation Runbook](maintenance/upstream-sync.md): how to merge new `zilliztech/claude-context` releases
+- [Design records and bug-fix reports](lufftw/): dated, detailed history of fork changes
+
 ### Troubleshooting
 - [❓ FAQ](troubleshooting/faq.md) - Frequently asked questions
 - [🐛 Troubleshooting Guide](troubleshooting/troubleshooting-guide.md) - Troubleshooting guide
