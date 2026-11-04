@@ -26,7 +26,10 @@ Welcome to the Claude Context documentation! Claude Context is a powerful tool t
 - [Credential Handling](security/credential-handling.md): secret policy, automated scanning, incident response
 - [Upstream Synchronisation Runbook](maintenance/upstream-sync.md): how to merge new `zilliztech/claude-context` releases
 - [Dependency Policy and Version Matrix](maintenance/dependency-policy.md): which library versions the fork uses, and why
-- [Design records and bug-fix reports](lufftw/): dated, detailed history of fork changes
+- [Design records and bug-fix reports](lufftw/): dated, detailed history of fork changes. Each one carries a status banner where later changes apply
+- [Planning documents](plan/): historical; superseded by the records above
+
+_Fork documentation last reviewed in full: 2026-11-04 (`0.1.15-lufftw.2`)._
 
 ### Troubleshooting
 - [❓ FAQ](troubleshooting/faq.md) - Frequently asked questions

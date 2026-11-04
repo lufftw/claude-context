@@ -2,7 +2,7 @@
 
 `lufftw/claude-context` is a fork of
 [`zilliztech/claude-context`](https://github.com/zilliztech/claude-context), currently level with
-upstream 0.1.15 (`0.1.15-lufftw.1`). It runs Claude Context as shared infrastructure: one Milvus
+upstream 0.1.15 (`0.1.15-lufftw.2`: MCP TypeScript SDK 1.32, Milvus Node SDK 2.5, amqplib 2). It runs Claude Context as shared infrastructure: one Milvus
 instance and one self-hosted embedding fleet serve several repositories, machines and concurrent MCP
 processes. This page summarises what the fork changes and why. Each section links to the detailed
 design record.
@@ -41,7 +41,9 @@ design record.
 | Cloud sync | Re-adds codebases found only in Milvus | Does not, because the Milvus instance is shared across machines | [upstream merge record](../lufftw/upstream-merge-2026-11-04.md) |
 | Milvus memory | Collections loaded on demand | `MILVUS_AUTOLOAD_DENY` refuses implicit loads of released collections | [configuration reference](../reference/fork-configuration.md) |
 | Sync performance | Re-hashes every file | Skips unchanged files by `stat`; compiles ignore globs once | commit `7b24ca1` |
-| Supply-chain hygiene | — | Secret scanner in CI, pre-commit hook and history audit | [credential-handling](../security/credential-handling.md) |
+| Supply-chain hygiene | — | Secret scanner in CI, pre-commit hook and history audit; hooks kept LF for Windows | [credential-handling](../security/credential-handling.md) |
+| AMQP connection health | — | 60 s heartbeat negotiated through the connection URL | [heartbeat fix](../lufftw/bugfix-2026-11-04-amqp-heartbeat.md) |
+| Dependency lines | Latest SDKs | MCP SDK on the maintained v1 line; Milvus SDK matched to the 2.5 server; versions and deferrals recorded | [dependency policy](../maintenance/dependency-policy.md) |
 
 ## Invariants
 

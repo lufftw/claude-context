@@ -1,5 +1,12 @@
 # RabbitMQ Embedding Provider
 
+> **Status:** reviewed 2026-11-04 against `0.1.15-lufftw.2` (amqplib 2.2.1). The AMQP heartbeat (default
+> 60 s) is now sent in the connection URL. It was previously passed as a socket option, which
+> amqplib ignores; see [bugfix-2026-11-04-amqp-heartbeat.md](./bugfix-2026-11-04-amqp-heartbeat.md).
+> An explicit `?heartbeat=` in `RABBITMQ_INFERENCE_URL` takes precedence. CPU-tolerant behaviour
+> (WAIT/REAL, partial batches) is described in
+> [design-2026-06-06-cpu-tolerant-embedding.md](./design-2026-06-06-cpu-tolerant-embedding.md).
+
 **Added**: v0.1.4-lufftw.2
 **File**: `packages/core/src/embedding/rabbitmq-embedding.ts`
 **Factory**: `packages/mcp/src/embedding.ts` (case `'RabbitMQ'`)
@@ -79,7 +86,7 @@ embed() / embedBatch()
    │
    ▼
 initialize()       // mutex-protected, idempotent
-   │  ├─ amqplib.connect(url, {heartbeat})
+   │  ├─ amqplib.connect(withHeartbeat(url, heartbeat))   // heartbeat goes in the URL query
    │  ├─ createConfirmChannel() → publishCh  (durable publish)
    │  ├─ createChannel() → replyCh           (consumer isolation)
    │  ├─ assertQueue('', {exclusive:true, autoDelete:true}) → replyQueue

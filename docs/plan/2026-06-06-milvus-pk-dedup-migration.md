@@ -1,5 +1,9 @@
 # Milvus Duplicate-PK Dedup — Migration Plan (PLAN ONLY — NO EXECUTION)
 
+> **Historical record (2026-06-06).** Planning or review document, kept as written for traceability. It
+> may not match the current code. Implemented designs are in [`docs/lufftw/`](../lufftw/); the
+> current state is summarised in [fork-overview.md](../architecture/fork-overview.md).
+
 > **Status:** DRAFT for owner review. **Nothing in this document is to be executed** until the owner
 > approves, and every destructive step has a per-collection confirmation gate. This is a Phase-3
 > correctness prerequisite surfaced by the Round-4 execution digital-twin.

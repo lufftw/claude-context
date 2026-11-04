@@ -1,5 +1,11 @@
 # Design — CPU-Fault-Tolerant RabbitMQ Embedding (PP-SCL)
 
+> **Design record (2026-06-06).** Implemented and still in force. Later changes: upstream 0.1.15's
+> embedding-error rules were reconciled with this design in
+> [upstream-merge-2026-11-04.md](./upstream-merge-2026-11-04.md) (a run that stores nothing raises
+> `EmbeddingError`). The Milvus Node SDK is now `~2.5.13`; the `upsert` call this design relies on
+> is unchanged, and the core suite (164 tests) passes on it.
+
 **Date:** 2026-06-06
 **Status:** Approved (direction); spec under owner review
 **Scope:** All 3 phases, shipped incrementally

@@ -1,5 +1,8 @@
 # Upstream merge — 2026-11-04 (zilliztech/claude-context `master` @ `6fc318b`, 0.1.15)
 
+> **Follow-up:** `0.1.15-lufftw.2` (same day) refreshed dependencies without new upstream commits
+> and fixed the ignored AMQP heartbeat. See [dependency-policy.md](../maintenance/dependency-policy.md).
+
 A real `git merge` of `upstream/master` (68 commits since merge-base `7255be0`), replacing the
 earlier cherry-pick approach (see `upstream-cherry-pick-log.md`). Packages are versioned
 `0.1.15-lufftw.1`.

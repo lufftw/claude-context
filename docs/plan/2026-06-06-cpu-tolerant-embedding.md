@@ -1,5 +1,9 @@
 # CPU-Tolerant RabbitMQ Embedding (PP-SCL) — Implementation Plan
 
+> **Historical record (2026-06-06).** Planning or review document, kept as written for traceability. It
+> may not match the current code. Implemented designs are in [`docs/lufftw/`](../lufftw/); the
+> current state is summarised in [fork-overview.md](../architecture/fork-overview.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make claude-context's RabbitMQ embedding pipeline tolerate slow CPU embedding workers (minutes-to-hours) without orphaning completed work or aborting the index run, while staying correct on crash/resume.

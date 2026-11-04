@@ -1,5 +1,9 @@
 # Environment Variables Configuration
 
+> **lufftw fork:** variables added by the fork (private/shared collections, RabbitMQ provider,
+> dual-model embedding, `MILVUS_AUTOLOAD_DENY`, `CLAUDE_CONTEXT_HOME`, …) and the project-`.env`
+> resolution order are documented in [Fork Configuration Reference](../reference/fork-configuration.md).
+
 ## 🎯 Global Configuration
 
 Claude Context supports a global configuration file at `~/.context/.env` to simplify MCP setup across different MCP clients.

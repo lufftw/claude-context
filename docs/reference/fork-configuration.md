@@ -41,7 +41,7 @@ RPC.
 
 | Variable | Default | Description |
 |---|---|---|
-| 🔒 `RABBITMQ_INFERENCE_URL` | — (required) | Full AMQP URL with credentials and vhost, `amqp://<user>:<password>@<host>:5672/<vhost>`. |
+| 🔒 `RABBITMQ_INFERENCE_URL` | — (required) | Full AMQP URL with credentials and vhost, `amqp://<user>:<password>@<host>:5672/<vhost>`. The provider adds `?heartbeat=60` unless the URL already sets `heartbeat` (since `0.1.15-lufftw.2`). |
 | `RABBITMQ_EMBEDDING_QUEUE` | `embedding.qwen3-8b` | Work queue of the primary model. |
 | `EMBEDDING_MODEL` | `qwen3-embedding-8b` | Logical model id sent in each task. |
 | `RABBITMQ_EMBEDDING_DIMENSION` | `4096` | Vector dimension of the primary model. |

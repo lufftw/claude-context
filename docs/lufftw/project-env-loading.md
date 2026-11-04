@@ -1,5 +1,11 @@
 # Project-Scoped `.env` Loading (EnvManager v2)
 
+> **Status:** feature reference, reviewed 2026-11-04 against `0.1.15-lufftw.2`. Project `.env` scoping
+> now uses `AsyncLocalStorage` per request (`envManager.runWithProject`); see
+> [bugfix-2026-05-04-envmanager-concurrency.md](./bugfix-2026-05-04-envmanager-concurrency.md).
+> Resolution order: project `.env` > `process.env` > `~/.context/.env`
+> ([fork configuration](../reference/fork-configuration.md)).
+
 **Version**: v0.1.4-lufftw.2
 **Date**: 2026-03-14
 **Depends on**: [private-shared-collections.md](./private-shared-collections.md)
@@ -13,7 +19,7 @@ In v0.1.4-lufftw.1, `EnvManager` resolved variables from two sources:
 1. `process.env` (MCP `env` block in `~/.claude.json` or `.mcp.json`)
 2. `~/.context/.env` (global fallback)
 
-This meant project-scoped variables (`MILVUS_STRATEGY`, `MILVUS_COLLECTION_PRIVATE`, etc.) could only be set via the MCP env block — not from a project's `.env` file.  The [layered configuration architecture](../../../milvus-services/docs/claude-context/layered-configuration.md) documented a "project `.env`" layer, but the code never implemented it.
+This meant project-scoped variables (`MILVUS_STRATEGY`, `MILVUS_COLLECTION_PRIVATE`, etc.) could only be set via the MCP env block — not from a project's `.env` file.  The layered configuration architecture (`docs/claude-context/layered-configuration.md` in the separate `milvus-services` repository) documented a "project `.env`" layer, but the code never implemented it.
 
 **Consequence**: Every project needed to either:
 - Duplicate collection variables into `.mcp.json` (project-scope approach), or

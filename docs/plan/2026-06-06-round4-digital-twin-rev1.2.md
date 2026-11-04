@@ -1,5 +1,9 @@
 # Round 4 — Execution Digital-Twin Verdict (plan rev1.1 -> rev1.2)
 
+> **Historical record (2026-06-06).** Planning or review document, kept as written for traceability. It
+> may not match the current code. Implemented designs are in [`docs/lufftw/`](../lufftw/); the
+> current state is summarised in [fork-overview.md](../architecture/fork-overview.md).
+
 > Audit artifact. 5-agent execution-digital-twin (3 scenario traces + adversarial breaker + chair)
 > traced the composed P30/P31/P33 seam against REAL code + the live duplicate-PK ground truth.
 > Verdict: NO-GO as scoped (rev1.1) -> GO against the rev1.2 atomic-unit design below.
