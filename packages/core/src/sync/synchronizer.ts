@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { MerkleDAG } from './merkle';
 import * as os from 'os';
+import { IgnoreMatcher } from '../utils/ignore-matcher';
 
 // A file's size and modification time at the moment it was last hashed. When both are unchanged on the
 // next scan, the stored hash is reused instead of reading the file again: re-reading and hashing every
@@ -20,13 +21,12 @@ const RACY_WINDOW_MS = 2000;
 export class FileSynchronizer {
     private fileHashes: Map<string, string>;
     private fileStats: Map<string, FileStat>;
-    private globRegexCache: Map<string, RegExp> = new Map();
     private merkleDAG: MerkleDAG;
     private rootDir: string;
     private snapshotPath: string;
-    private ignorePatterns: string[];
     private includeDotDirs: string[];
     private supportedExtensions: string[];
+    private ignoreMatcher: IgnoreMatcher;
 
     constructor(rootDir: string, ignorePatterns: string[] = [], includeDotDirs: string[] = [], supportedExtensions: string[] = []) {
         this.rootDir = rootDir;
@@ -34,10 +34,12 @@ export class FileSynchronizer {
         this.fileHashes = new Map();
         this.fileStats = new Map();
         this.merkleDAG = new MerkleDAG();
-        this.ignorePatterns = ignorePatterns;
-        // Normalize: ensure entries start with '.' and have no trailing slashes
+        // Normalize: ensure entries have no trailing slashes
         this.includeDotDirs = includeDotDirs.map(d => d.replace(/\/+$/, ''));
         this.supportedExtensions = supportedExtensions;
+        // Upstream's gitignore-compatible matcher (negation, root anchoring) plus the fork's
+        // includeDotDirs allow-list for otherwise-hidden dot directories.
+        this.ignoreMatcher = new IgnoreMatcher(ignorePatterns, this.includeDotDirs);
     }
 
     private getSnapshotPath(codebasePath: string): string {
@@ -132,111 +134,8 @@ export class FileSynchronizer {
         return fileHashes;
     }
 
-    private shouldIgnore(relativePath: string, isDirectory: boolean = false): boolean {
-        // Ignore hidden files and directories (starting with .) unless explicitly included
-        const pathParts = relativePath.split(path.sep);
-        if (pathParts.some(part => part.startsWith('.'))) {
-            // Check if the dot-prefixed part is in the include list
-            const hasIncludedDotDir = this.includeDotDirs.length > 0 && pathParts.every(part =>
-                !part.startsWith('.') || this.includeDotDirs.includes(part)
-            );
-            if (!hasIncludedDotDir) {
-                return true;
-            }
-        }
-
-        if (this.ignorePatterns.length === 0) {
-            return false;
-        }
-
-        // Normalize path separators and remove leading/trailing slashes
-        const normalizedPath = relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-
-        if (!normalizedPath) {
-            return false; // Don't ignore root
-        }
-
-        // Check direct pattern matches first
-        for (const pattern of this.ignorePatterns) {
-            if (this.matchPattern(normalizedPath, pattern, isDirectory)) {
-                return true;
-            }
-        }
-
-        // Check if any parent directory is ignored
-        const normalizedPathParts = normalizedPath.split('/');
-        for (let i = 0; i < normalizedPathParts.length; i++) {
-            const partialPath = normalizedPathParts.slice(0, i + 1).join('/');
-            for (const pattern of this.ignorePatterns) {
-                // Check directory patterns
-                if (pattern.endsWith('/')) {
-                    const dirPattern = pattern.slice(0, -1);
-                    if (this.simpleGlobMatch(partialPath, dirPattern) ||
-                        this.simpleGlobMatch(normalizedPathParts[i], dirPattern)) {
-                        return true;
-                    }
-                }
-                // Check exact path patterns
-                else if (pattern.includes('/')) {
-                    if (this.simpleGlobMatch(partialPath, pattern)) {
-                        return true;
-                    }
-                }
-                // Check filename patterns against any path component
-                else {
-                    if (this.simpleGlobMatch(normalizedPathParts[i], pattern)) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private matchPattern(filePath: string, pattern: string, isDirectory: boolean = false): boolean {
-        // Clean both path and pattern
-        const cleanPath = filePath.replace(/^\/+|\/+$/g, '');
-        const cleanPattern = pattern.replace(/^\/+|\/+$/g, '');
-
-        if (!cleanPath || !cleanPattern) {
-            return false;
-        }
-
-        // Handle directory patterns (ending with /)
-        if (pattern.endsWith('/')) {
-            if (!isDirectory) return false; // Directory pattern only matches directories
-            const dirPattern = cleanPattern.slice(0, -1);
-
-            // Direct match or any path component matches
-            return this.simpleGlobMatch(cleanPath, dirPattern) ||
-                cleanPath.split('/').some(part => this.simpleGlobMatch(part, dirPattern));
-        }
-
-        // Handle path patterns (containing /)
-        if (cleanPattern.includes('/')) {
-            return this.simpleGlobMatch(cleanPath, cleanPattern);
-        }
-
-        // Handle filename patterns (no /) - match against basename
-        const fileName = path.basename(cleanPath);
-        return this.simpleGlobMatch(fileName, cleanPattern);
-    }
-
-    private simpleGlobMatch(text: string, pattern: string): boolean {
-        if (!text || !pattern) return false;
-
-        // Compiled once per pattern. Building a new RegExp on every call (patterns x path components x
-        // files, on every sync) was 55% of an unchanged re-check's CPU on a 10k-file codebase (2026-10-04).
-        let regex = this.globRegexCache.get(pattern);
-        if (!regex) {
-            const regexPattern = pattern
-                .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex special chars except *
-                .replace(/\*/g, '.*'); // Convert * to .*
-            regex = new RegExp(`^${regexPattern}$`);
-            this.globRegexCache.set(pattern, regex);
-        }
-        return regex.test(text);
+    private shouldIgnore(relativePath: string, isDirectory: boolean): boolean {
+        return this.ignoreMatcher.ignores(relativePath, isDirectory);
     }
 
     private buildMerkleDAG(fileHashes: Map<string, string>): MerkleDAG {
@@ -246,7 +145,7 @@ export class FileSynchronizer {
 
         // Create a root node for the entire directory
         let valuesString = "";
-        keys.forEach(key => {
+        sortedPaths.forEach(key => {
             valuesString += fileHashes.get(key);
         });
         const rootNodeData = "root:" + valuesString;

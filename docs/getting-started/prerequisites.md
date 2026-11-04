@@ -19,11 +19,11 @@ Before setting up Claude Context, ensure you have the following requirements met
 
 #### Option 3: Gemini
 - **API Key**: Get from [Google AI Studio](https://aistudio.google.com/)
-- **Models**: `gemini-embedding-001`
+- **Models**: `gemini-embedding-001`, `gemini-embedding-2`
 - **Quota**: Check current quotas and limits
 
 #### Option 4: Ollama (Local)
-- **Installation**: Download from [ollama.ai](https://ollama.ai/)
+- **Installation**: Download from [ollama.com](https://ollama.com/)
 - **Models**: Pull embedding models like `nomic-embed-text`
 - **Hardware**: Sufficient RAM for model loading (varies by model)
 

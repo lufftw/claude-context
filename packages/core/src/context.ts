@@ -29,6 +29,36 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { FileSynchronizer } from './sync/synchronizer';
+import { IgnoreMatcher } from './utils/ignore-matcher';
+
+/**
+ * Thrown by indexCodebase / processFileList when an AbortSignal fires
+ * mid-indexing. Callers (e.g. the MCP server's clear_index handler) use
+ * this to detect a cooperative cancel vs. a real failure.
+ */
+export class IndexAbortError extends Error {
+    constructor(message: string = 'Indexing aborted') {
+        super(message);
+        this.name = 'IndexAbortError';
+    }
+}
+
+/**
+ * Thrown when the embedding API fails (quota exhausted, auth failure,
+ * network error, etc.). Propagates through processFileList so callers
+ * can distinguish a critical embedding failure from a per-file skip.
+ *
+ * Unlike a per-file read/parse error (which is logged and skipped),
+ * an EmbeddingError is always re-thrown so that the entire indexing
+ * pipeline stops. This prevents silent partial indexing: Milvus would
+ * otherwise receive zero vectors while the snapshot marks files as done.
+ */
+export class EmbeddingError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'EmbeddingError';
+    }
+}
 
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
@@ -118,6 +148,7 @@ export interface ContextConfig {
     customExtensions?: string[]; // New: custom extensions from MCP
     customIgnorePatterns?: string[]; // New: custom ignore patterns from MCP
     includeDotDirs?: string[]; // Dot-prefixed directories to include in indexing
+    collectionNameOverride?: string; // Optional: custom collection name suffix
 }
 
 /**
@@ -146,6 +177,8 @@ interface BatchOutcome {
     realFailures: number;
     waitFailures: number;
     successes: number;
+    /** Message of the last whole-batch provider failure, if any (surfaced in EmbeddingError). */
+    lastError?: string;
 }
 
 /**
@@ -201,17 +234,19 @@ const WRITABLE_SHARED_MODEL_ID = '__writable_shared__';
  * Per-target abort isolation (Fix 2) decides whether catching it drops a single
  * non-primary target or re-throws to fail the whole run (primary death).
  */
-interface IndexAbortError extends Error {
+interface EmbedFailureAbortError extends Error {
     __isIndexAbort: true;
 }
 
-/** Type guard for the {@link IndexAbortError} sentinel (Fix 4 — replaces the
+/** Type guard for the {@link EmbedFailureAbortError} sentinel (Fix 4 — replaces the
  *  `(err as any).__isIndexAbort` casts at the throw + both catch sites). */
-function isIndexAbort(e: unknown): e is IndexAbortError {
+function isIndexAbort(e: unknown): e is EmbedFailureAbortError {
     return !!e && typeof e === 'object' && (e as { __isIndexAbort?: unknown }).__isIndexAbort === true;
 }
 
 export class Context {
+    private static readonly MAX_COLLECTION_NAME_LENGTH = 255;
+
     private embedding: Embedding;
     private secondaryEmbedding?: Embedding;
     private coverageReader?: (codebasePath: string, modelId: string) => number | undefined;
@@ -221,8 +256,11 @@ export class Context {
     private vectorDatabase: VectorDatabase;
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
+    private baseIgnorePatterns: string[];
     private ignorePatterns: string[];
     private includeDotDirs: string[];
+    private collectionNameOverride?: string;
+    private warnedOverrideSanitization = new Set<string>();
     private synchronizers = new Map<string, FileSynchronizer>();
 
     constructor(config: ContextConfig = {}) {
@@ -266,15 +304,16 @@ export class Context {
         // Load custom ignore patterns from environment variables  
         const envCustomIgnorePatterns = this.getCustomIgnorePatternsFromEnv();
 
-        // Start with default ignore patterns
+        // Start with default ignore patterns and persistent config/env patterns.
         const allIgnorePatterns = [
             ...DEFAULT_IGNORE_PATTERNS,
             ...(config.ignorePatterns || []),
             ...(config.customIgnorePatterns || []),
             ...envCustomIgnorePatterns
         ];
-        // Remove duplicates
-        this.ignorePatterns = [...new Set(allIgnorePatterns)];
+        this.baseIgnorePatterns = this.dedupePatterns(allIgnorePatterns);
+        this.ignorePatterns = [...this.baseIgnorePatterns];
+        this.collectionNameOverride = config.collectionNameOverride;
 
         // Initialize includeDotDirs from config
         this.includeDotDirs = (config.includeDotDirs || []).map(d => d.replace(/\/+$/, ''));
@@ -407,6 +446,15 @@ export class Context {
     }
 
     /**
+     * Get supported extensions for the current operation without mutating
+     * the Context's persistent extension list.
+     */
+    getEffectiveSupportedExtensions(additionalExtensions: string[] = []): string[] {
+        const normalizedExtensions = this.normalizeExtensions(additionalExtensions);
+        return [...new Set([...this.supportedExtensions, ...normalizedExtensions])];
+    }
+
+    /**
      * Get ignore patterns
      */
     getIgnorePatterns(): string[] {
@@ -438,7 +486,15 @@ export class Context {
      * Public wrapper for loadIgnorePatterns private method
      */
     async getLoadedIgnorePatterns(codebasePath: string): Promise<void> {
-        return this.loadIgnorePatterns(codebasePath);
+        await this.loadIgnorePatterns(codebasePath);
+    }
+
+    /**
+     * Get the effective ignore patterns for a codebase without relying on
+     * codebase-specific patterns already stored on this Context instance.
+     */
+    async getEffectiveIgnorePatterns(codebasePath: string, additionalIgnorePatterns: string[] = []): Promise<string[]> {
+        return this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
     }
 
     /**
@@ -469,10 +525,58 @@ export class Context {
             return customName;
         }
         const isHybrid = this.getIsHybrid();
-        const normalizedPath = path.resolve(codebasePath);
-        const hash = crypto.createHash('md5').update(normalizedPath).digest('hex');
         const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
-        return `${prefix}_${hash.substring(0, 8)}`;
+        const normalizedPath = path.resolve(codebasePath);
+        const pathHash = crypto.createHash('md5').update(normalizedPath).digest('hex').substring(0, 8);
+
+        // Overrides always keep the per-codebase `_<pathHash>` suffix so that multiple
+        // codebases indexed by the same MCP server can't collapse into one collection.
+        const configOverride = this.getValidOverrideValue(this.collectionNameOverride);
+        if (configOverride) {
+            const suffix = this.sanitizeCollectionNameSuffix(configOverride, prefix, pathHash, 'Context config');
+            return `${prefix}_${suffix}`;
+        }
+
+        const envOverride = this.getValidOverrideValue(envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE'));
+        if (envOverride) {
+            const suffix = this.sanitizeCollectionNameSuffix(envOverride, prefix, pathHash, 'CODE_CHUNKS_COLLECTION_NAME_OVERRIDE');
+            return `${prefix}_${suffix}`;
+        }
+
+        return `${prefix}_${pathHash}`;
+    }
+
+    private getValidOverrideValue(value?: string): string | undefined {
+        if (!value) {
+            return undefined;
+        }
+        const trimmed = value.trim();
+        return trimmed.length > 0 ? trimmed : undefined;
+    }
+
+    private sanitizeCollectionNameSuffix(value: string, prefix: string, pathHash: string, source: string): string {
+        const hashSuffix = `_${pathHash}`;
+        // Leave room for both the prefix and the trailing `_<pathHash>` disambiguator.
+        const maxReadableLength = Context.MAX_COLLECTION_NAME_LENGTH - `${prefix}_`.length - hashSuffix.length;
+        const normalized = value.trim();
+        let sanitized = normalized.replace(/[^A-Za-z0-9_]/g, '_');
+        sanitized = sanitized.slice(0, Math.max(0, maxReadableLength));
+
+        if (sanitized.length === 0) {
+            sanitized = 'custom';
+        }
+
+        const full = `${sanitized}${hashSuffix}`;
+
+        if (sanitized !== normalized) {
+            const warningKey = `${source}:${normalized}:${sanitized}`;
+            if (!this.warnedOverrideSanitization.has(warningKey)) {
+                console.warn(`[Context] ⚠️ Sanitized collection name override from "${normalized}" to "${sanitized}" (${source}); final suffix "${full}"`);
+                this.warnedOverrideSanitization.add(warningKey);
+            }
+        }
+
+        return full;
     }
 
     /**
@@ -668,6 +772,9 @@ export class Context {
      *        A target whose ledger disagrees re-embeds even if another target is
      *        complete (NOT all-or-nothing). Defined inline — core must NOT import
      *        mcp's FileCompleteness.
+     * @param additionalIgnorePatterns Request-scoped ignore patterns
+     * @param additionalSupportedExtensions Request-scoped file extensions
+     * @param requestSplitter Request-scoped splitter for this indexing run
      * @returns Indexing statistics
      */
     async indexCodebase(
@@ -675,13 +782,17 @@ export class Context {
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
         onFileComplete?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
         forceReindex: boolean = false,
-        priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>
+        priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        requestSplitter?: Splitter,
+        signal?: AbortSignal
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         // Scope project-`.env` reads (MILVUS_COLLECTION_PRIVATE, _SHARED, _STRATEGY, etc.)
         // to this call only via AsyncLocalStorage. Critical for parallel safety:
         // sibling indexCodebase() calls must not see each other's project context.
         // Bug history: see docs/lufftw/bugfix-2026-05-04-envmanager-concurrency.md
-        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, onFileComplete, forceReindex, priorLedgersByModel));
+        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, onFileComplete, forceReindex, priorLedgersByModel, additionalIgnorePatterns, additionalSupportedExtensions, requestSplitter, signal));
     }
 
     private async _indexCodebaseImpl(
@@ -689,14 +800,20 @@ export class Context {
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
         onFileComplete?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
         forceReindex: boolean = false,
-        priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>
+        priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        requestSplitter?: Splitter,
+        signal?: AbortSignal
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
+        const splitter = requestSplitter || this.codeSplitter;
 
-        // 1. Load ignore patterns from various ignore files
-        await this.loadIgnorePatterns(codebasePath);
+        // 1. Compute ignore patterns for this codebase/request without
+        // retaining file-based patterns from previous codebases.
+        const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
 
         // 2. Check and prepare vector collection
         progressCallback?.({ phase: 'Preparing collection...', current: 0, total: 100, percentage: 0 });
@@ -705,7 +822,8 @@ export class Context {
 
         // 3. Recursively traverse codebase to get all supported files
         progressCallback?.({ phase: 'Scanning files...', current: 5, total: 100, percentage: 5 });
-        const codeFiles = await this.getCodeFiles(codebasePath);
+        const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
+        const codeFiles = await this.getCodeFiles(codebasePath, ignorePatterns, supportedExtensions);
         console.log(`[Context] 📁 Found ${codeFiles.length} code files`);
 
         if (codeFiles.length === 0) {
@@ -735,7 +853,9 @@ export class Context {
                 });
             },
             onFileComplete,
-            priorLedgersByModel
+            priorLedgersByModel,
+            splitter,
+            signal
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
@@ -756,27 +876,36 @@ export class Context {
 
     async reindexByChange(
         codebasePath: string,
-        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        requestSplitter?: Splitter
     ): Promise<{ added: number, removed: number, modified: number }> {
-        return envManager.runWithProject(codebasePath, () => this._reindexByChangeImpl(codebasePath, progressCallback));
+        return envManager.runWithProject(codebasePath, () => this._reindexByChangeImpl(codebasePath, progressCallback, additionalIgnorePatterns, additionalSupportedExtensions, requestSplitter));
     }
 
     private async _reindexByChangeImpl(
         codebasePath: string,
-        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        requestSplitter?: Splitter
     ): Promise<{ added: number, removed: number, modified: number }> {
         // P2: the syncer is the SECOND live entry point — bring it under the same
         // IndexTarget abstraction so a user edit can't desync the secondary _0p6b.
         const targets = this.buildIndexTargets(codebasePath);
         const primaryCollection = targets[0].collectionName;   // synchronizer key (filesystem-tracked, model-blind)
         const synchronizer = this.synchronizers.get(primaryCollection);
+        const splitter = requestSplitter || this.codeSplitter;
 
         if (!synchronizer) {
-            // Load project-specific ignore patterns before creating FileSynchronizer
-            await this.loadIgnorePatterns(codebasePath);
+            // Recreate the synchronizer with the same request-scoped options that
+            // were used for the original indexing task.
+            const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+            const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
 
             // To be safe, let's initialize if it's not there.
-            const newSynchronizer = new FileSynchronizer(codebasePath, this.ignorePatterns, this.includeDotDirs, this.supportedExtensions);
+            const newSynchronizer = new FileSynchronizer(codebasePath, ignorePatterns, this.includeDotDirs, supportedExtensions);
             await newSynchronizer.initialize();
             this.synchronizers.set(primaryCollection, newSynchronizer);
         }
@@ -831,6 +960,7 @@ export class Context {
                 (filePath, fileIndex, totalFiles) => { updateProgress(`Indexed ${filePath} (${fileIndex}/${totalFiles})`); },
                 undefined,                 // syncer does not write the per-model ledger here
                 new Map(),                 // empty per-model prior ledgers ⇒ re-embed the changed set for every target
+                splitter,
             );
         }
 
@@ -996,11 +1126,13 @@ export class Context {
                 allResults.push(...results);
             }
 
-            // 3. Sort merged results by score and take topK
+            // 3. Sort merged results by score, drop overlapping chunks (upstream #333 —
+            //    deduplicateResults keeps the first, i.e. highest-scored, hit), take topK
             allResults.sort((a, b) => b.score - a.score);
-            allResults = allResults.slice(0, topK);
+            const mergedCount = allResults.length;
+            allResults = this.deduplicateResults(allResults).slice(0, topK);
 
-            console.log(`[Context] ✅ Found ${allResults.length} relevant hybrid results (from ${collectionsToSearch.length} collection(s))`);
+            console.log(`[Context] ✅ Found ${allResults.length} relevant hybrid results (${mergedCount} before dedup, from ${collectionsToSearch.length} collection(s))`);
             if (allResults.length > 0) {
                 console.log(`[Context] 🔍 Top result score: ${allResults[0].score}, path: ${allResults[0].relativePath}`);
             }
@@ -1037,11 +1169,38 @@ export class Context {
             }
 
             allResults.sort((a, b) => b.score - a.score);
-            allResults = allResults.slice(0, topK);
+            const mergedCount = allResults.length;
+            allResults = this.deduplicateResults(allResults).slice(0, topK);
 
-            console.log(`[Context] ✅ Found ${allResults.length} relevant results (from ${collectionsToSearch.length} collection(s))`);
+            console.log(`[Context] ✅ Found ${allResults.length} relevant results (${mergedCount} before dedup, from ${collectionsToSearch.length} collection(s))`);
             return allResults;
         }
+    }
+
+    /**
+     * Deduplicate search results by file + line range overlap.
+     * Keeps higher-scored result when two results from the same file overlap >50%.
+     */
+    private deduplicateResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
+        const kept: SemanticSearchResult[] = [];
+
+        for (const result of results) {
+            const overlaps = kept.some((existing) => {
+                if (existing.relativePath !== result.relativePath) return false;
+                const overlapStart = Math.max(existing.startLine, result.startLine);
+                const overlapEnd = Math.min(existing.endLine, result.endLine);
+                if (overlapStart > overlapEnd) return false;
+                // Line ranges are inclusive (endLine = startLine + N - 1).
+                const overlapSize = overlapEnd - overlapStart + 1;
+                const resultSize = result.endLine - result.startLine + 1;
+                return resultSize > 0 && overlapSize / resultSize > 0.5;
+            });
+            if (!overlaps) {
+                kept.push(result);
+            }
+        }
+
+        return kept;
     }
 
     /**
@@ -1117,10 +1276,8 @@ export class Context {
     updateIgnorePatterns(ignorePatterns: string[]): void {
         // Merge with default patterns and any existing custom patterns, avoiding duplicates
         const mergedPatterns = [...DEFAULT_IGNORE_PATTERNS, ...ignorePatterns];
-        const uniquePatterns: string[] = [];
-        const patternSet = new Set(mergedPatterns);
-        patternSet.forEach(pattern => uniquePatterns.push(pattern));
-        this.ignorePatterns = uniquePatterns;
+        this.baseIgnorePatterns = this.dedupePatterns(mergedPatterns);
+        this.ignorePatterns = [...this.baseIgnorePatterns];
         console.log(`[Context] 🚫 Updated ignore patterns: ${ignorePatterns.length} new + ${DEFAULT_IGNORE_PATTERNS.length} default = ${this.ignorePatterns.length} total patterns`);
     }
 
@@ -1131,12 +1288,10 @@ export class Context {
     addCustomIgnorePatterns(customPatterns: string[]): void {
         if (customPatterns.length === 0) return;
 
-        // Merge current patterns with new custom patterns, avoiding duplicates
-        const mergedPatterns = [...this.ignorePatterns, ...customPatterns];
-        const uniquePatterns: string[] = [];
-        const patternSet = new Set(mergedPatterns);
-        patternSet.forEach(pattern => uniquePatterns.push(pattern));
-        this.ignorePatterns = uniquePatterns;
+        // Merge persistent base patterns with new custom patterns, avoiding duplicates.
+        const mergedPatterns = [...this.baseIgnorePatterns, ...customPatterns];
+        this.baseIgnorePatterns = this.dedupePatterns(mergedPatterns);
+        this.ignorePatterns = [...this.baseIgnorePatterns];
         console.log(`[Context] 🚫 Added ${customPatterns.length} custom ignore patterns. Total: ${this.ignorePatterns.length} patterns`);
     }
 
@@ -1144,7 +1299,8 @@ export class Context {
      * Reset ignore patterns to defaults only
      */
     resetIgnorePatternsToDefaults(): void {
-        this.ignorePatterns = [...DEFAULT_IGNORE_PATTERNS];
+        this.baseIgnorePatterns = [...DEFAULT_IGNORE_PATTERNS];
+        this.ignorePatterns = [...this.baseIgnorePatterns];
         console.log(`[Context] 🔄 Reset ignore patterns to defaults: ${this.ignorePatterns.length} patterns`);
     }
 
@@ -1255,17 +1411,25 @@ export class Context {
     /**
      * Recursively get all code files in the codebase
      */
-    private async getCodeFiles(codebasePath: string): Promise<string[]> {
+    private async getCodeFiles(
+        codebasePath: string,
+        ignorePatterns: string[] = this.ignorePatterns,
+        supportedExtensions: string[] = this.supportedExtensions
+    ): Promise<string[]> {
         const files: string[] = [];
+        // Same matcher (incl. the fork's includeDotDirs allow-list) as FileSynchronizer,
+        // so the initial index and the incremental sync see the same file set.
+        const ignoreMatcher = new IgnoreMatcher(ignorePatterns, this.includeDotDirs);
 
         const traverseDirectory = async (currentPath: string) => {
             const entries = await fs.promises.readdir(currentPath, { withFileTypes: true });
 
             for (const entry of entries) {
                 const fullPath = path.join(currentPath, entry.name);
+                const relativePath = path.relative(codebasePath, fullPath);
 
                 // Check if path matches ignore patterns
-                if (this.matchesIgnorePattern(fullPath, codebasePath)) {
+                if (ignoreMatcher.ignores(relativePath, entry.isDirectory())) {
                     continue;
                 }
 
@@ -1273,7 +1437,7 @@ export class Context {
                     await traverseDirectory(fullPath);
                 } else if (entry.isFile()) {
                     const ext = path.extname(entry.name);
-                    if (this.supportedExtensions.includes(ext)) {
+                    if (supportedExtensions.includes(ext)) {
                         files.push(fullPath);
                     }
                 }
@@ -1340,6 +1504,8 @@ export class Context {
         onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void,
         onFileComplete?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
         priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>,
+        splitter: Splitter = this.codeSplitter,
+        signal?: AbortSignal
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
         const CHUNK_LIMIT = 450000;
@@ -1384,12 +1550,20 @@ export class Context {
             // for the rest of the run — while the primary (and any healthy target)
             // continues. The primary never sets this; its abort fails the whole run.
             dropped: boolean;
+            // Run-wide slot totals (upstream f8e2672 synthesis): a run in which the
+            // PRIMARY embedded nothing yet saw REAL-class failures is an unusable
+            // provider (missing model, bad key, quota) — surface it as EmbeddingError
+            // instead of reporting an empty index as 'completed'.
+            totalSuccesses: number;
+            totalRealFailures: number;
+            lastError?: string;
         };
         const acc = new Map<string, Acc>();
         for (const t of targets) {
             acc.set(t.modelId, {
                 fileChunkTotals: new Map(), fileProgress: new Map(), fileHashByPath: new Map(),
                 firedComplete: new Set(), buffer: [], consecutiveBatchErrors: 0, dropped: false,
+                totalSuccesses: 0, totalRealFailures: 0,
             });
         }
 
@@ -1457,7 +1631,7 @@ export class Context {
         // Flush one target's buffer through processChunkBuffer with that target's
         // OWN three-way abort counter. Per-target abort ISOLATION (Fix 2):
         //   - PRIMARY (DEFAULT_PRIMARY_MODEL_ID) hits MAX → throw the typed
-        //     IndexAbortError sentinel; the outer per-file catch re-throws it and the
+        //     EmbedFailureAbortError sentinel; the outer per-file catch re-throws it and the
         //     WHOLE run aborts (no point continuing if the primary is dead).
         //   - ANY NON-primary target (0.6B secondary AND the synthetic writable-
         //     shared) hits MAX → DROP only that target (dropTarget) and return
@@ -1472,6 +1646,9 @@ export class Context {
             if (a.buffer.length === 0) return;
             const r = await this.processChunkBuffer(target, a.buffer);
             a.buffer = [];
+            a.totalSuccesses += r.successes;
+            a.totalRealFailures += r.realFailures;
+            if (r.lastError) a.lastError = r.lastError;
             this.mergeFileProgress(a.fileProgress, r.perFile);
             fireCompletedFor(target);
             if (r.realFailures > 0) {
@@ -1496,6 +1673,13 @@ export class Context {
         };
 
         for (let i = 0; i < filePaths.length; i++) {
+            // Cooperative cancellation: bail out at the next file boundary so the
+            // caller (e.g. clear_index) can rely on no further inserts/snapshot
+            // writes happening once it has signalled abort. See issue #199.
+            if (signal?.aborted) {
+                throw new IndexAbortError(`Indexing aborted after processing ${processedFiles}/${filePaths.length} files`);
+            }
+
             const filePath = filePaths[i];
             try {
                 const relativePath = path.relative(codebasePath, filePath);
@@ -1545,7 +1729,7 @@ export class Context {
                 // ── AST split ONCE (model-independent) ──
                 const content = await fs.promises.readFile(filePath, 'utf-8');
                 const language = this.getLanguageFromExtension(path.extname(filePath));
-                const chunks = await this.codeSplitter.split(content, language, filePath);
+                const chunks = await splitter.split(content, language, filePath);
 
                 // Inject fileHash into each chunk's metadata (model-blind; both
                 // targets reuse the same chunk objects — embedBatchPartial only
@@ -1598,19 +1782,23 @@ export class Context {
                 if (limitReached) break;
 
             } catch (error) {
-                if (this.isAbortError(error)) {
+                if (this.isAbortError(error) || error instanceof EmbeddingError || error instanceof IndexAbortError) {
                     // Fix 2: ONLY a PRIMARY abort reaches here (flushTarget throws the
                     // sentinel only for DEFAULT_PRIMARY_MODEL_ID; non-primary targets
                     // are dropped in place and never throw). Re-throw so the whole run
-                    // unwinds to handlers.ts → indexfailed.
+                    // unwinds to handlers.ts → indexfailed. EmbeddingError (unusable
+                    // provider) and IndexAbortError (cooperative cancel, upstream #199)
+                    // must also never be swallowed as a per-file skip.
                     throw error;
                 }
                 console.warn(`[Context] ⚠️  Skipping file ${filePath}: ${error}`);
             }
         }
 
-        // Final per-target buffer flush.
+        // Final per-target buffer flush (skipped once cancelled — upstream #199:
+        // no further inserts after the caller signalled abort).
         for (const target of targets) {
+            if (signal?.aborted) break;
             const a = acc.get(target.modelId)!;
             if (a.buffer.length > 0) {
                 const searchType = target.isHybrid === true ? 'hybrid' : 'regular';
@@ -1637,6 +1825,20 @@ export class Context {
                     a.firedComplete.add(rp);
                 }
             }
+        }
+
+        if (signal?.aborted) {
+            throw new IndexAbortError(`Indexing aborted after processing ${processedFiles}/${filePaths.length} files`);
+        }
+
+        const primaryAcc = acc.get(targets[0].modelId);
+        if (primaryAcc && primaryAcc.totalSuccesses === 0 && primaryAcc.totalRealFailures > 0) {
+            throw new EmbeddingError(
+                `Indexing stored nothing for the primary model '${targets[0].modelId}': every chunk failed to embed or upsert ` +
+                `(${primaryAcc.totalRealFailures} REAL-class failure(s), 0 succeeded). ` +
+                `Check that the embedding model is available and the API key/quota are valid.` +
+                (primaryAcc.lastError ? ` Last error: ${primaryAcc.lastError}` : ''),
+            );
         }
 
         const anyExisting = targets.some(t => (t.existingHashes?.size ?? 0) > 0);
@@ -1721,10 +1923,12 @@ export class Context {
      * REAL-class chunk-batch failures occur in a row. Tagged so the per-file
      * skip handler in processFileList re-throws it instead of swallowing it.
      */
-    private makeAbortError(maxConsecutive: number): IndexAbortError {
-        const err = new Error(
+    private makeAbortError(maxConsecutive: number): EmbedFailureAbortError {
+        // An EmbeddingError instance so callers matching upstream's error type
+        // (e.g. MCP handlers surfacing "embedding model unavailable") see it too.
+        const err = new EmbeddingError(
             `Aborting indexing: ${maxConsecutive} consecutive REAL-class chunk-batch failures.`,
-        ) as IndexAbortError;
+        ) as unknown as EmbedFailureAbortError;
         err.__isIndexAbort = true;
         return err;
     }
@@ -1734,7 +1938,7 @@ export class Context {
      * past the per-file skip handler to handlers.ts → indexfailed). Delegates to
      * the typed {@link isIndexAbort} guard (Fix 4).
      */
-    private isAbortError(error: unknown): error is IndexAbortError {
+    private isAbortError(error: unknown): error is EmbedFailureAbortError {
         return isIndexAbort(error);
     }
 
@@ -1816,7 +2020,10 @@ export class Context {
             console.error(
                 `[Context] ❌ [${target.modelId}] Whole-batch embed failed (REAL): ${embedErr instanceof Error ? embedErr.message : String(embedErr)}`,
             );
-            return { perFile, realFailures: items.length, waitFailures: 0, successes: 0 };
+            return {
+                perFile, realFailures: items.length, waitFailures: 0, successes: 0,
+                lastError: embedErr instanceof Error ? embedErr.message : String(embedErr),
+            };
         }
 
         // Partition into succeeded slots (paired with their source item) and
@@ -1879,6 +2086,7 @@ export class Context {
         }
 
         let successes = 0;
+        let lastError: string | undefined;
 
         if (docs.length > 0) {
             try {
@@ -1903,11 +2111,13 @@ export class Context {
                 // doc and return the outcome so the three-way counter decides.
                 console.error(`[Context] ❌ [${target.modelId}] Upsert failed for batch (${docs.length} docs) into ${target.collectionName}, counting as REAL insert-error:`, insertError);
                 realFailures += docs.length;
+                lastError = `upsert into ${target.collectionName} failed: ${insertError instanceof Error ? insertError.message : String(insertError)}`;
             }
         }
 
-        return { perFile, realFailures, waitFailures, successes };
+        return { perFile, realFailures, waitFailures, successes, ...(lastError && { lastError }) };
     }
+
 
     /**
      * Get programming language based on file extension
@@ -1974,11 +2184,13 @@ export class Context {
     }
 
     /**
-     * Load ignore patterns from various ignore files in the codebase
-     * This method preserves any existing custom patterns that were added before
+     * Load ignore patterns from various ignore files in the codebase.
+     * Returns the effective patterns for the current codebase/request without
+     * allowing file-based patterns from previous codebases to leak forward.
      * @param codebasePath Path to the codebase
+     * @param additionalIgnorePatterns Ignore patterns for the current request
      */
-    private async loadIgnorePatterns(codebasePath: string): Promise<void> {
+    private async loadIgnorePatterns(codebasePath: string, additionalIgnorePatterns: string[] = []): Promise<string[]> {
         try {
             let fileBasedPatterns: string[] = [];
 
@@ -1993,19 +2205,35 @@ export class Context {
             const globalIgnorePatterns = await this.loadGlobalIgnoreFile();
             fileBasedPatterns.push(...globalIgnorePatterns);
 
-            // Merge file-based patterns with existing patterns (which may include custom MCP patterns)
-            if (fileBasedPatterns.length > 0) {
-                this.addCustomIgnorePatterns(fileBasedPatterns);
-                console.log(`[Context] 🚫 Loaded total ${fileBasedPatterns.length} ignore patterns from all ignore files`);
+            const effectiveIgnorePatterns = this.dedupePatterns([
+                ...this.baseIgnorePatterns,
+                ...additionalIgnorePatterns,
+                ...fileBasedPatterns
+            ]);
+            // Preserve the previous observable getIgnorePatterns() behavior for
+            // sequential callers, while all indexing paths use the local return
+            // value to avoid shared-state leakage between background tasks.
+            this.ignorePatterns = effectiveIgnorePatterns;
+
+            if (fileBasedPatterns.length > 0 || additionalIgnorePatterns.length > 0) {
+                console.log(`[Context] 🚫 Loaded total ${fileBasedPatterns.length} ignore patterns from all ignore files and ${additionalIgnorePatterns.length} request ignore patterns`);
             } else {
-                console.log('📄 No ignore files found, keeping existing patterns');
+                console.log('📄 No ignore files found, using base ignore patterns');
             }
 
             // Load .contextinclude for dot-directory inclusion
             await this.loadIncludeDotDirs(codebasePath);
+            return effectiveIgnorePatterns;
         } catch (error) {
             console.warn(`[Context] ⚠️ Failed to load ignore patterns: ${error}`);
-            // Continue with existing patterns on error - don't reset them
+            // Continue with base/request patterns on error - don't reuse
+            // previously loaded codebase-specific patterns.
+            const fallbackPatterns = this.dedupePatterns([
+                ...this.baseIgnorePatterns,
+                ...additionalIgnorePatterns
+            ]);
+            this.ignorePatterns = fallbackPatterns;
+            return fallbackPatterns;
         }
     }
 
@@ -2111,77 +2339,8 @@ export class Context {
         }
     }
 
-    /**
-     * Check if a path matches any ignore pattern
-     * @param filePath Path to check
-     * @param basePath Base path for relative pattern matching
-     * @returns True if path should be ignored
-     */
-    private matchesIgnorePattern(filePath: string, basePath: string): boolean {
-        const relativePath = path.relative(basePath, filePath);
-
-        // Always ignore dotfiles/dotdirs to stay aligned with
-        // FileSynchronizer.shouldIgnore. If these traversals diverge, files
-        // indexed here are never hashed by the synchronizer and their stale
-        // chunks linger in Milvus forever.
-        if (relativePath.split(path.sep).some(part => part.startsWith('.'))) {
-            return true;
-        }
-
-        if (this.ignorePatterns.length === 0) {
-            return false;
-        }
-
-        const normalizedPath = relativePath.replace(/\\/g, '/'); // Normalize path separators
-
-        for (const pattern of this.ignorePatterns) {
-            if (this.isPatternMatch(normalizedPath, pattern)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * Simple glob pattern matching
-     * @param filePath File path to test
-     * @param pattern Glob pattern
-     * @returns True if pattern matches
-     */
-    private isPatternMatch(filePath: string, pattern: string): boolean {
-        // Handle directory patterns (ending with /)
-        if (pattern.endsWith('/')) {
-            const dirPattern = pattern.slice(0, -1);
-            const pathParts = filePath.split('/');
-            return pathParts.some(part => this.simpleGlobMatch(part, dirPattern));
-        }
-
-        // Handle file patterns
-        if (pattern.includes('/')) {
-            // Pattern with path separator - match exact path
-            return this.simpleGlobMatch(filePath, pattern);
-        } else {
-            // Pattern without path separator - match filename in any directory
-            const fileName = path.basename(filePath);
-            return this.simpleGlobMatch(fileName, pattern);
-        }
-    }
-
-    /**
-     * Simple glob matching supporting * wildcard
-     * @param text Text to test
-     * @param pattern Pattern with * wildcards
-     * @returns True if pattern matches
-     */
-    private simpleGlobMatch(text: string, pattern: string): boolean {
-        // Convert glob pattern to regex
-        const regexPattern = pattern
-            .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex special chars except *
-            .replace(/\*/g, '.*'); // Convert * to .*
-
-        const regex = new RegExp(`^${regexPattern}$`);
-        return regex.test(text);
+    private dedupePatterns(patterns: string[]): string[] {
+        return [...new Set(patterns)];
     }
 
     /**
@@ -2233,6 +2392,13 @@ export class Context {
         }
     }
 
+    private normalizeExtensions(extensions: string[]): string[] {
+        return extensions
+            .map(ext => ext.trim())
+            .filter(ext => ext.length > 0)
+            .map(ext => ext.startsWith('.') ? ext : `.${ext}`);
+    }
+
     /**
      * Add custom extensions (from MCP or other sources) without replacing existing ones
      * @param customExtensions Array of custom extensions to add
@@ -2240,10 +2406,7 @@ export class Context {
     addCustomExtensions(customExtensions: string[]): void {
         if (customExtensions.length === 0) return;
 
-        // Ensure extensions start with dot
-        const normalizedExtensions = customExtensions.map(ext =>
-            ext.startsWith('.') ? ext : `.${ext}`
-        );
+        const normalizedExtensions = this.normalizeExtensions(customExtensions);
 
         // Merge current extensions with new custom extensions, avoiding duplicates
         const mergedExtensions = [...this.supportedExtensions, ...normalizedExtensions];
