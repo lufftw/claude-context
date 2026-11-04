@@ -12,7 +12,14 @@ review (`0.1.15-lufftw.2`, 2026-11-04).
 2. **Client SDKs follow the server.** The Milvus SDK minor line must match the deployed Milvus
    server line (2.5.x today). A 3.x SDK requires a Milvus 3 server.
 3. **Evidence before merge:** `pnpm build`, the core (Jest) and mcp (node:test) suites,
-   `pnpm check:secrets`, and the CI matrix (Ubuntu and Windows, Node 20/22/24).
+   `pnpm check:secrets`, and both CI workflows. `ci.yml` (upstream) builds on Ubuntu and
+   Windows with Node 20/22/24. `fork-tests.yml` (fork-owned) runs the unit, integration and mcp
+   tests on Ubuntu 24.04 and Windows Server 2025.
+4. **No automated version PRs.** Dependabot *version* updates are not configured: they would
+   rewrite upstream-owned `package.json`/`pnpm-lock.yaml` and `ci.yml`. Only Dependabot
+   *security* updates are recommended, as a repository setting. The fork-owned workflow's
+   actions are SHA-pinned and updated by hand. Alternatives considered:
+   [OSS landscape](oss-landscape-2026-11.md).
 
 ## Version matrix
 
