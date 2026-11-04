@@ -105,36 +105,21 @@ class ContextMcpServer {
 
     private setupTools() {
         const index_description = `
-Index a codebase directory to enable semantic search using a configurable code splitter.
+Index a codebase directory so search_code can find code in it by meaning. Indexing runs in the background: this call returns right away, and get_indexing_status reports progress.
 
-⚠️ **IMPORTANT**:
-- You MUST provide an absolute path to the target codebase.
-
-✨ **Usage Guidance**:
-- This tool is typically used when search fails due to an unindexed codebase.
-- If indexing is attempted on an already indexed path, and a conflict is detected, you MUST prompt the user to confirm whether to proceed with a force index (i.e., re-indexing and overwriting the previous index).
+Use it when search_code reports that the codebase is not indexed, or when the user asks to index or re-index a directory.
+- \`path\` must be absolute, because the server resolves paths independently of your working directory.
+- If the path is already indexed, the tool reports it. Re-indexing with \`force: true\` deletes and rebuilds the existing index, so ask the user before forcing it.
+- Pass \`customExtensions\` / \`ignorePatterns\` only when the user asks for them; the defaults already cover common languages and build output.
 `;
 
 
         const search_description = `
-Search the indexed codebase using natural language queries within a specified absolute path.
+Search an indexed codebase with a natural-language query and return the most relevant code chunks, with file paths and line ranges.
 
-⚠️ **IMPORTANT**:
-- You MUST provide an absolute path.
-
-🎯 **When to Use**:
-This tool is versatile and can be used before completing various tasks to retrieve relevant context:
-- **Code search**: Find specific functions, classes, or implementations
-- **Context-aware assistance**: Gather relevant code context before making changes
-- **Issue identification**: Locate problematic code sections or bugs
-- **Code review**: Understand existing implementations and patterns
-- **Refactoring**: Find all related code pieces that need to be updated
-- **Feature development**: Understand existing architecture and similar implementations
-- **Duplicate detection**: Identify redundant or duplicated code patterns across the codebase
-
-✨ **Usage Guidance**:
-- If the codebase is not indexed, this tool will return a clear error message indicating that indexing is required first.
-- You can then use the index_codebase tool to index the codebase before searching again.
+Use it to find where something is implemented, gather context before changing code, locate the code behind a bug, or find related code to update together. Phrase the query as what the code does (for example "retry logic for failed uploads"), not as a single identifier — semantic search ranks by meaning.
+- \`path\` must be the same absolute path that was indexed.
+- If the codebase is not indexed, the tool says so; call index_codebase first. While indexing is still running, results may be incomplete.
 `;
 
         // Define available tools
@@ -222,7 +207,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                     },
                     {
                         name: "clear_index",
-                        description: `Clear the search index. IMPORTANT: You MUST provide an absolute path.`,
+                        description: `Delete the search index for a codebase. Use only when the user asks to remove or reset an index; afterwards the codebase must be re-indexed before search_code works again. The path must be absolute.`,
                         inputSchema: {
                             type: "object",
                             properties: {
@@ -236,7 +221,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                     },
                     {
                         name: "get_indexing_status",
-                        description: `Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases.`,
+                        description: `Report the indexing status of a codebase: progress percentage while background indexing runs, completion details when done, or the failure reason. Use it after index_codebase, or before searching a codebase whose index state is unknown. The path must be absolute.`,
                         inputSchema: {
                             type: "object",
                             properties: {
