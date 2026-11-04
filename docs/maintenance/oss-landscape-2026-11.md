@@ -21,11 +21,11 @@ upstream-owned code or configuration require a stated reason.
 
 | Item | Problem | Evidence | Verification |
 |---|---|---|---|
-| `.github/workflows/fork-tests.yml` (new file) | The upstream `ci.yml` only builds; ~190 fork tests never ran in CI | `ci.yml` has no test step and `pnpm lint` is commented out. The workflow also never triggered on `claude/**` branches | Locally: core unit 30 suites / 164 tests; integration 8 suites / 17 passed, 2 skipped; mcp 6/6. CI: Ubuntu 24.04 and Windows Server 2025, Node 22 |
+| `.github/workflows/fork-tests.yml` (new file) | The upstream `ci.yml` only builds; ~190 fork tests never ran in CI | `ci.yml` has no test step and `pnpm lint` is commented out. The workflow also never triggered on `claude/**` branches | Locally: core unit 30 suites / 164 tests; integration 9 suites (8 passed, 1 skipped) / 17 tests passed, 2 skipped; mcp 6/6. CI: Ubuntu 24.04 and Windows Server 2025, Node 22 |
 
 The workflow runs the secret scanner, the core unit tests, the hermetic core integration tests
 (`*.int.test.ts`, in-memory fakes, no services) and the mcp `node:test` suite. Its permissions
-are read-only and its actions are pinned to commit SHAs. It calls Jest directly under bash,
+are read-only and its actions are pinned to commit SHAs. On a pull request from a `claude/**` branch it runs twice, once for the push and once for the PR. This is intentional: the push run gives early feedback before a PR exists. It calls Jest directly under bash,
 because the single-quoted patterns in the npm scripts are passed literally by `cmd.exe` on
 Windows.
 
@@ -74,9 +74,10 @@ repository secret ([upstream sync](upstream-sync.md#release-caution)).
 
 - [x] `pnpm install --frozen-lockfile && pnpm build` succeeds.
 - [x] Core unit tests pass locally: 30 suites, 164 tests.
-- [x] Core integration tests pass locally: 8 suites; 17 passed, 2 skipped.
+- [x] Core integration tests pass locally: 9 suites (8 passed, 1 skipped); 17 tests passed, 2 skipped.
 - [x] mcp `node:test` passes 6/6.
 - [x] The PR changes only `.github/workflows/fork-tests.yml` and `docs/**`. No upstream-owned code or configuration changes.
 - [x] `node scripts/check-secrets.mjs` is clean; every relative documentation link resolves.
 - [x] `permissions: contents: read`; all 3 `uses:` entries are SHA-pinned.
-- [ ] `Fork tests` is green on `ubuntu-24.04` and `windows-2025`, and the existing `ci.yml` matrix is still green on the PR.
+- [x] `Fork tests` is green on `ubuntu-24.04` and `windows-2025`, and the existing `ci.yml` matrix is still green on the PR.
+- [x] Independent code review completed; its claude-context NITs (suite count, duplicate runs) are addressed.
