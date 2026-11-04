@@ -42,6 +42,7 @@ design record.
 | Milvus memory | Collections loaded on demand | `MILVUS_AUTOLOAD_DENY` refuses implicit loads of released collections | [configuration reference](../reference/fork-configuration.md) |
 | Sync performance | Re-hashes every file | Skips unchanged files by `stat`; compiles ignore globs once | commit `7b24ca1` |
 | Supply-chain hygiene | — | Secret scanner in CI, pre-commit hook and history audit; hooks kept LF for Windows | [credential-handling](../security/credential-handling.md) |
+| Test gate in CI | Build only | `fork-tests.yml` runs core unit, hermetic integration and mcp tests on Ubuntu 24.04 and Windows Server 2025 | [OSS landscape](../maintenance/oss-landscape-2026-11.md) |
 | AMQP connection health | — | 60 s heartbeat negotiated through the connection URL | [heartbeat fix](../lufftw/bugfix-2026-11-04-amqp-heartbeat.md) |
 | Dependency lines | Latest SDKs | MCP SDK on the maintained v1 line; Milvus SDK matched to the 2.5 server; versions and deferrals recorded | [dependency policy](../maintenance/dependency-policy.md) |
 

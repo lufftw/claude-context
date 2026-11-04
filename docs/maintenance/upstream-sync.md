@@ -119,6 +119,17 @@ already listed under *Known historical exposure* in
 Before merging to `main`, smoke-test the MCP server against a real Milvus instance with credentials
 from the environment (`scripts/smoke-env.ps1`, `scripts/run-smoke.ps1`).
 
+### Fork-owned files to keep
+
+When resolving conflicts, keep these fork-owned files. Upstream does not have them, so they never
+conflict:
+
+- `.github/workflows/fork-tests.yml`: the fork's test gate. The upstream `ci.yml` only builds.
+- `.githooks/`, `.gitattributes`, `scripts/check-secrets.mjs`
+- `docs/architecture/`, `docs/reference/`, `docs/security/`, `docs/maintenance/`, `docs/lufftw/`
+
+After a sync, `Fork tests` must be green on Ubuntu and Windows before the merge PR lands.
+
 ### 6. Record and merge
 
 1. Add `docs/lufftw/upstream-merge-<date>.md` with: upstream range, adopted changes, fork behaviour
