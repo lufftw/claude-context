@@ -641,6 +641,25 @@ export class SnapshotManager {
     }
 
     /**
+     * Forget the completeness ledger (and coverage ratio) of ONE model, leaving every other model
+     * and the codebase entry itself untouched. Used by a model-scoped clear_index: after that
+     * model's collection is emptied, its ledger must not claim files are still complete.
+     */
+    public clearFileLedgerForModel(codebasePath: string, modelId: string): void {
+        this.assertSafeModelId(modelId);
+        const entry = this.codebaseInfoMap.get(codebasePath) as any;
+        if (!entry) {
+            return;
+        }
+        if (modelId === DEFAULT_PRIMARY_MODEL_ID) {
+            entry.files = {};
+        } else {
+            if (entry.filesByModel) delete entry.filesByModel[modelId];
+            if (entry.coverageByModel) delete entry.coverageByModel[modelId];
+        }
+    }
+
+    /**
      * Build the prior-run completeness ledger for a codebase (Commit 4/4 — the
      * resume read). Now delegates to the primary (8B) per-model accessor so all
      * existing single-model callers (handlers.ts) are unchanged. Returns a NEW Map
