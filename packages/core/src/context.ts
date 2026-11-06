@@ -2125,6 +2125,21 @@ export class Context {
         let successes = 0;
         let lastError: string | undefined;
 
+        // A splitter can emit the same chunk twice (same path, lines and content => same
+        // deterministic id), and Milvus rejects one upsert request that carries a primary key
+        // twice. Identical ids are identical rows, so send each id once. docItems is NOT
+        // reduced: every produced chunk is still tallied as inserted below, which keeps the
+        // per-file completeness comparison (produced vs inserted) exact.
+        const seenIds = new Set<string>();
+        const upsertDocs = docs.filter(d => {
+            if (seenIds.has(d.id)) return false;
+            seenIds.add(d.id);
+            return true;
+        });
+        if (upsertDocs.length < docs.length) {
+            console.warn(`[Context] [${target.modelId}] Collapsed ${docs.length - upsertDocs.length} duplicate chunk id(s) in a batch of ${docs.length} before upsert`);
+        }
+
         if (docs.length > 0) {
             try {
                 // Idempotent native upsert into THIS target's collection only
@@ -2134,9 +2149,9 @@ export class Context {
                 // failures. (P1: no inline writable-shared dual-write here —
                 // writable-shared is its own IndexTarget when configured.)
                 if (isHybrid === true) {
-                    await this.vectorDatabase.upsertHybrid(target.collectionName, docs);
+                    await this.vectorDatabase.upsertHybrid(target.collectionName, upsertDocs);
                 } else {
-                    await this.vectorDatabase.upsert(target.collectionName, docs);
+                    await this.vectorDatabase.upsert(target.collectionName, upsertDocs);
                 }
                 // Confirmed upserted — tally per file.
                 for (const di of docItems) {
