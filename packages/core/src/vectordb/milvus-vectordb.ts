@@ -963,6 +963,17 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 );
                 return true;
             }
+            // A role without CreateCollection privilege (for example a restricted dev-tools user)
+            // cannot run this probe at all. The probe is advisory: indexing into collections that
+            // already exist needs no create privilege, and a real create (prepareCollection) still
+            // fails loudly with the same permission error, so the guardrail is not bypassed.
+            if (/PERMISSION_DENIED|permission deny|PrivilegeCreateCollection/i.test(errorMessage)) {
+                console.warn(
+                    '[MilvusDB] checkCollectionLimit: this Milvus user may not create collections; ' +
+                    'proceeding without limit pre-check (existing collections are unaffected).'
+                );
+                return true;
+            }
             // Re-throw other errors as-is
             throw error;
         } finally {

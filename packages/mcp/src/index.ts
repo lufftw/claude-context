@@ -156,6 +156,11 @@ This tool is versatile and can be used before completing various tasks to retrie
                                     description: "Force re-indexing even if already indexed",
                                     default: false
                                 },
+                                embeddingModel: {
+                                    type: "string",
+                                    description: "Optional: bring ONLY this embedding model's collection up to date for an already indexed codebase ('qwen3-embedding-8b' = primary, 4096-dim; 'qwen3-embedding-0.6b' = secondary, 1024-dim). Omit to index every configured model (the default). Cannot be combined with force.",
+                                    enum: ["qwen3-embedding-8b", "qwen3-embedding-0.6b"]
+                                },
                                 splitter: {
                                     type: "string",
                                     description: "Code splitter to use: 'ast' for syntax-aware splitting with automatic fallback, 'langchain' for character-based splitting",
@@ -229,6 +234,11 @@ This tool is versatile and can be used before completing various tasks to retrie
                                 path: {
                                     type: "string",
                                     description: `ABSOLUTE path to the codebase directory to clear.`
+                                },
+                                embeddingModel: {
+                                    type: "string",
+                                    description: "Optional: clear ONLY this embedding model's collection ('qwen3-embedding-8b' or 'qwen3-embedding-0.6b'); other models and change tracking are kept. Omit to clear every configured model (the default).",
+                                    enum: ["qwen3-embedding-8b", "qwen3-embedding-0.6b"]
                                 }
                             },
                             required: ["path"]
@@ -243,6 +253,11 @@ This tool is versatile and can be used before completing various tasks to retrie
                                 path: {
                                     type: "string",
                                     description: `ABSOLUTE path to the codebase directory to check status for.`
+                                },
+                                embeddingModel: {
+                                    type: "string",
+                                    description: "Optional: report readiness for ONLY this embedding model ('qwen3-embedding-8b' or 'qwen3-embedding-0.6b'). Omit to report every configured model (the default).",
+                                    enum: ["qwen3-embedding-8b", "qwen3-embedding-0.6b"]
                                 }
                             },
                             required: ["path"]

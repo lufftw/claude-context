@@ -20,6 +20,9 @@ export class ToolHandlers {
      * just-cleared collection (issue #199).
      */
     private indexingTasks: Map<string, { controller: AbortController; promise: Promise<void> }> = new Map();
+    // Model-scoped index runs (index_codebase with embeddingModel) report progress here instead of
+    // flipping the codebase to 'indexing', because the other models stay readable meanwhile.
+    private scopedModelIndexing: Map<string, { modelId: string; percentage: number }> = new Map();
 
     constructor(context: Context, snapshotManager: SnapshotManager) {
         this.context = context;
@@ -334,7 +337,7 @@ export class ToolHandlers {
     }
 
     public async handleIndexCodebase(args: any) {
-        const { path: codebasePath, force, splitter, customExtensions, ignorePatterns } = args;
+        const { path: codebasePath, force, splitter, customExtensions, ignorePatterns, embeddingModel } = args;
         const forceReindex = force || false;
         const requestedSplitter = splitter || 'ast'; // Default to AST
         const customFileExtensions = customExtensions || [];
@@ -384,6 +387,15 @@ export class ToolHandlers {
                     }],
                     isError: true
                 };
+            }
+
+            // Model-scoped run: bring ONE model's collection up to date (no clearing, no change to the
+            // shared change-tracking snapshot). Omitted embeddingModel keeps the all-models behaviour.
+            if (typeof embeddingModel === 'string' && embeddingModel.trim().length > 0) {
+                return await this.handleScopedModelIndex(
+                    absolutePath, embeddingModel.trim(), forceReindex, splitterType,
+                    customIgnorePatterns, customFileExtensions, indexOptions
+                );
             }
 
             // Check if already indexing
@@ -693,6 +705,104 @@ export class ToolHandlers {
         }
     }
 
+    /** Validate an optional embeddingModel argument against the models this server has active. */
+    private resolveScopedModel(embeddingModel: unknown): { modelId?: string; error?: { content: { type: "text"; text: string }[]; isError: true } } {
+        if (typeof embeddingModel !== 'string' || embeddingModel.trim().length === 0) {
+            return {};
+        }
+        try {
+            return { modelId: this.context.resolveScopedModelIds(embeddingModel.trim())[0] };
+        } catch (e: any) {
+            return { error: { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true } };
+        }
+    }
+
+    private async handleScopedModelIndex(
+        absolutePath: string,
+        embeddingModel: string,
+        forceReindex: boolean,
+        splitterType: RequestSplitterType,
+        customIgnorePatterns: string[],
+        customFileExtensions: string[],
+        _indexOptions: CodebaseIndexOptions
+    ) {
+        const fail = (text: string) => ({ content: [{ type: "text" as const, text }], isError: true as const });
+        const scoped = this.resolveScopedModel(embeddingModel);
+        if (scoped.error) return scoped.error;
+        const modelId = scoped.modelId!;
+
+        if (forceReindex) {
+            return fail(`Error: force=true cannot be combined with embeddingModel. A forced rebuild drops every model's collection; to redo one model, run clear_index with embeddingModel='${modelId}' and then index_codebase with embeddingModel='${modelId}'.`);
+        }
+        if (!this.snapshotManager.getIndexedCodebases().includes(absolutePath)) {
+            return fail(`Error: '${absolutePath}' is not indexed yet. Run index_codebase without embeddingModel first (it indexes every configured model); embeddingModel only refreshes one model of an already indexed codebase.`);
+        }
+        if (this.indexingTasks.has(absolutePath)) {
+            return fail(`Codebase '${absolutePath}' is already being indexed in the background. Please wait for completion.`);
+        }
+
+        const controller = new AbortController();
+        this.scopedModelIndexing.set(absolutePath, { modelId, percentage: 0 });
+        const promise = this.startBackgroundModelIndexing(
+            absolutePath, modelId, splitterType, customIgnorePatterns, customFileExtensions, controller.signal
+        ).finally(() => {
+            this.scopedModelIndexing.delete(absolutePath);
+            const current = this.indexingTasks.get(absolutePath);
+            if (current && current.controller === controller) {
+                this.indexingTasks.delete(absolutePath);
+            }
+        });
+        this.indexingTasks.set(absolutePath, { controller, promise });
+
+        return {
+            content: [{
+                type: "text" as const,
+                text: `Started bringing model '${modelId}' up to date for '${absolutePath}' in the background. Other models stay searchable and the change-tracking snapshot is untouched. Use get_indexing_status with embeddingModel='${modelId}' to follow it.`
+            }]
+        };
+    }
+
+    private async startBackgroundModelIndexing(
+        absolutePath: string,
+        modelId: string,
+        splitterType: RequestSplitterType,
+        customIgnorePatterns: string[],
+        customFileExtensions: string[],
+        signal: AbortSignal
+    ): Promise<void> {
+        try {
+            console.log(`[SCOPED-INDEX] Bringing '${modelId}' up to date for: ${absolutePath}`);
+            const requestSplitter = createRequestSplitter(splitterType);
+            const priorLedgersByModel = new Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>();
+            priorLedgersByModel.set(modelId, this.snapshotManager.getFileLedgerForModel(absolutePath, modelId));
+
+            const stats = await this.context.indexCodebase(
+                absolutePath,
+                (progress) => {
+                    this.scopedModelIndexing.set(absolutePath, { modelId, percentage: progress.percentage });
+                },
+                (mid, relativePath, info) => {
+                    this.snapshotManager.setFileCompleteForModel(absolutePath, mid, relativePath, info);
+                },
+                false,
+                priorLedgersByModel,
+                customIgnorePatterns,
+                customFileExtensions,
+                requestSplitter,
+                signal,
+                modelId
+            );
+            this.snapshotManager.saveCodebaseSnapshot();
+            console.log(`[SCOPED-INDEX] ✅ '${modelId}' up to date for ${absolutePath}. Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
+        } catch (error: any) {
+            if (error instanceof IndexAbortError) {
+                console.log(`[SCOPED-INDEX] Cancelled for ${absolutePath}: ${error.message}`);
+                return;
+            }
+            console.error(`[SCOPED-INDEX] ❌ Failed for ${absolutePath} (model ${modelId}): ${error?.message || error}`);
+        }
+    }
+
     public async handleSearchCode(args: any) {
         const { path: codebasePath, query, limit = 10, extensionFilter, embeddingModel } = args;
         const resultLimit = limit || 10;
@@ -948,7 +1058,10 @@ export class ToolHandlers {
     }
 
     public async handleClearIndex(args: any) {
-        const { path: codebasePath } = args;
+        const { path: codebasePath, embeddingModel } = args;
+        const scopedClear = this.resolveScopedModel(embeddingModel);
+        if (scopedClear.error) return scopedClear.error;
+        const scopedClearModelId = scopedClear.modelId;
 
         if (this.snapshotManager.getIndexedCodebases().length === 0 && this.snapshotManager.getIndexingCodebases().length === 0) {
             return {
@@ -1021,8 +1134,8 @@ export class ToolHandlers {
             }
 
             try {
-                await this.context.clearIndex(absolutePath);
-                console.log(`[CLEAR] Successfully cleared index for: ${absolutePath}`);
+                await this.context.clearIndex(absolutePath, undefined, scopedClearModelId);
+                console.log(`[CLEAR] Successfully cleared index for: ${absolutePath}${scopedClearModelId ? ` (model ${scopedClearModelId} only)` : ''}`);
             } catch (error: any) {
                 const errorMsg = `Failed to clear ${absolutePath}: ${error.message}`;
                 console.error(`[CLEAR] ${errorMsg}`);
@@ -1032,6 +1145,18 @@ export class ToolHandlers {
                         text: errorMsg
                     }],
                     isError: true
+                };
+            }
+
+            if (scopedClearModelId) {
+                // Scoped clear: keep the codebase entry and the other models' ledgers; forget only this model's.
+                this.snapshotManager.clearFileLedgerForModel(absolutePath, scopedClearModelId);
+                this.snapshotManager.saveCodebaseSnapshot();
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Cleared the '${scopedClearModelId}' collection for '${absolutePath}'. Other models and change tracking were left untouched. Repopulate it with index_codebase embeddingModel='${scopedClearModelId}'.`
+                    }]
                 };
             }
 
@@ -1086,7 +1211,10 @@ export class ToolHandlers {
     }
 
     public async handleGetIndexingStatus(args: any) {
-        const { path: codebasePath } = args;
+        const { path: codebasePath, embeddingModel } = args;
+        const scopedStatus = this.resolveScopedModel(embeddingModel);
+        if (scopedStatus.error) return scopedStatus.error;
+        const scopedStatusModelId = scopedStatus.modelId;
 
         try {
             // Force absolute path resolution
@@ -1151,12 +1279,18 @@ export class ToolHandlers {
                     // Enumerate active models via the ONE enumerator (SEAM-2) and report each
                     // non-primary model's readability through the shared isModelReadable
                     // predicate, so status and search stay in lock-step (P3).
-                    for (const modelId of this.context.getActiveModelIds()) {
-                        if (modelId === DEFAULT_PRIMARY_MODEL_ID) continue;
-                        const secondaryReadable = await this.context.isModelReadable(statusCodebasePath, modelId);
-                        statusMessage += secondaryReadable
-                            ? `\n🟢 Secondary model '${modelId}' is readable.`
-                            : `\n🟡 Secondary model '${modelId}' is configured but NOT yet readable (collection missing or coverage below threshold — searches with it return a degraded notice).`;
+                    const modelIdsToReport = scopedStatusModelId ? [scopedStatusModelId] : this.context.getActiveModelIds();
+                    for (const modelId of modelIdsToReport) {
+                        if (modelId === DEFAULT_PRIMARY_MODEL_ID && !scopedStatusModelId) continue;
+                        const label = modelId === DEFAULT_PRIMARY_MODEL_ID ? 'Primary' : 'Secondary';
+                        const modelReadable = await this.context.isModelReadable(statusCodebasePath, modelId);
+                        statusMessage += modelReadable
+                            ? `\n🟢 ${label} model '${modelId}' is readable.`
+                            : `\n🟡 ${label} model '${modelId}' is configured but NOT yet readable (collection missing or coverage below threshold — searches with it return a degraded notice).`;
+                    }
+                    const scopedRun = this.scopedModelIndexing.get(statusCodebasePath) ?? this.scopedModelIndexing.get(absolutePath);
+                    if (scopedRun) {
+                        statusMessage += `\n🔄 Model '${scopedRun.modelId}' is being brought up to date: ${scopedRun.percentage.toFixed(1)}%`;
                     }
                     break;
                 }

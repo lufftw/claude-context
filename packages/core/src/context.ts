@@ -688,6 +688,28 @@ export class Context {
     }
 
     /**
+     * Resolve the model ids an operation applies to.
+     *  - `onlyModelId` omitted/empty ⇒ every ACTIVE model (today's behaviour, unchanged).
+     *  - `onlyModelId` set ⇒ exactly that model; it must be ACTIVE (configured), otherwise
+     *    this throws so a typo or an unconfigured secondary can never silently fall back to
+     *    "all models" (which would touch collections the caller did not name).
+     */
+    public resolveScopedModelIds(onlyModelId?: string): string[] {
+        const active = this.getActiveModelIds();
+        const wanted = (onlyModelId ?? '').trim();
+        if (!wanted) {
+            return active;
+        }
+        if (!active.includes(wanted)) {
+            throw new Error(
+                `Embedding model '${wanted}' is not active for this server (active: ${active.join(', ')}). ` +
+                `Check the id and, for the secondary model, MILVUS_COLLECTION_PRIVATE_0P6B.`
+            );
+        }
+        return [wanted];
+    }
+
+    /**
      * Build the per-run IndexTarget array (the SHARED owner used by
      * prepareCollection, processFileList, the per-target delete, and the syncer —
      * Residual-Risk-1's "one IndexTarget-array builder").
@@ -708,6 +730,7 @@ export class Context {
     private buildIndexTargets(
         codebasePath: string,
         priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>,
+        onlyModelId?: string,
     ): IndexTarget[] {
         const isHybrid = this.getIsHybrid();
 
@@ -715,7 +738,7 @@ export class Context {
         // definition — getActiveModelIds() — never re-derived inline here. The
         // primary embedding instance is this.embedding; each non-primary id maps to
         // this.secondaryEmbedding (only the 0.6B secondary is non-primary today).
-        const activeModelIds = this.getActiveModelIds();
+        const activeModelIds = this.resolveScopedModelIds(onlyModelId);
         const primaryCollectionName = this.getCollectionNameForModel(codebasePath, DEFAULT_PRIMARY_MODEL_ID);
         const targets: IndexTarget[] = [];
 
@@ -786,13 +809,14 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onlyModelId?: string
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         // Scope project-`.env` reads (MILVUS_COLLECTION_PRIVATE, _SHARED, _STRATEGY, etc.)
         // to this call only via AsyncLocalStorage. Critical for parallel safety:
         // sibling indexCodebase() calls must not see each other's project context.
         // Bug history: see docs/lufftw/bugfix-2026-05-04-envmanager-concurrency.md
-        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, onFileComplete, forceReindex, priorLedgersByModel, additionalIgnorePatterns, additionalSupportedExtensions, requestSplitter, signal));
+        return envManager.runWithProject(codebasePath, () => this._indexCodebaseImpl(codebasePath, progressCallback, onFileComplete, forceReindex, priorLedgersByModel, additionalIgnorePatterns, additionalSupportedExtensions, requestSplitter, signal, onlyModelId));
     }
 
     private async _indexCodebaseImpl(
@@ -804,7 +828,8 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onlyModelId?: string
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
@@ -818,7 +843,7 @@ export class Context {
         // 2. Check and prepare vector collection
         progressCallback?.({ phase: 'Preparing collection...', current: 0, total: 100, percentage: 0 });
         console.log(`Debug2: Preparing vector collection for codebase${forceReindex ? ' (FORCE REINDEX)' : ''}`);
-        await this.prepareCollection(codebasePath, forceReindex);
+        await this.prepareCollection(codebasePath, forceReindex, onlyModelId);
 
         // 3. Recursively traverse codebase to get all supported files
         progressCallback?.({ phase: 'Scanning files...', current: 5, total: 100, percentage: 5 });
@@ -855,7 +880,8 @@ export class Context {
             onFileComplete,
             priorLedgersByModel,
             splitter,
-            signal
+            signal,
+            onlyModelId
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
@@ -1222,14 +1248,16 @@ export class Context {
      */
     async clearIndex(
         codebasePath: string,
-        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        onlyModelId?: string
     ): Promise<void> {
-        return envManager.runWithProject(codebasePath, () => this._clearIndexImpl(codebasePath, progressCallback));
+        return envManager.runWithProject(codebasePath, () => this._clearIndexImpl(codebasePath, progressCallback, onlyModelId));
     }
 
     private async _clearIndexImpl(
         codebasePath: string,
-        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        onlyModelId?: string
     ): Promise<void> {
         console.log(`[Context] 🧹 Cleaning index data for ${codebasePath}...`);
 
@@ -1238,7 +1266,12 @@ export class Context {
         // Drop EVERY active model collection (primary + secondary + writable-shared
         // sibling) via the one shared enumerator (P3). A single-model config yields
         // exactly the primary collection — byte-identical to the prior behavior.
-        const collectionNames = this.getActiveModelCollectionNames(codebasePath);
+        // Scoped clear (onlyModelId): drop ONLY that model's own collection. The writable-shared
+        // sibling is shared across projects and the change-tracking snapshot is model-blind, so a
+        // scoped clear leaves both alone.
+        const collectionNames = onlyModelId && onlyModelId.trim()
+            ? this.resolveScopedModelIds(onlyModelId).map(m => this.getCollectionNameForModel(codebasePath, m))
+            : this.getActiveModelCollectionNames(codebasePath);
 
         progressCallback?.({ phase: 'Removing index data...', current: 50, total: 100, percentage: 50 });
 
@@ -1259,8 +1292,11 @@ export class Context {
             }
         }
 
-        // Delete snapshot file
-        await FileSynchronizer.deleteSnapshot(codebasePath);
+        // Delete snapshot file (full clear only — a scoped clear must keep change tracking for the
+        // models that were not cleared).
+        if (!(onlyModelId && onlyModelId.trim())) {
+            await FileSynchronizer.deleteSnapshot(codebasePath);
+        }
 
         progressCallback?.({ phase: 'Index cleared', current: 100, total: 100, percentage: 100 });
         if (dropFailures.length > 0) {
@@ -1350,10 +1386,10 @@ export class Context {
      * Single-model (no secondary, no writable-shared) ⇒ targets.length === 1 ⇒
      * the create path is byte-identical.
      */
-    private async prepareCollection(codebasePath: string, forceReindex: boolean = false): Promise<void> {
+    private async prepareCollection(codebasePath: string, forceReindex: boolean = false, onlyModelId?: string): Promise<void> {
         const isHybrid = this.getIsHybrid();
         const collectionType = isHybrid === true ? 'hybrid vector' : 'vector';
-        const targets = this.buildIndexTargets(codebasePath);
+        const targets = this.buildIndexTargets(codebasePath, undefined, onlyModelId);
         const dirName = path.basename(codebasePath);
 
         for (const target of targets) {
@@ -1505,7 +1541,8 @@ export class Context {
         onFileComplete?: (modelId: string, relativePath: string, info: { complete: boolean; fileHash: string; chunkCount: number }) => void,
         priorLedgersByModel?: Map<string, Map<string, { complete: boolean; fileHash: string; chunkCount?: number }>>,
         splitter: Splitter = this.codeSplitter,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onlyModelId?: string
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
         const CHUNK_LIMIT = 450000;
@@ -1525,7 +1562,7 @@ export class Context {
         // ── Build the per-run targets and hydrate each with its OWN existingHashes
         //    (loadExistingFileHashes is already collection-parameterized) and its
         //    OWN priorLedger (M8 — per-(codebase × model) resume state). ──
-        const targets = this.buildIndexTargets(codebasePath, priorLedgersByModel);
+        const targets = this.buildIndexTargets(codebasePath, priorLedgersByModel, onlyModelId);
         for (const target of targets) {
             target.existingHashes = await this.loadExistingFileHashes(target.collectionName);
             // The writable-shared target shares the primary 8B ledger key by design
