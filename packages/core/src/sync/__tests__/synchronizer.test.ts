@@ -141,3 +141,76 @@ describe('FileSynchronizer change detection', () => {
         expect(reads.count()).toBe(1);
     });
 });
+
+describe('FileSynchronizer saved baseline follows completed work', () => {
+    const openFresh = async (root: string) => {
+        const sync = new FileSynchronizer(root, []);
+        await sync.initialize();
+        return sync;
+    };
+
+    it('a deferred check leaves the saved baseline alone until commitChanges', async () => {
+        const root = await makeCodebase({ 'a.ts': 'one', 'b.ts': 'two' });
+        const sync = await openFresh(root);
+        await fs.writeFile(path.join(root, 'a.ts'), 'changed', 'utf-8');
+
+        const found = await sync.checkForChanges({ deferCommit: true });
+        expect(found.modified).toEqual(['a.ts']);
+
+        // The process died here: its work never finished, so the next process must see the change.
+        expect((await (await openFresh(root)).checkForChanges({ deferCommit: true })).modified).toEqual(['a.ts']);
+
+        await sync.commitChanges();
+        expect((await (await openFresh(root)).checkForChanges()).modified).toEqual([]);
+    });
+
+    it('a failed run is retried by the same instance', async () => {
+        const root = await makeCodebase({ 'a.ts': 'one' });
+        const sync = await openFresh(root);
+        await fs.writeFile(path.join(root, 'a.ts'), 'changed', 'utf-8');
+        await sync.checkForChanges({ deferCommit: true });
+        expect((await sync.checkForChanges({ deferCommit: true })).modified).toEqual(['a.ts']);
+    });
+
+    it('a full index replaces a stale baseline, so the next check reports nothing', async () => {
+        const root = await makeCodebase({ 'a.ts': 'one', 'b.ts': 'two' });
+        await openFresh(root);                                    // baseline from before the pull
+        await fs.writeFile(path.join(root, 'a.ts'), 'pulled', 'utf-8');
+
+        const sync = await openFresh(root);
+        await sync.captureBaseline();                             // what the index is about to read
+        await sync.commitChanges();                               // the index finished
+
+        expect((await (await openFresh(root)).checkForChanges()).modified).toEqual([]);
+    });
+
+    it('a file edited after the capture is still found by the next check', async () => {
+        const root = await makeCodebase({ 'a.ts': 'one' });
+        const sync = await openFresh(root);
+        await sync.captureBaseline();
+        await fs.writeFile(path.join(root, 'a.ts'), 'edited mid index', 'utf-8');
+        await sync.commitChanges();
+        expect((await (await openFresh(root)).checkForChanges()).modified).toEqual(['a.ts']);
+    });
+
+    it('commitChanges with nothing pending changes nothing', async () => {
+        const root = await makeCodebase({ 'a.ts': 'one' });
+        const sync = await openFresh(root);
+        await fs.writeFile(path.join(root, 'a.ts'), 'changed', 'utf-8');
+        await sync.commitChanges();
+        expect((await (await openFresh(root)).checkForChanges()).modified).toEqual(['a.ts']);
+    });
+
+    it('initialize picks up a baseline another process moved', async () => {
+        const root = await makeCodebase({ 'a.ts': 'one' });
+        const cached = await openFresh(root);                     // a long-lived server's instance
+        await fs.writeFile(path.join(root, 'a.ts'), 'pulled', 'utf-8');
+
+        const other = await openFresh(root);                      // another process rebuilt the repo
+        await other.captureBaseline();
+        await other.commitChanges();
+
+        await cached.initialize();
+        expect((await cached.checkForChanges()).modified).toEqual([]);
+    });
+});

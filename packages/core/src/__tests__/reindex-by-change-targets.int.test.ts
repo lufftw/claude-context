@@ -34,6 +34,7 @@ describe('_reindexByChangeImpl — per-target delete + re-embed (P2)', () => {
 
     it('a modified file is deleted from + re-upserted into BOTH collections; no stale-hash _0p6b rows', async () => {
         const deletedFrom: string[] = [];          // collections deleteFileChunks ran on
+        const order: string[] = [];
         const upsertedRows: Array<{ collection: string; fileHash: string; relativePath: string }> = [];
 
         const stubDb: any = {
@@ -66,13 +67,17 @@ describe('_reindexByChangeImpl — per-target delete + re-embed (P2)', () => {
         // Inject a fake FileSynchronizer keyed by the PRIMARY collection so
         // _reindexByChangeImpl uses it directly (no real FS Merkle scan).
         const fakeSync = {
-            initialize: async () => { },
-            checkForChanges: async () => ({ added: [], removed: [], modified: ['a.ts'] }),
+            initialize: async () => { order.push('initialize'); },
+            checkForChanges: async (o: any) => { expect(o?.deferCommit).toBe(true); return { added: [], removed: [], modified: ['a.ts'] }; },
+            commitChanges: async () => { order.push('commit'); },
         };
         (ctx as any).synchronizers.set(PRIMARY, fakeSync);
 
         const result = await withFakeRead(() => (ctx as any).reindexByChange('/repo'));
         expect(result).toEqual({ added: 0, removed: 0, modified: 1 });
+
+        // The cached instance reloads first, and the baseline moves only after the rows are back.
+        expect(order).toEqual(['initialize', 'commit']);
 
         // (a) deleted from BOTH collections.
         expect(deletedFrom.filter(c => c === PRIMARY)).toHaveLength(1);
@@ -110,6 +115,7 @@ describe('_reindexByChangeImpl — per-target delete + re-embed (P2)', () => {
         const fakeSync = {
             initialize: async () => { },
             checkForChanges: async () => ({ added: [], removed: ['gone.ts'], modified: [] }),
+            commitChanges: async () => { },
         };
         (ctx as any).synchronizers.set(PRIMARY, fakeSync);
 

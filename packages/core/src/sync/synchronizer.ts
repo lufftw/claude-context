@@ -22,6 +22,8 @@ export class FileSynchronizer {
     private fileHashes: Map<string, string>;
     private fileStats: Map<string, FileStat>;
     private merkleDAG: MerkleDAG;
+    // A scan whose work has not finished yet. It becomes the saved baseline only through commitChanges().
+    private pendingBaseline: { fileHashes: Map<string, string>; fileStats: Map<string, FileStat>; merkleDAG: MerkleDAG } | null = null;
     private rootDir: string;
     private snapshotPath: string;
     private includeDotDirs: string[];
@@ -167,7 +169,34 @@ export class FileSynchronizer {
         console.log(`[Synchronizer] File synchronizer initialized. Loaded ${this.fileHashes.size} file hashes.`);
     }
 
-    public async checkForChanges(): Promise<{ added: string[], removed: string[], modified: string[] }> {
+    /**
+     * Hold what is on disk now as the baseline a full index is about to read. Taken before the index walks the tree, so
+     * a file edited during the index differs from it and the next check finds that file. Nothing is saved until
+     * commitChanges(): a failed index must leave the previous baseline in place.
+     */
+    public async captureBaseline(): Promise<void> {
+        const fileStats = new Map<string, FileStat>();
+        const fileHashes = await this.generateFileHashes(this.rootDir, fileStats);
+        this.pendingBaseline = { fileHashes, fileStats, merkleDAG: this.buildMerkleDAG(fileHashes) };
+    }
+
+    /** Save the pending baseline. Call only after the rows for it are in the vector store. */
+    public async commitChanges(): Promise<void> {
+        if (!this.pendingBaseline) {
+            return;
+        }
+        this.fileHashes = this.pendingBaseline.fileHashes;
+        this.fileStats = this.pendingBaseline.fileStats;
+        this.merkleDAG = this.pendingBaseline.merkleDAG;
+        this.pendingBaseline = null;
+        await this.saveSnapshot();
+    }
+
+    /**
+     * Compare disk with the baseline. With deferCommit the baseline does not move: the caller deletes and re-embeds the
+     * changed files, then calls commitChanges(). If that work stops part way, the changes are found again next time.
+     */
+    public async checkForChanges(options: { deferCommit?: boolean } = {}): Promise<{ added: string[], removed: string[], modified: string[] }> {
         console.log('[Synchronizer] Checking for file changes...');
 
         const newFileStats = new Map<string, FileStat>();
@@ -182,6 +211,12 @@ export class FileSynchronizer {
         if (changes.added.length > 0 || changes.removed.length > 0) {
             console.log('[Synchronizer] Merkle DAG has changed. Comparing file states...');
             const fileChanges = this.compareStates(this.fileHashes, newFileHashes);
+
+            if (options.deferCommit) {
+                this.pendingBaseline = { fileHashes: newFileHashes, fileStats: newFileStats, merkleDAG: newMerkleDAG };
+                console.log(`[Synchronizer] Found changes: ${fileChanges.added.length} added, ${fileChanges.removed.length} removed, ${fileChanges.modified.length} modified.`);
+                return fileChanges;
+            }
 
             this.fileHashes = newFileHashes;
             this.fileStats = newFileStats;

@@ -655,7 +655,16 @@ export class Context {
         if (spec.collectionSuffix === '') {
             return this.getCollectionName(codebasePath);
         }
-        const override = envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B');
+        // A project that names its own collection owns its 0.6B name too. One server syncs every repository in the shared
+        // snapshot, and its env block names a single project: inheriting that value here wrote other repositories' rows
+        // into that project's 0.6B collection.
+        const projectOverride = envManager.getFromProjectScope('MILVUS_COLLECTION_PRIVATE_0P6B');
+        if (projectOverride) {
+            return projectOverride;
+        }
+        const override = envManager.getFromProjectScope('MILVUS_COLLECTION_PRIVATE')
+            ? undefined
+            : envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B');
         if (override) {
             return override;
         }
@@ -925,7 +934,11 @@ export class Context {
         const synchronizer = this.synchronizers.get(primaryCollection);
         const splitter = requestSplitter || this.codeSplitter;
 
-        if (!synchronizer) {
+        if (synchronizer) {
+            // Another process may have rebuilt this repository and moved the saved baseline. Comparing disk with this
+            // process's older copy would report files as changed that are already indexed, and delete their rows.
+            await synchronizer.initialize();
+        } else {
             // Recreate the synchronizer with the same request-scoped options that
             // were used for the original indexing task.
             const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
@@ -940,7 +953,9 @@ export class Context {
         const currentSynchronizer = this.synchronizers.get(primaryCollection)!;
 
         progressCallback?.({ phase: 'Checking for file changes...', current: 0, total: 100, percentage: 0 });
-        const { added, removed, modified } = await currentSynchronizer.checkForChanges();
+        // The baseline moves only after the rows are back (commitChanges below): a run that stops between the delete and
+        // the re-embed must be found again, or those rows are lost and every later check reports no changes.
+        const { added, removed, modified } = await currentSynchronizer.checkForChanges({ deferCommit: true });
         const totalChanges = added.length + removed.length + modified.length;
 
         if (totalChanges === 0) {
@@ -980,8 +995,9 @@ export class Context {
         // in the index path); pass a no-op onFileComplete so processFileList's new
         // arity is satisfied.
         const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
+        let finished = true;
         if (filesToIndex.length > 0) {
-            await this.processFileList(
+            const result = await this.processFileList(
                 filesToIndex,
                 codebasePath,
                 (filePath, fileIndex, totalFiles) => { updateProgress(`Indexed ${filePath} (${fileIndex}/${totalFiles})`); },
@@ -989,6 +1005,10 @@ export class Context {
                 new Map(),                 // empty per-model prior ledgers ⇒ re-embed the changed set for every target
                 splitter,
             );
+            finished = result.status === 'completed';
+        }
+        if (finished) {
+            await currentSynchronizer.commitChanges();
         }
 
         console.log(`[Context] ✅ Re-indexing complete. Added: ${added.length}, Removed: ${removed.length}, Modified: ${modified.length}`);

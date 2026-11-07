@@ -616,6 +616,10 @@ export class ToolHandlers {
             }
             const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, includeDotDirs, supportedExtensions);
             await synchronizer.initialize();
+            // This index is about to replace the rows, so the baseline left by an earlier state of the tree must go with
+            // them. Otherwise the next background sync treats every file changed since then as modified, and deletes
+            // rows this run has just written.
+            await synchronizer.captureBaseline();
 
             // Store synchronizer in the context (let context manage collection names)
             await this.context.getPreparedCollection(absolutePath);
@@ -676,6 +680,9 @@ export class ToolHandlers {
             }, false /* forceReindex — collection already cleared during validation */, priorLedgersByModel,
                customIgnorePatterns, customFileExtensions, requestSplitter, signal);
             console.log(`[BACKGROUND-INDEX] ✅ Indexing completed successfully! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
+            if (stats.status === 'completed') {
+                await synchronizer.commitChanges();
+            }
 
             // Set codebase to indexed status with complete statistics
             this.snapshotManager.setCodebaseIndexed(absolutePath, stats, indexOptions);
