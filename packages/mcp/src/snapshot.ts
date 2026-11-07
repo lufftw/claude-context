@@ -690,6 +690,38 @@ export class SnapshotManager {
     }
 
     /**
+     * Measure each secondary model against the primary from the per-file ledgers and persist the
+     * ratio, so a finished indexing run makes the secondary readable without a manual step (P4).
+     *
+     * The ratio is weighted by chunks to stay close to the design's distinct-PK overlap. A file only
+     * counts when the secondary finished the same content hash, and a secondary holding fewer chunks
+     * than the primary is credited with what it holds. So a partial or stale run stays below the gate.
+     * With no completed primary file there is nothing to measure against, and the entry is left as it was.
+     */
+    public refreshCoverageFromLedgers(codebasePath: string, modelIds: string[]): void {
+        const primary = this.getFileLedgerForModel(codebasePath, DEFAULT_PRIMARY_MODEL_ID);
+        const primaryFiles = [...primary.entries()].filter(([, info]) => info.complete);
+        const total = primaryFiles.reduce((sum, [, info]) => sum + (info.chunkCount ?? 0), 0);
+        if (total === 0) {
+            return;
+        }
+        for (const modelId of modelIds) {
+            if (modelId === DEFAULT_PRIMARY_MODEL_ID) {
+                continue;
+            }
+            const ledger = this.getFileLedgerForModel(codebasePath, modelId);
+            let covered = 0;
+            for (const [relativePath, info] of primaryFiles) {
+                const other = ledger.get(relativePath);
+                if (other?.complete && other.fileHash === info.fileHash) {
+                    covered += Math.min(info.chunkCount ?? 0, other.chunkCount ?? 0);
+                }
+            }
+            this.setCoverageRatioForModel(codebasePath, modelId, covered / total);
+        }
+    }
+
+    /**
      * Read the per-(codebase × model) coverage ratio (P4). Returns undefined when
      * unknown — the search-side coverage gate treats undefined as DEGRADED for
      * secondary models (never silently search a possibly-incomplete collection).

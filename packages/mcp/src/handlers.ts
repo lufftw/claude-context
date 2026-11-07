@@ -679,6 +679,7 @@ export class ToolHandlers {
 
             // Set codebase to indexed status with complete statistics
             this.snapshotManager.setCodebaseIndexed(absolutePath, stats, indexOptions);
+            this.snapshotManager.refreshCoverageFromLedgers(absolutePath, this.context.getActiveModelIds());
             this.indexingStats = { indexedFiles: stats.indexedFiles, totalChunks: stats.totalChunks };
 
             // Save snapshot after updating codebase lists
@@ -803,6 +804,7 @@ export class ToolHandlers {
                 signal,
                 modelId
             );
+            this.snapshotManager.refreshCoverageFromLedgers(absolutePath, this.context.getActiveModelIds());
             this.snapshotManager.saveCodebaseSnapshot();
             console.log(`[SCOPED-INDEX] ✅ '${modelId}' up to date for ${absolutePath}. Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
         } catch (error: any) {
