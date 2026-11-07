@@ -132,6 +132,21 @@ export class EnvManager {
     }
 
     /**
+     * The value set by the project .env of the current runWithProject scope, and nothing else. For a setting that names
+     * this project and so must not fall through to another project's env block.
+     */
+    getFromProjectScope(name: string): string | undefined {
+        const alsCtx = this.als.getStore();
+        if (!alsCtx?.projectEnvPath) {
+            return undefined;
+        }
+        if (!alsCtx.cache) {
+            alsCtx.cache = this.parseEnvFile(alsCtx.projectEnvPath);
+        }
+        return alsCtx.cache.get(name);
+    }
+
+    /**
      * Read a variable from the legacy globally-set project .env file.
      */
     private getFromProjectEnv(name: string): string | undefined {

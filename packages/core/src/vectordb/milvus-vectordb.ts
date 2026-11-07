@@ -888,6 +888,13 @@ export class MilvusVectorDatabase implements VectorDatabase {
             throw new Error('MilvusClient is not initialized. Call ensureInitialized() first.');
         }
 
+        // The limit this probes is a Zilliz Cloud plan limit. On a self-hosted server a role that may create collections
+        // but not drop them would leave one probe collection behind on every index run.
+        const address = this.config?.address;
+        if (address && !/zilliz/i.test(address)) {
+            return true;
+        }
+
         const parsedTimeoutMs = Number(process.env.MILVUS_COLLECTION_LIMIT_CHECK_TIMEOUT_MS);
         const timeoutMs = Number.isFinite(parsedTimeoutMs) && parsedTimeoutMs > 0 ? parsedTimeoutMs : 15000;
         const collectionName = `dummy_collection_${Date.now()}`;

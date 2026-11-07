@@ -12,6 +12,21 @@ const MIN_SYNC_INTERVAL_MS = 1_000;
 const DEFAULT_SYNC_LOCK_STALE_MS = 10 * 60 * 1000;
 const SYNC_LOCK_STALE_ENV = "CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS";
 
+/**
+ * True when this server's env block names a project and codebasePath is a different repository with no identity of its
+ * own. Syncing it would write that repository into the block's collections.
+ */
+export async function belongsToEnvBlockOfAnotherProject(codebasePath: string): Promise<boolean> {
+    if (!process.env.MILVUS_COLLECTION_PRIVATE) {
+        return false;
+    }
+    if (path.resolve(codebasePath) === path.resolve(process.cwd())) {
+        return false;
+    }
+    const own = await envManager.runWithProject(codebasePath, async () => envManager.getFromProjectScope("MILVUS_COLLECTION_PRIVATE"));
+    return !own;
+}
+
 function isBackgroundSyncEnabled(): boolean {
     const value = envManager.get("CLAUDE_CONTEXT_BACKGROUND_SYNC");
     if (!value) {
@@ -201,6 +216,11 @@ export class SyncManager {
                     }
                 } catch (pathError: any) {
                     console.error(`[SYNC-DEBUG] Error checking codebase path '${codebasePath}':`, pathError);
+                    continue;
+                }
+
+                if (await belongsToEnvBlockOfAnotherProject(codebasePath)) {
+                    console.warn(`[SYNC-DEBUG] '${codebasePath}' has no MILVUS_COLLECTION_PRIVATE in its .env and this server is configured for another project. Skipping sync.`);
                     continue;
                 }
 
