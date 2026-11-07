@@ -8,6 +8,20 @@ interface ProjectContext {
     cache: Map<string, string> | undefined;
 }
 
+/**
+ * The value of one .env assignment, by dotenv rules: surrounding single or double quotes are removed (a # inside them is
+ * kept), and an unquoted value ends before whitespace followed by #. A # with no whitespace before it is part of the value.
+ */
+export function parseEnvValue(raw: string): string {
+    const value = raw.trim();
+    const quote = value[0];
+    if (quote === '"' || quote === "'") {
+        const end = value.indexOf(quote, 1);
+        if (end > 0) return value.substring(1, end);
+    }
+    return value.replace(/\s+#.*$/, '').trim();
+}
+
 export class EnvManager {
     private envFilePath: string;
 
@@ -163,22 +177,7 @@ export class EnvManager {
      * Read a single variable from a .env file (no caching).
      */
     private getFromFile(filePath: string, name: string): string | undefined {
-        try {
-            if (fs.existsSync(filePath)) {
-                const content = fs.readFileSync(filePath, 'utf-8');
-                const lines = content.split('\n');
-
-                for (const line of lines) {
-                    const trimmedLine = line.trim();
-                    if (trimmedLine.startsWith(`${name}=`)) {
-                        return trimmedLine.substring(name.length + 1);
-                    }
-                }
-            }
-        } catch (error) {
-            // Ignore file read errors
-        }
-        return undefined;
+        return this.parseEnvFile(filePath).get(name);
     }
 
     /**
@@ -190,13 +189,12 @@ export class EnvManager {
             if (fs.existsSync(filePath)) {
                 const content = fs.readFileSync(filePath, 'utf-8');
                 for (const line of content.split('\n')) {
-                    const trimmed = line.trim();
+                    const trimmed = line.trim().replace(/^export\s+/, '');
                     if (!trimmed || trimmed.startsWith('#')) continue;
                     const eqIndex = trimmed.indexOf('=');
                     if (eqIndex > 0) {
                         const key = trimmed.substring(0, eqIndex).trim();
-                        const value = trimmed.substring(eqIndex + 1).trim();
-                        result.set(key, value);
+                        result.set(key, parseEnvValue(trimmed.substring(eqIndex + 1)));
                     }
                 }
             }
