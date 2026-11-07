@@ -56,13 +56,16 @@ Background: [RabbitMQ embedding provider](../lufftw/rabbitmq-embedding-provider.
 ## Embedding: dual model (secondary collection)
 
 A secondary, smaller model can be indexed into its own collection so that search keeps working
-while the primary model's GPU is busy. It is activated only when **all** of the following hold:
-`MILVUS_COLLECTION_PRIVATE_0P6B` is set, `EMBEDDING_PROVIDER=RabbitMQ`, and `RABBITMQ_INFERENCE_URL`
-is set.
+while the primary model's GPU is busy. It runs when `EMBEDDING_PROVIDER=RabbitMQ` and
+`RABBITMQ_INFERENCE_URL` is set, unless `EMBEDDING_SECONDARY=off`. Each repository names its secondary
+collection in its own `.env` (`MILVUS_COLLECTION_PRIVATE_0P6B`); without one it is `<private>_0p6b`.
+Before 2026-11-07 the secondary was switched by `MILVUS_COLLECTION_PRIVATE_0P6B` in the server's env
+block, so a session whose block did not name one answered `secondary-not-configured` for every repository.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MILVUS_COLLECTION_PRIVATE_0P6B` | — | Activation switch and name of the secondary collection. |
+| `EMBEDDING_SECONDARY` | `on` for RabbitMQ, else `off` | Runs the secondary model. `off` turns it off; an unrecognised value keeps the default. |
+| `MILVUS_COLLECTION_PRIVATE_0P6B` | `<private>_0p6b` | Name of the secondary collection. Belongs in the project `.env`; the env block value is used only for a project that names no collection of its own. |
 | `RABBITMQ_SECONDARY_MODEL` | `qwen3-embedding-0.6b` | Must be a canonical id from `core/src/embedding/model-registry.ts`; anything else disables the secondary. |
 | `RABBITMQ_SECONDARY_QUEUE` | `embedding.qwen3-0.6b` | Work queue of the secondary model. |
 | `RABBITMQ_SECONDARY_DIMENSION` | `1024` | Vector dimension of the secondary model. |

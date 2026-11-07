@@ -121,7 +121,8 @@ const childEnv = {
     MILVUS_ADDRESS: '127.0.0.1:1', // dead loopback port → fast ECONNREFUSED
     NODE_OPTIONS: `${process.env.NODE_OPTIONS ? process.env.NODE_OPTIONS + ' ' : ''}--require ${JSON.stringify(preloadPath)}`,
 };
-delete childEnv.MILVUS_COLLECTION_PRIVATE_0P6B; // ensure secondary is OFF
+delete childEnv.MILVUS_COLLECTION_PRIVATE_0P6B;
+childEnv.EMBEDDING_SECONDARY = 'off'; // ensure secondary is OFF
 delete childEnv.RABBITMQ_SECONDARY_QUEUE;
 delete childEnv.SEARCH_EMBEDDING_MODEL;
 

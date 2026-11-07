@@ -132,11 +132,10 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
 
 /**
  * Construct the secondary (0.6B) RabbitMQEmbedding instance ONLY when the config
- * activates it (milvusCollectionPrivate0p6b is truthy). Returns undefined otherwise.
+ * activates it (config.secondaryEnabled, from EMBEDDING_SECONDARY). Returns undefined otherwise.
  *
- * The activation signal is the PRESENCE of MILVUS_COLLECTION_PRIVATE_0P6B — this ensures
- * that adding only a queue override does nothing, and the user must explicitly name the
- * collection they want to write into.
+ * The 0.6B collection is named per repository (its .env, else `<private>_0p6b`), so the switch is not a
+ * collection name: a server whose env block named none used to leave 0.6B off for every repository.
  *
  * Per LD-2: secondary uses a SEPARATE RabbitMQEmbedding instance from the primary because
  * the per-instance dimension guard in rabbitmq-embedding.ts forbids reusing one instance
@@ -147,9 +146,8 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
 export function createSecondaryEmbeddingInstance(
     config: ContextMcpConfig,
 ): RabbitMQEmbedding | undefined {
-    // Activation check: MILVUS_COLLECTION_PRIVATE_0P6B must be set.
-    if (!config.milvusCollectionPrivate0p6b) {
-        console.error('[EMBEDDING] Secondary embedding: MILVUS_COLLECTION_PRIVATE_0P6B not set → secondary OFF (single-model mode)');
+    if (!config.secondaryEnabled) {
+        console.error('[EMBEDDING] Secondary embedding: EMBEDDING_SECONDARY is off → secondary OFF (single-model mode)');
         return undefined;
     }
 

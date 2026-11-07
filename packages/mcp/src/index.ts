@@ -60,7 +60,7 @@ class ContextMcpServer {
         logEmbeddingProviderInfo(config, embedding);
 
         // Dual-embedding (Option B / LD-2): construct the secondary 0.6B instance
-        // ONLY when configured (MILVUS_COLLECTION_PRIVATE_0P6B present + RabbitMQ).
+        // ONLY when configured (EMBEDDING_SECONDARY, default on for RabbitMQ).
         // undefined ⇒ single-model byte-identical path.
         const secondaryEmbedding = createSecondaryEmbeddingInstance(config);
 

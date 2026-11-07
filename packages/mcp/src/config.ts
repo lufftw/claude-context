@@ -28,13 +28,13 @@ export interface ContextMcpConfig {
     rabbitmqPriority?: number;
     rabbitmqConcurrency?: number;
     rabbitmqSource?: string;
-    // RabbitMQ secondary (0.6B) configuration — all undefined = secondary disabled.
-    // Activation signal: milvusCollectionPrivate0p6b must be truthy to enable secondary.
+    // RabbitMQ secondary (0.6B) configuration. Switched by secondaryEnabled; the overrides below only tune it.
+    secondaryEnabled: boolean;             // EMBEDDING_SECONDARY=on|off; default on for RabbitMQ (see resolveSecondaryEnabled)
     rabbitmqSecondaryQueue?: string;       // RABBITMQ_SECONDARY_QUEUE; default from registry if activated
     rabbitmqSecondaryDimension?: number;   // RABBITMQ_SECONDARY_DIMENSION; default 1024 if activated
     rabbitmqSecondaryModel?: string;       // RABBITMQ_SECONDARY_MODEL; default 'qwen3-embedding-0.6b' if activated
     // Dual-embedding Milvus configuration
-    milvusCollectionPrivate0p6b?: string; // MILVUS_COLLECTION_PRIVATE_0P6B — ACTIVATION SIGNAL; absent = secondary OFF
+    milvusCollectionPrivate0p6b?: string; // MILVUS_COLLECTION_PRIVATE_0P6B — fallback 0.6B name for a project without its own .env name
     // Search configuration
     searchEmbeddingModel: string;          // SEARCH_EMBEDDING_MODEL; default 'qwen3-embedding-8b'
     // Vector database configuration
@@ -200,6 +200,21 @@ function getPositiveIntegerFromEnv(name: string): number | undefined {
     return undefined;
 }
 
+/**
+ * Whether the server runs the secondary (0.6B) model. EMBEDDING_SECONDARY=on|off decides; without it, the secondary is on
+ * whenever the provider can run it (RabbitMQ), or when an older env block still names MILVUS_COLLECTION_PRIVATE_0P6B.
+ * The 0.6B collection name is resolved per repository (its .env, else `<private>_0p6b`), so no name is needed here.
+ */
+export function resolveSecondaryEnabled(provider: string, raw: string | undefined, legacyCollection: string | undefined): boolean {
+    const value = (raw ?? '').trim().toLowerCase();
+    if (['off', 'false', '0', 'no'].includes(value)) return false;
+    if (['on', 'true', '1', 'yes'].includes(value)) return true;
+    if (value) {
+        console.error(`[DEBUG] ⚠️  Ignoring invalid EMBEDDING_SECONDARY: ${raw}. Expected on or off.`);
+    }
+    return provider === 'RabbitMQ' || Boolean(legacyCollection);
+}
+
 export function createMcpConfig(): ContextMcpConfig {
     // Debug: Print all environment variables related to Context
     console.error(`[DEBUG] Environment Variables Debug:`);
@@ -212,7 +227,8 @@ export function createMcpConfig(): ContextMcpConfig {
     console.error(`[DEBUG]   MILVUS_ADDRESS: ${envManager.get('MILVUS_ADDRESS') || 'NOT SET'}`);
     console.error(`[DEBUG]   CODE_CHUNKS_COLLECTION_NAME_OVERRIDE: ${envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE') || 'NOT SET'}`);
     console.error(`[DEBUG]   NODE_ENV: ${envManager.get('NODE_ENV') || 'NOT SET'}`);
-    console.error(`[DEBUG]   MILVUS_COLLECTION_PRIVATE_0P6B: ${envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B') || 'NOT SET (secondary OFF)'}`);
+    console.error(`[DEBUG]   EMBEDDING_SECONDARY: ${envManager.get('EMBEDDING_SECONDARY') || 'NOT SET (default: on for RabbitMQ)'}`);
+    console.error(`[DEBUG]   MILVUS_COLLECTION_PRIVATE_0P6B: ${envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B') || 'NOT SET (each project names its own)'}`);
     console.error(`[DEBUG]   SEARCH_EMBEDDING_MODEL: ${envManager.get('SEARCH_EMBEDDING_MODEL') || 'NOT SET (default: qwen3-embedding-8b)'}`);
 
     const rabbitmqDim = envManager.get('RABBITMQ_EMBEDDING_DIMENSION');
@@ -259,11 +275,16 @@ export function createMcpConfig(): ContextMcpConfig {
         rabbitmqPriority: rabbitmqPriority ? parseInt(rabbitmqPriority, 10) : undefined,
         rabbitmqConcurrency: rabbitmqConcurrency ? parseInt(rabbitmqConcurrency, 10) : undefined,
         rabbitmqSource: envManager.get('RABBITMQ_EMBEDDING_SOURCE'),
-        // RabbitMQ secondary (0.6B) configuration — undefined when not activated
+        // RabbitMQ secondary (0.6B) configuration
+        secondaryEnabled: resolveSecondaryEnabled(
+            envManager.get('EMBEDDING_PROVIDER') || 'OpenAI',
+            envManager.get('EMBEDDING_SECONDARY'),
+            envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B'),
+        ),
         rabbitmqSecondaryQueue: envManager.get('RABBITMQ_SECONDARY_QUEUE'),
         rabbitmqSecondaryDimension,
         rabbitmqSecondaryModel: envManager.get('RABBITMQ_SECONDARY_MODEL'),
-        // Dual-embedding Milvus — milvusCollectionPrivate0p6b presence = activation signal
+        // Fallback 0.6B collection name; a project's own .env takes precedence (Context.getCollectionNameForModel)
         milvusCollectionPrivate0p6b: envManager.get('MILVUS_COLLECTION_PRIVATE_0P6B'),
         // Search configuration
         searchEmbeddingModel,
@@ -335,7 +356,7 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
             // not the stale 30000 that previously appeared here.
             console.error(`[MCP]   RabbitMQ Timeout: ${config.rabbitmqTimeoutMs ?? 1_700_000}ms`);
             // Secondary (0.6B) dual-embedding summary — only meaningful when activated.
-            console.error(`[MCP]   Secondary (0.6B): ${config.milvusCollectionPrivate0p6b ? `ON (collection=${config.milvusCollectionPrivate0p6b}, queue=${config.rabbitmqSecondaryQueue ?? 'embedding.qwen3-0.6b'}, dim=${config.rabbitmqSecondaryDimension ?? 1024})` : 'OFF'}`);
+            console.error(`[MCP]   Secondary (0.6B): ${config.secondaryEnabled ? `ON (queue=${config.rabbitmqSecondaryQueue ?? 'embedding.qwen3-0.6b'}, collection per project)` : 'OFF'}`);
             console.error(`[MCP]   Search default model: ${config.searchEmbeddingModel}`);
             break;
     }
