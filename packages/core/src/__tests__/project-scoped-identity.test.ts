@@ -38,3 +38,37 @@ describe('getCollectionNameForModel under a project scope', () => {
         await expect(name(repoWith('OTHER=1\n'))).resolves.toBe('claude_context_own_0p6b');
     });
 });
+
+// The search handler asks isModelReadable before it searches, outside any project scope. Without its own scope the check
+// looked for the env block's 0.6B collection, or for a hash-named one when the block named none, so a repository whose
+// own .env names its 0.6B collection was refused even with full coverage.
+describe('isModelReadable resolves the repository\'s own collection', () => {
+    afterEach(() => {
+        delete process.env.MILVUS_COLLECTION_PRIVATE;
+        delete process.env.MILVUS_COLLECTION_PRIVATE_0P6B;
+    });
+    const probe = () => {
+        const asked: string[] = [];
+        const ctx = new Context({
+            embedding: embedding(4096), secondaryEmbedding: embedding(1024),
+            vectorDatabase: { hasCollection: async (n: string) => { asked.push(n); return n === 'repo_own_0p6b'; } } as any,
+            coverageReader: () => 1,
+        });
+        return { ctx, asked };
+    };
+
+    it('checks the project collection when the env block names none', async () => {
+        const { ctx, asked } = probe();
+        const dir = repoWith('MILVUS_COLLECTION_PRIVATE=repo_own\nMILVUS_COLLECTION_PRIVATE_0P6B=repo_own_0p6b\n');
+        await expect(ctx.isModelReadable(dir, MODEL_06)).resolves.toBe(true);
+        expect(asked).toEqual(['repo_own_0p6b']);
+    });
+
+    it('checks the project collection, not the env block\'s, when both name one', async () => {
+        process.env.MILVUS_COLLECTION_PRIVATE = 'claude_context_own';
+        process.env.MILVUS_COLLECTION_PRIVATE_0P6B = 'claude_context_own_0p6b';
+        const { ctx, asked } = probe();
+        await expect(ctx.isModelReadable(repoWith('MILVUS_COLLECTION_PRIVATE=repo_own\n'), MODEL_06)).resolves.toBe(true);
+        expect(asked).toEqual(['repo_own_0p6b']);
+    });
+});

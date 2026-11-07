@@ -419,10 +419,14 @@ export class Context {
     public async isModelReadable(codebasePath: string, modelId: string): Promise<boolean> {
         getModelSpec(modelId); // validate id
         if (!this.hasEmbeddingForModel(modelId)) return false;
-        const collectionName = this.getCollectionNameForModel(codebasePath, modelId);
-        const exists = await this.vectorDatabase.hasCollection(collectionName);
-        if (!exists) return false;
-        return this.isCoverageSufficientForModel(codebasePath, modelId);
+        // Callers (the search handler) ask before searching, outside any project scope. The collection is the
+        // repository's own, named in its .env, so resolve it inside that scope as semanticSearch does.
+        return envManager.runWithProject(codebasePath, async () => {
+            const collectionName = this.getCollectionNameForModel(codebasePath, modelId);
+            const exists = await this.vectorDatabase.hasCollection(collectionName);
+            if (!exists) return false;
+            return this.isCoverageSufficientForModel(codebasePath, modelId);
+        });
     }
 
     /**

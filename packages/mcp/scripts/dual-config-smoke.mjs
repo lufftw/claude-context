@@ -74,7 +74,7 @@ const SCRUB_KEYS = [
     'RABBITMQ_EMBEDDING_TIMEOUT_MS', 'RABBITMQ_EMBEDDING_MAX_RETRIES',
     'RABBITMQ_EMBEDDING_PRIORITY', 'RABBITMQ_EMBEDDING_CONCURRENCY', 'RABBITMQ_EMBEDDING_SOURCE',
     'RABBITMQ_SECONDARY_QUEUE', 'RABBITMQ_SECONDARY_DIMENSION', 'RABBITMQ_SECONDARY_MODEL',
-    'MILVUS_COLLECTION_PRIVATE_0P6B', 'SEARCH_EMBEDDING_MODEL',
+    'MILVUS_COLLECTION_PRIVATE_0P6B', 'SEARCH_EMBEDDING_MODEL', 'EMBEDDING_SECONDARY',
     'MILVUS_ADDRESS', 'MILVUS_TOKEN', 'MCP_SERVER_NAME', 'MCP_SERVER_VERSION',
 ];
 
@@ -125,6 +125,7 @@ check('rabbitmqSecondaryModel is undefined',
     cfgOff.rabbitmqSecondaryModel === undefined, `got ${cfgOff.rabbitmqSecondaryModel}`);
 eq('searchEmbeddingModel defaults to qwen3-embedding-8b',
     cfgOff.searchEmbeddingModel, 'qwen3-embedding-8b');
+eq('secondaryEnabled is false for a provider that cannot run two models', cfgOff.secondaryEnabled, false);
 
 // No defined secondary field may leak into the OFF config (undefined → absent in
 // JSON, so the pre-existing single-model surface is preserved).
@@ -175,7 +176,8 @@ const cfgOnBare = resolveConfig({
     EMBEDDING_PROVIDER: 'RabbitMQ',
     MILVUS_COLLECTION_PRIVATE_0P6B: 'myproj_code_chunks_0p6b',
 });
-eq('activation signal present', cfgOnBare.milvusCollectionPrivate0p6b, 'myproj_code_chunks_0p6b');
+eq('legacy collection name passes through', cfgOnBare.milvusCollectionPrivate0p6b, 'myproj_code_chunks_0p6b');
+eq('secondaryEnabled is true', cfgOnBare.secondaryEnabled, true);
 check('secondary queue stays undefined (registry default deferred to factory)',
     cfgOnBare.rabbitmqSecondaryQueue === undefined, `got ${cfgOnBare.rabbitmqSecondaryQueue}`);
 check('secondary dimension stays undefined (registry default deferred to factory)',
@@ -184,6 +186,14 @@ check('secondary model stays undefined (registry default deferred to factory)',
     cfgOnBare.rabbitmqSecondaryModel === undefined, `got ${cfgOnBare.rabbitmqSecondaryModel}`);
 eq('searchEmbeddingModel still defaults to primary when unset',
     cfgOnBare.searchEmbeddingModel, 'qwen3-embedding-8b');
+
+// ── C. The switch is EMBEDDING_SECONDARY, not a collection name ──────────────
+console.log('\nC. RabbitMQ with no collection name → secondary on; EMBEDDING_SECONDARY=off → off');
+const cfgDefault = resolveConfig({ EMBEDDING_PROVIDER: 'RabbitMQ' });
+eq('secondaryEnabled defaults to true for RabbitMQ', cfgDefault.secondaryEnabled, true);
+check('no collection name is required', cfgDefault.milvusCollectionPrivate0p6b === undefined, `got ${cfgDefault.milvusCollectionPrivate0p6b}`);
+const cfgOffExplicit = resolveConfig({ EMBEDDING_PROVIDER: 'RabbitMQ', EMBEDDING_SECONDARY: 'off', MILVUS_COLLECTION_PRIVATE_0P6B: 'myproj_code_chunks_0p6b' });
+eq('EMBEDDING_SECONDARY=off wins over a collection name', cfgOffExplicit.secondaryEnabled, false);
 
 // ── verdict ──────────────────────────────────────────────────────────────────
 console.log(`\n${failures === 0 ? 'PASS' : 'FAIL'} — ${failures} failed assertion(s)`);
