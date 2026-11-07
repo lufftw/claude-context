@@ -300,8 +300,19 @@ export class ToolHandlers {
 
             let hasChanges = false;
 
-            // Remove local codebases that don't exist in cloud (using normalized path comparison)
+            // FORK POLICY (2026-11-07): do NOT prune by default. The snapshot under CLAUDE_CONTEXT_HOME is
+            // shared by every project's MCP process, and a process recognises only its OWN custom collection,
+            // so another project's custom-named collection is skipped above as "non-code". Pruning "everything
+            // not seen" therefore removed other projects' entries, per-model ledgers and merkle snapshots on
+            // every search/status call. Per-path reconciliation still happens where it is safe: index_codebase
+            // compares the snapshot with hasIndex() under the project's own env. Opt back in to the upstream
+            // behaviour (single-project, unshared snapshot) with CLAUDE_CONTEXT_SYNC_PRUNE=true.
+            const pruneEnabled = (envManager.get('CLAUDE_CONTEXT_SYNC_PRUNE') || '').toLowerCase() === 'true';
             for (const localCodebase of localCodebases) {
+                if (!normalizedCloudPaths.has(normalizePath(localCodebase)) && !pruneEnabled) {
+                    console.log(`[SYNC-CLOUD] ℹ️  Not seen by this process, kept (pruning disabled): ${localCodebase}`);
+                    continue;
+                }
                 if (!normalizedCloudPaths.has(normalizePath(localCodebase))) {
                     this.snapshotManager.removeCodebaseCompletely(localCodebase);
                     hasChanges = true;

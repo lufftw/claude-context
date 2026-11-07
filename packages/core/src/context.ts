@@ -14,6 +14,7 @@ import {
 import {
     getModelSpec,
     DEFAULT_PRIMARY_MODEL_ID,
+    batchSizeForModel,
 } from './embedding/model-registry';
 import {
     VectorDatabase,
@@ -1802,7 +1803,7 @@ export class Context {
                         const a = acc.get(target.modelId)!;
                         if (a.dropped) continue;                 // Fix 2: stop buffering a dropped target
                         a.buffer.push({ chunk, codebasePath, relativePath });
-                        if (a.buffer.length >= EMBEDDING_BATCH_SIZE) {
+                        if (a.buffer.length >= batchSizeForModel(target.modelId, EMBEDDING_BATCH_SIZE, (k) => envManager.get(k))) {
                             await flushTarget(target, false);
                         }
                     }
