@@ -19,6 +19,7 @@ export function withHeartbeat(url: string, seconds: number | undefined): string 
 }
 import { randomUUID } from 'node:crypto';
 import { Embedding, EmbeddingVector, EmbedItemResult, EmbedReason, WAIT_REASONS } from './base-embedding';
+import { CONTEXT_BUSY_BACKOFF_MS, MAX_OVERSIZE_CUTS, isContextBusy, shortenForContextLimit } from './oversize-retry';
 
 /**
  * RabbitMQEmbedding
@@ -384,12 +385,34 @@ export class RabbitMQEmbedding extends Embedding {
      */
     private async sendOneWithRetry(text: string): Promise<number[]> {
         let lastErr: any;
+        let cuts = 0;
+        let busyResends = 0;
         for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
             try {
                 return await this.sendOne(text, attempt);
             } catch (err) {
                 lastErr = err;
                 const reason = (err as { embedReason?: EmbedReason }).embedReason;
+                // A chunk longer than the worker's context is a property of that chunk, not a worker fault: shorten it from
+                // the limit the worker reports and send it again (bounded, and not counted against the retry budget).
+                if (reason === 'worker-error' && cuts < MAX_OVERSIZE_CUTS) {
+                    const shorter = shortenForContextLimit(text, (err as Error).message ?? '');
+                    if (shorter !== null) {
+                        cuts++;
+                        console.error(`[RabbitMQEmbedding] chunk over the worker context; cut ${text.length} -> ${shorter.length} chars (${cuts}/${MAX_OVERSIZE_CUTS})`);
+                        text = shorter;
+                        attempt--; // does not use a WAIT-retry
+                        continue;
+                    }
+                }
+                // Momentary context pressure on a busy worker: resend after a growing pause (own bounded budget).
+                if (reason === 'worker-error' && busyResends < CONTEXT_BUSY_BACKOFF_MS.length && isContextBusy((err as Error).message ?? '')) {
+                    const pause = CONTEXT_BUSY_BACKOFF_MS[busyResends++] * (0.75 + Math.random() * 0.5);
+                    console.error(`[RabbitMQEmbedding] worker context busy; resend ${busyResends}/${CONTEXT_BUSY_BACKOFF_MS.length} after ${Math.round(pause)} ms`);
+                    await new Promise((resolve) => setTimeout(resolve, pause));
+                    attempt--; // does not use a WAIT-retry
+                    continue;
+                }
                 if (!reason || !WAIT_REASONS.has(reason)) throw err; // REAL or 'shutdown' → no retry
                 // WAIT-class: re-publish a fresh taskId on the next loop iteration.
                 console.error(`[RabbitMQEmbedding] retry ${attempt + 1}/${this.config.maxRetries} after ${reason}`);

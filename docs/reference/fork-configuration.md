@@ -53,6 +53,15 @@ RPC.
 
 Background: [RabbitMQ embedding provider](../lufftw/rabbitmq-embedding-provider.md).
 
+**Chunks longer than a worker's context.** The 0.6B worker's context is 2048 tokens and it ignores `truncate:'end'`: a chunk
+of about 2,200 tokens (dense Chinese text at 2,500 characters) gets a terminal `exceed_context_size_error`. The client reads the
+two token counts from that error, keeps the leading part of the chunk (limit/tokens, with a 10% margin), and sends it again, at
+most three cuts per chunk. The row keeps its place in both models; its vector describes the leading part of the chunk. A worker
+that answers `500 Context size has been exceeded` because other long requests are in flight is sent the request again after
+1, 2.5, 5, 10, 20 and 30 seconds (each with jitter) before the slot fails. Neither case counts toward the three-in-a-row rule
+that drops a secondary model. Before this, `taiwan-counties.ts` (31 of 70 chunks over the limit) dropped the 0.6B model for the
+rest of an `event-search-service` run.
+
 ## Embedding: dual model (secondary collection)
 
 A secondary, smaller model can be indexed into its own collection so that search keeps working
