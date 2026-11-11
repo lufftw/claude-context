@@ -48,3 +48,10 @@ export function shortenForContextLimit(text: string, errorMessage: string): stri
     if (keep < 1 || keep >= text.length) return null;
     return text.slice(0, keep);
 }
+
+/**
+ * Pauses (ms) between attempts to reach the broker again after a connection could not be opened (broker restart, network
+ * switch, a socket closed during the handshake). Own budget, about nine minutes in all, so a short outage is waited out
+ * instead of ending a long index run; each pause is jittered by the caller.
+ */
+export const CONNECT_BACKOFF_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
