@@ -430,7 +430,17 @@ export class ToolHandlers {
             const snapshotHasIndex = this.snapshotManager.getIndexedCodebases().includes(absolutePath);
             const vectorDbHasIndex = await this.context.hasIndex(absolutePath);
             if (snapshotHasIndex !== vectorDbHasIndex) {
-                if (vectorDbHasIndex && !snapshotHasIndex) {
+                // An interrupted or failed run that still carries a per-file ledger is a RESUME, not a missing
+                // snapshot: marking it indexed would refuse the run ("already indexed") and leave the unfinished
+                // files out for good. The core skips every file whose ledger entry is complete at the same hash
+                // and re-embeds the rest, so the run is allowed to go on with the entry (and its ledger) intact.
+                const priorStatus = this.snapshotManager.getCodebaseStatus(absolutePath);
+                const resumable = !forceReindex
+                    && (priorStatus === 'indexfailed' || priorStatus === 'indexing')
+                    && this.snapshotManager.getFileLedgerForModel(absolutePath, DEFAULT_PRIMARY_MODEL_ID).size > 0;
+                if (resumable) {
+                    console.warn(`[INDEX-VALIDATION] Resuming '${absolutePath}' from its per-file ledger (previous status: ${priorStatus})`);
+                } else if (vectorDbHasIndex && !snapshotHasIndex) {
                     // Query Milvus for real row count. If unknown/empty, log and move on
                     // without writing 0/0+completed (which would trigger the force-reindex
                     // loop in Issue #295). The user is about to (re)index anyway.
