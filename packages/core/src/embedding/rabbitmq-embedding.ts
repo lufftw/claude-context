@@ -19,7 +19,7 @@ export function withHeartbeat(url: string, seconds: number | undefined): string 
 }
 import { randomUUID } from 'node:crypto';
 import { Embedding, EmbeddingVector, EmbedItemResult, EmbedReason, WAIT_REASONS } from './base-embedding';
-import { CONTEXT_BUSY_BACKOFF_MS, MAX_OVERSIZE_CUTS, isContextBusy, shortenForContextLimit } from './oversize-retry';
+import { CONNECT_BACKOFF_MS, CONTEXT_BUSY_BACKOFF_MS, MAX_OVERSIZE_CUTS, isContextBusy, shortenForContextLimit } from './oversize-retry';
 
 /**
  * RabbitMQEmbedding
@@ -387,6 +387,7 @@ export class RabbitMQEmbedding extends Embedding {
         let lastErr: any;
         let cuts = 0;
         let busyResends = 0;
+        let connectRetries = 0;
         for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
             try {
                 return await this.sendOne(text, attempt);
@@ -413,6 +414,15 @@ export class RabbitMQEmbedding extends Embedding {
                     attempt--; // does not use a WAIT-retry
                     continue;
                 }
+                // The broker could not be reached at all (restart, network switch, socket closed in the handshake): wait it out
+                // on its own growing budget instead of spending the three WAIT retries in the same second.
+                if ((err as { embedConnectFailure?: boolean }).embedConnectFailure && connectRetries < CONNECT_BACKOFF_MS.length) {
+                    const pause = CONNECT_BACKOFF_MS[connectRetries++] * (0.75 + Math.random() * 0.5);
+                    console.error(`[RabbitMQEmbedding] broker unreachable (${(err as Error).message}); reconnect ${connectRetries}/${CONNECT_BACKOFF_MS.length} after ${Math.round(pause)} ms`);
+                    await new Promise((resolve) => setTimeout(resolve, pause));
+                    attempt--; // does not use a WAIT-retry
+                    continue;
+                }
                 if (!reason || !WAIT_REASONS.has(reason)) throw err; // REAL or 'shutdown' → no retry
                 // WAIT-class: re-publish a fresh taskId on the next loop iteration.
                 console.error(`[RabbitMQEmbedding] retry ${attempt + 1}/${this.config.maxRetries} after ${reason}`);
@@ -425,7 +435,12 @@ export class RabbitMQEmbedding extends Embedding {
         // Re-establish after a resetState (idempotent + mutex-guarded) so WAIT-class
         // retries can recover from a transient connection/channel drop. Because each
         // retry calls sendOne afresh, it reads the NEW this.replyQueue at publish time.
-        await this.initialize();
+        try {
+            await this.initialize();
+        } catch (err) {
+            // Not being able to open the connection says nothing about the chunk: it is a wait-class fault, never a real one.
+            throw Object.assign(err instanceof Error ? err : new Error(String(err)), { embedReason: 'connection-lost' as EmbedReason, embedConnectFailure: true });
+        }
         // Defensive post-init assertion: initialize() above guarantees these are set
         // on the happy path; this guards against a drop racing in between.
         if (!this.publishCh || !this.replyQueue) {
