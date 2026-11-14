@@ -1,5 +1,9 @@
 # RabbitMQ Embedding Provider
 
+> **2026-11-14 (CC-EMBED-FIX-1114):** publishes now default to priority 2, carry an AMQP `expiration`
+> equal to the request timeout, and are never re-published after a timeout or a connection fault; see
+> [Publish policy](#publish-policy-priority-expiration-no-re-publish).
+>
 > **Status:** reviewed 2026-11-04 against `0.1.15-lufftw.2` (amqplib 2.2.1). The AMQP heartbeat (default
 > 60 s) is now sent in the connection URL. It was previously passed as a socket option, which
 > amqplib ignores; see [bugfix-2026-11-04-amqp-heartbeat.md](./bugfix-2026-11-04-amqp-heartbeat.md).
@@ -29,7 +33,7 @@ Published to `embedding.qwen3-8b` (or whatever queue is configured):
   "createdAt": 1712838391000,
   "traceId": "claude-context-1712838391000-a1b2c3d4",
   "source": "claude-context",
-  "priority": 8,
+  "priority": 2,
   "replyTo": "amq.gen-...",
   "correlationId": "<same uuid>",
   "prompt": "<text>",
@@ -54,7 +58,8 @@ contentType: application/json
 correlationId: <uuid>
 replyTo: <exclusive reply queue>
 messageId: <uuid>
-priority: <configured priority>
+priority: <configured priority, default 2>
+expiration: <timeoutMs as a string of milliseconds, default "1700000">
 ```
 
 Published to the **default exchange** (`""`), routed by queue name — matches the convention used by event-search-service and event-crawler so no custom binding is needed.
@@ -111,6 +116,21 @@ close()            // explicit shutdown
 
 **Connection failure handling**: On any `channel.close` / `connection.close` event the provider calls `resetState(reason)` which immediately rejects all pending requests (callers fail fast instead of waiting for individual timeouts). The next `embed()` call will trigger a fresh `initialize()` — there is no automatic reconnect loop because the MCP server process is typically restarted by its supervisor when things go wrong.
 
+## Publish policy: priority, expiration, no re-publish
+
+Code-search embeds share the `embedding.qwen3-8b` queue with the event pipeline. On 2026-11-14 that queue held 16,291 messages with about 95% of them claude-context code chunks, and new events waited behind them. Three rules keep that from recurring:
+
+1. **Priority 2 by default.** Code-search publishes sit below the event pipeline's traffic. Configuration that sets `RABBITMQ_EMBEDDING_PRIORITY` (or `priority`) explicitly keeps working as given.
+2. **`expiration` = `timeoutMs`.** Every publish carries the request timeout as the AMQP per-message TTL (a string of milliseconds). When the waiter has given up, the broker drops the message instead of a worker embedding it for nobody.
+3. **No re-publish while an earlier copy can be queued.** Previously a timeout was retried by publishing the same text under a fresh task id while the first message was still queued, so one chunk could be in the queue up to four times and every stale copy was embedded and its reply discarded. Now:
+   - a **timeout** fails the chunk with `embedReason: 'timeout'`;
+   - a **connection or channel loss after the publish**, and a **failed publish confirm**, fail the chunk as `connection-lost` (or the publish error); the message is persistent and may still be queued, so it is not published again. The next call reconnects and publishes on a fresh reply queue;
+   - kept, because no earlier copy can be live: the **broker-unreachable wait** (nothing was published yet), the **oversize-chunk cut** and the **busy-context backoff** (both resend only after the worker has answered the first message with a failure reply).
+
+   `maxRetries` is still accepted so existing configuration does not break, but it no longer has an effect.
+
+A caller that wants a failed chunk embedded later (the indexer's partial-batch path reports the slot with its reason) does that after the fact, not by queueing a second copy now.
+
 ## Concurrency
 
 `embedBatch(texts)` uses a **bounded worker pool** pattern:
@@ -131,8 +151,8 @@ Default `concurrency = 10`. This caps how many RPCs are in flight at once. Raisi
 | `RABBITMQ_EMBEDDING_QUEUE` | `queue` | `embedding.qwen3-8b` | Target work queue |
 | `EMBEDDING_MODEL` | `modelName` | `qwen3-embedding-8b` | Logical name in task body |
 | `RABBITMQ_EMBEDDING_DIMENSION` | `dimension` | `4096` | Fixed by model |
-| `RABBITMQ_EMBEDDING_TIMEOUT_MS` | `timeoutMs` | `30000` | Per-RPC timeout |
-| `RABBITMQ_EMBEDDING_PRIORITY` | `priority` | `5` | 0-10 |
+| `RABBITMQ_EMBEDDING_TIMEOUT_MS` | `timeoutMs` | `1700000` | Per-RPC timeout; also the message `expiration` |
+| `RABBITMQ_EMBEDDING_PRIORITY` | `priority` | `2` | 0-10; an explicit value is honoured |
 | `RABBITMQ_EMBEDDING_CONCURRENCY` | `concurrency` | `10` | `embedBatch` parallelism |
 | `RABBITMQ_EMBEDDING_SOURCE` | `source` | `claude-context` | Task `source` field |
 

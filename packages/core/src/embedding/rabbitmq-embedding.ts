@@ -59,15 +59,23 @@ export interface RabbitMQEmbeddingConfig {
     modelName: string;
     /** Vector dimension produced by the worker (Qwen3-8b = 4096) */
     dimension: number;
-    /** Per-request liveness timeout in ms (default 1_700_000 ≈ 28 min — patient backstop) */
+    /**
+     * Per-request liveness timeout in ms (default 1_700_000 ≈ 28 min — patient backstop).
+     * Also stamped on every published message as its AMQP `expiration`, so a message whose
+     * waiter has given up is dropped by the broker instead of being embedded for nobody.
+     */
     timeoutMs?: number;
     /**
-     * Max retry-via-republish attempts for WAIT-class faults (default 3).
-     * Invariant: timeoutMs * (maxRetries + 1) must stay under the broker
-     * consumer_timeout (2h = 7_200_000ms) so a slow worker never exceeds it.
+     * Accepted for configuration compatibility and no longer used: a chunk is never
+     * re-published after a timeout or a connection fault (see sendOneWithRetry). The
+     * oversize-cut, busy-context and broker-unreachable resends have their own budgets.
+     * @deprecated has no effect
      */
     maxRetries?: number;
-    /** RabbitMQ priority (0-10). Indexing = higher if you want to jump enrichment. */
+    /**
+     * RabbitMQ priority (0-10), default 2: code-search embeds sit below the event pipeline's
+     * traffic on the shared queue. An explicit value is honoured as given.
+     */
     priority?: number;
     /** Parallel in-flight requests for embedBatch (default 10) */
     concurrency?: number;
@@ -111,7 +119,7 @@ export class RabbitMQEmbedding extends Embedding {
             dimension: config.dimension,
             timeoutMs: config.timeoutMs ?? 1_700_000,
             maxRetries: config.maxRetries ?? 3,
-            priority: config.priority ?? 5,
+            priority: config.priority ?? 2,
             concurrency: config.concurrency ?? 10,
             heartbeat: config.heartbeat ?? 60,
             source: config.source ?? 'claude-context',
@@ -377,64 +385,66 @@ export class RabbitMQEmbedding extends Embedding {
     // ── Internals ────────────────────────────────────────────
 
     /**
-     * Bounded retry-via-republish wrapper around sendOne. Only WAIT-class faults
-     * are retried; REAL faults and 'shutdown' fail fast. Retries re-publish a
-     * fresh taskId (the prior attempt already settled — timeout deleted its
-     * pending entry, or the channel closed) and reuse the configured priority
-     * (never escalate).
+     * Resend wrapper around sendOne. A chunk is re-published only when no earlier copy of
+     * it can still be in the queue:
+     *   - after a definite failure reply from the worker (oversize cut, busy context): the
+     *     worker consumed that message and answered it;
+     *   - when the broker could not be reached at all (embedConnectFailure): nothing was
+     *     published yet.
+     * Every other fault fails the chunk without a resend. In particular a timeout, a
+     * connection or channel loss after the publish, and a failed publish confirm all leave
+     * the earlier message possibly queued (it is persistent and unacked), so re-publishing
+     * under a fresh id would put a second live copy of the chunk on the shared queue. The
+     * message carries an `expiration` equal to timeoutMs, so an abandoned copy is dropped
+     * by the broker; the caller sees the fault (timeout / connection-lost) and decides.
      */
     private async sendOneWithRetry(text: string): Promise<number[]> {
-        let lastErr: any;
         let cuts = 0;
         let busyResends = 0;
         let connectRetries = 0;
-        for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
+        for (;;) {
             try {
-                return await this.sendOne(text, attempt);
+                return await this.sendOne(text, 0);
             } catch (err) {
-                lastErr = err;
                 const reason = (err as { embedReason?: EmbedReason }).embedReason;
                 // A chunk longer than the worker's context is a property of that chunk, not a worker fault: shorten it from
-                // the limit the worker reports and send it again (bounded, and not counted against the retry budget).
+                // the limit the worker reports and send it again (bounded). The worker answered the first message.
                 if (reason === 'worker-error' && cuts < MAX_OVERSIZE_CUTS) {
                     const shorter = shortenForContextLimit(text, (err as Error).message ?? '');
                     if (shorter !== null) {
                         cuts++;
                         console.error(`[RabbitMQEmbedding] chunk over the worker context; cut ${text.length} -> ${shorter.length} chars (${cuts}/${MAX_OVERSIZE_CUTS})`);
                         text = shorter;
-                        attempt--; // does not use a WAIT-retry
                         continue;
                     }
                 }
-                // Momentary context pressure on a busy worker: resend after a growing pause (own bounded budget).
+                // Momentary context pressure on a busy worker: resend after a growing pause (own bounded budget). The worker answered.
                 if (reason === 'worker-error' && busyResends < CONTEXT_BUSY_BACKOFF_MS.length && isContextBusy((err as Error).message ?? '')) {
                     const pause = CONTEXT_BUSY_BACKOFF_MS[busyResends++] * (0.75 + Math.random() * 0.5);
                     console.error(`[RabbitMQEmbedding] worker context busy; resend ${busyResends}/${CONTEXT_BUSY_BACKOFF_MS.length} after ${Math.round(pause)} ms`);
                     await new Promise((resolve) => setTimeout(resolve, pause));
-                    attempt--; // does not use a WAIT-retry
                     continue;
                 }
-                // The broker could not be reached at all (restart, network switch, socket closed in the handshake): wait it out
-                // on its own growing budget instead of spending the three WAIT retries in the same second.
+                // The broker could not be reached at all (restart, network switch, socket closed in the handshake): nothing was
+                // published, so wait it out on its own growing budget and try again.
                 if ((err as { embedConnectFailure?: boolean }).embedConnectFailure && connectRetries < CONNECT_BACKOFF_MS.length) {
                     const pause = CONNECT_BACKOFF_MS[connectRetries++] * (0.75 + Math.random() * 0.5);
                     console.error(`[RabbitMQEmbedding] broker unreachable (${(err as Error).message}); reconnect ${connectRetries}/${CONNECT_BACKOFF_MS.length} after ${Math.round(pause)} ms`);
                     await new Promise((resolve) => setTimeout(resolve, pause));
-                    attempt--; // does not use a WAIT-retry
                     continue;
                 }
-                if (!reason || !WAIT_REASONS.has(reason)) throw err; // REAL or 'shutdown' → no retry
-                // WAIT-class: re-publish a fresh taskId on the next loop iteration.
-                console.error(`[RabbitMQEmbedding] retry ${attempt + 1}/${this.config.maxRetries} after ${reason}`);
+                if (reason && WAIT_REASONS.has(reason)) {
+                    console.error(`[RabbitMQEmbedding] ${reason}: not re-publishing (an earlier copy may still be queued)`);
+                }
+                throw err;
             }
         }
-        throw lastErr;
     }
 
     private async sendOne(text: string, attempt: number = 0): Promise<number[]> {
-        // Re-establish after a resetState (idempotent + mutex-guarded) so WAIT-class
-        // retries can recover from a transient connection/channel drop. Because each
-        // retry calls sendOne afresh, it reads the NEW this.replyQueue at publish time.
+        // Re-establish after a resetState (idempotent + mutex-guarded) so the next chunk
+        // can recover from a transient connection/channel drop. Each call to sendOne reads
+        // the NEW this.replyQueue at publish time.
         try {
             await this.initialize();
         } catch (err) {
@@ -499,6 +509,8 @@ export class RabbitMQEmbedding extends Embedding {
                     replyTo: replyQueue,
                     messageId: taskId,
                     priority: this.config.priority,
+                    // Same bound as the waiter's timeout: once nobody waits, the broker drops the message.
+                    expiration: String(this.config.timeoutMs),
                 },
                 (err) => {
                     if (err) {
