@@ -2,7 +2,7 @@ import { RabbitMQEmbedding } from '../rabbitmq-embedding';
 
 // CC-EMBED-FIX-1114: code-search embeds must not flood the shared queue.
 //   1. default publish priority is 2
-//   2. every publish carries an AMQP `expiration` equal to String(timeoutMs)
+//   2. publishes carry NO per-message `expiration` (the queue dead-letters expired messages into dlq.failed)
 //   3. no path re-publishes a chunk while an earlier copy of it can still be queued
 
 interface Published {
@@ -57,7 +57,7 @@ const base = (h: ReturnType<typeof makeHarness>, extra: object = {}) => ({
     url: 'amqp://x', queue: 'q', modelName: 'm', dimension: DIM, connectFn: h.connectFn, ...extra,
 });
 
-describe('publish policy: priority and expiration', () => {
+describe('publish policy: priority and no expiration', () => {
     let errSpy: jest.SpyInstance;
     let warnSpy: jest.SpyInstance;
     beforeEach(() => {
@@ -89,24 +89,26 @@ describe('publish policy: priority and expiration', () => {
         await p;
     });
 
-    it('expiration is String(timeoutMs) by default', async () => {
+    // embedding.qwen3-8b has x-dead-letter-exchange llm.dlx (routing key failed): an expired message would be
+    // dead-lettered into dlq.failed, a sink with no consumer, instead of being dropped. So none is set.
+    it('publish options carry no expiration property by default', async () => {
         const h = makeHarness();
         const e = new RabbitMQEmbedding(base(h));
         const p = e.embed('hello');
         await new Promise((r) => setImmediate(r));
-        expect(h.published[0].opts.expiration).toBe('1700000');
+        expect(h.published[0].opts).not.toHaveProperty('expiration');
         h.deliver(h.published[0].task.id, ok());
         await p;
     });
 
-    it('expiration follows an explicit timeoutMs, for embed and for embedBatch', async () => {
+    it('an explicit timeoutMs still sets no expiration, for embed and for embedBatch', async () => {
         const h = makeHarness();
         const e = new RabbitMQEmbedding(base(h, { timeoutMs: 12345 }));
         const p = e.embedBatch(['a', 'b']);
         await new Promise((r) => setImmediate(r));
         await new Promise((r) => setImmediate(r));
         expect(h.published).toHaveLength(2);
-        for (const m of h.published) expect(m.opts.expiration).toBe('12345');
+        for (const m of h.published) expect(m.opts).not.toHaveProperty('expiration');
         for (const m of h.published) h.deliver(m.task.id, ok());
         await p;
     });

@@ -61,8 +61,8 @@ export interface RabbitMQEmbeddingConfig {
     dimension: number;
     /**
      * Per-request liveness timeout in ms (default 1_700_000 ≈ 28 min — patient backstop).
-     * Also stamped on every published message as its AMQP `expiration`, so a message whose
-     * waiter has given up is dropped by the broker instead of being embedded for nobody.
+     * The message carries no AMQP `expiration`: the shared queue dead-letters expired
+     * messages into dlq.failed, so staleness is left to the worker side.
      */
     timeoutMs?: number;
     /**
@@ -395,8 +395,7 @@ export class RabbitMQEmbedding extends Embedding {
      * connection or channel loss after the publish, and a failed publish confirm all leave
      * the earlier message possibly queued (it is persistent and unacked), so re-publishing
      * under a fresh id would put a second live copy of the chunk on the shared queue. The
-     * message carries an `expiration` equal to timeoutMs, so an abandoned copy is dropped
-     * by the broker; the caller sees the fault (timeout / connection-lost) and decides.
+     * caller sees the fault (timeout / connection-lost) and decides.
      */
     private async sendOneWithRetry(text: string): Promise<number[]> {
         let cuts = 0;
@@ -509,8 +508,6 @@ export class RabbitMQEmbedding extends Embedding {
                     replyTo: replyQueue,
                     messageId: taskId,
                     priority: this.config.priority,
-                    // Same bound as the waiter's timeout: once nobody waits, the broker drops the message.
-                    expiration: String(this.config.timeoutMs),
                 },
                 (err) => {
                     if (err) {
