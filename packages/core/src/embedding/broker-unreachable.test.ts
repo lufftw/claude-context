@@ -21,7 +21,7 @@ describe('RabbitMQEmbedding when the broker cannot be reached', () => {
         await expect(emb.sendOne('x', 0)).rejects.toMatchObject({ embedReason: 'connection-lost', embedConnectFailure: true });
     });
 
-    it('waits out a broker outage longer than the three WAIT retries and then succeeds', async () => {
+    it('waits out a broker outage of several failed connects and then succeeds', async () => {
         jest.useFakeTimers();
         try {
             let calls = 0;
@@ -48,8 +48,8 @@ describe('RabbitMQEmbedding when the broker cannot be reached', () => {
             const settled = expect(p).rejects.toMatchObject({ embedReason: 'connection-lost' });
             await jest.advanceTimersByTimeAsync(1_500_000);
             await settled;
-            // the reconnect pauses are a separate budget, then the ordinary WAIT retries run
-            expect(calls).toBe(CONNECT_BACKOFF_MS.length + 3 + 1);
+            // the reconnect pauses are the only budget: nothing was published, and nothing is re-published after them
+            expect(calls).toBe(CONNECT_BACKOFF_MS.length + 1);
         } finally {
             jest.useRealTimers();
         }

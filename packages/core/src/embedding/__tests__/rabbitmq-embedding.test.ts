@@ -233,8 +233,8 @@ describe('Edit D — Layer-0 dimension/norm guard', () => {
     });
 });
 
-describe('Edit E — sendOneWithRetry (bounded retry-via-republish)', () => {
-    it('times out, retries, then succeeds: exactly 2 publishes, pending empty', async () => {
+describe('Edit E — sendOneWithRetry (no re-publish after a timeout)', () => {
+    it('times out without re-publishing: exactly 1 publish, rejects as timeout, pending empty', async () => {
         jest.useFakeTimers();
         try {
             const h = makeHarness();
@@ -243,19 +243,13 @@ describe('Edit E — sendOneWithRetry (bounded retry-via-republish)', () => {
                 timeoutMs: 1000, maxRetries: 3, connectFn: h.connectFn,
             });
             const p = e.embed('hello');
-            // Let initialize() + first publish complete.
+            const settled = expect(p).rejects.toMatchObject({ embedReason: 'timeout' });
             await jest.advanceTimersByTimeAsync(0);
             expect(h.publishedTasks.length).toBe(1);
-            // First attempt times out.
             await jest.advanceTimersByTimeAsync(1000);
-            // Retry should have published a second task.
             await jest.advanceTimersByTimeAsync(0);
-            expect(h.publishedTasks.length).toBe(2);
-            // Deliver a good reply for the SECOND task.
-            const secondId = h.taskIdAt(1);
-            h.deliver(secondId, { success: true, content: JSON.stringify([makeVector(DIM)]) });
-            const out = await p;
-            expect(out.vector.length).toBe(DIM);
+            await settled;
+            expect(h.publishedTasks.length).toBe(1);
             expect((e as any).pending.size).toBe(0);
         } finally {
             jest.useRealTimers();
@@ -277,34 +271,10 @@ describe('Edit E — sendOneWithRetry (bounded retry-via-republish)', () => {
         expect(h.publishedTasks.length).toBe(1);
         expect((e as any).pending.size).toBe(0);
     });
-
-    it('retry stamps the attempt index into retryCount / x-retry-count', async () => {
-        jest.useFakeTimers();
-        try {
-            const h = makeHarness();
-            const e = new RabbitMQEmbedding({
-                url: 'amqp://x', queue: 'q', modelName: 'm', dimension: DIM,
-                timeoutMs: 1000, maxRetries: 3, connectFn: h.connectFn,
-            });
-            const p = e.embed('hello');
-            await jest.advanceTimersByTimeAsync(0);
-            await jest.advanceTimersByTimeAsync(1000); // first times out
-            await jest.advanceTimersByTimeAsync(0);    // retry published
-            expect(h.publishedTasks[0].retryCount).toBe(0);
-            expect(h.publishedTasks[0].headers['x-retry-count']).toBe(0);
-            expect(h.publishedTasks[1].retryCount).toBe(1);
-            expect(h.publishedTasks[1].headers['x-retry-count']).toBe(1);
-            // Resolve to avoid dangling.
-            h.deliver(h.taskIdAt(1), { success: true, content: JSON.stringify([makeVector(DIM)]) });
-            await p;
-        } finally {
-            jest.useRealTimers();
-        }
-    });
 });
 
-describe('Edit G — connection-lost (WAIT-class) retries re-establish the connection', () => {
-    it('a mid-flight connection drop re-initializes and the retry resolves on the NEW reply queue', async () => {
+describe('Edit G — connection-lost after the publish is not re-published; the next call reconnects', () => {
+    it('a mid-flight connection drop fails the chunk as connection-lost with one publish, and a later embed uses a fresh reply queue', async () => {
         const h = makeHarness();
         const e = new RabbitMQEmbedding({
             url: 'amqp://x', queue: 'q', modelName: 'm', dimension: DIM,
@@ -312,37 +282,33 @@ describe('Edit G — connection-lost (WAIT-class) retries re-establish the conne
         });
 
         const p = e.embed('x');
-        // Let initialize() (#1) + first publish complete.
+        const failed = expect(p).rejects.toMatchObject({ embedReason: 'connection-lost' });
         await new Promise((r) => setImmediate(r));
         expect(h.publishedTasks.length).toBe(1);
-        expect(h.assertQueueCount()).toBe(1); // first exclusive reply queue asserted
+        expect(h.assertQueueCount()).toBe(1);
 
-        // Simulate a transient connection drop INSTEAD of replying. resetState rejects
-        // the pending with embedReason='connection-lost' (WAIT class → retryable) and
-        // nulls publishCh/replyQueue + isInitialized=false.
         h.setReplyQueueName('amq.gen-fake-reply-2');
         h.dropConnection();
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+        await failed;
+        // the first message may still be queued, so it was NOT published again
+        expect(h.publishedTasks.length).toBe(1);
 
-        // The retry must re-initialize: a SECOND assertQueue('') (new reply queue) and a
-        // SECOND publish. Let the retry loop run initialize() (#2) + republish.
+        // The next call re-initializes and publishes on the NEW reply queue.
+        const p2 = e.embed('y');
         await new Promise((r) => setImmediate(r));
         await new Promise((r) => setImmediate(r));
-        expect(h.assertQueueCount()).toBe(2); // reconnect created a fresh reply queue
+        expect(h.assertQueueCount()).toBe(2);
         expect(h.publishedTasks.length).toBe(2);
-        // The republished task targets the NEW reply queue.
         expect(h.publishedTasks[1].replyTo).toBe('amq.gen-fake-reply-2');
-
-        // Deliver a good reply to the NEW reply queue's consumer for the SECOND task.
         h.deliver(h.taskIdAt(1), { success: true, content: JSON.stringify([makeVector(DIM)]) });
-
-        // It RESOLVES with a valid vector — and never throws the opaque "not initialized".
-        const out = await p;
+        const out = await p2;
         expect(out.vector.length).toBe(DIM);
-        expect(out.dimension).toBe(DIM);
         expect((e as any).pending.size).toBe(0);
     });
 
-    it('embedBatchPartial recovers a single slot after a connection drop (resolves, not "not initialized")', async () => {
+    it('embedBatchPartial reports the slot as connection-lost after a drop, without re-publishing', async () => {
         const h = makeHarness();
         const e = new RabbitMQEmbedding({
             url: 'amqp://x', queue: 'q', modelName: 'm', dimension: DIM,
@@ -353,17 +319,12 @@ describe('Edit G — connection-lost (WAIT-class) retries re-establish the conne
         await new Promise((r) => setImmediate(r));
         expect(h.publishedTasks.length).toBe(1);
 
-        // Drop instead of replying → connection-lost → retry re-initializes.
         h.dropConnection();
         await new Promise((r) => setImmediate(r));
         await new Promise((r) => setImmediate(r));
-        expect(h.publishedTasks.length).toBe(2);
-
-        h.deliver(h.taskIdAt(1), { success: true, content: JSON.stringify([makeVector(DIM)]) });
         const results = await pr;
-        expect(results.length).toBe(1);
-        expect(results[0].ok).toBe(true);
-        if (results[0].ok) expect(results[0].vector.length).toBe(DIM);
+        expect(results[0]).toMatchObject({ ok: false, reason: 'connection-lost' });
+        expect(h.publishedTasks.length).toBe(1);
     });
 });
 
